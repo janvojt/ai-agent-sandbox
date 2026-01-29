@@ -76,6 +76,20 @@ nano ~/.config/claude-sandbox/blacklist.txt
 ./claude-code-sandbox.sh -- --model claude-sonnet-4-5
 ```
 
+### Docker support (Testcontainers)
+```bash
+# Enable Docker access via filtered socket proxy
+./claude-code-sandbox.sh --enable-docker
+
+# Add writable caches for dependency downloads
+./claude-code-sandbox.sh \
+  --enable-docker \
+  --whitelist-path-rw ~/.m2/repository \
+  --whitelist-path-rw ~/.gradle/caches
+```
+
+Docker access is provided through a per-run socket proxy created at `.docker-proxy/docker.sock` in the working directory. The proxy only allows bind mounts from paths already accessible inside the sandbox (working directory and any read-write mounts).
+
 ### Using environment variables:
 ```bash
 export CLAUDE_SANDBOX_WHITELIST=/path/to/whitelist.txt

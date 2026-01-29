@@ -25,6 +25,11 @@ EXPLICIT_BLACKLIST=false
 QUIET=false
 DRY_RUN=false
 AGENT="claudecode"
+ENABLE_DOCKER=false
+SOCKET_PROXY_IMAGE="${CLAUDE_SANDBOX_DOCKER_PROXY:-ghcr.io/wollomatic/socket-proxy:1}"
+PROXY_CONTAINER_NAME=""
+PROXY_SOCKET_PATH=""
+PROXY_SOCKET_DIR=""
 
 # Print usage
 usage() {
@@ -40,6 +45,8 @@ OPTIONS:
     --whitelist-path PATH   Directly whitelist a path (read-only, can be specified multiple times)
     --whitelist-path-rw PATH Directly whitelist a path (read-write, can be specified multiple times)
     --blacklist-path PATH   Directly blacklist a path (relative to working dir, can be specified multiple times)
+    --enable-docker         Enable Docker access via filtered socket proxy
+    --docker-image IMAGE    Socket proxy image (default: ghcr.io/wollomatic/socket-proxy:1)
     --dry-run              Start bash shell instead of agent (for testing)
     --quiet, -q            Suppress informational output (faster startup)
     --verbose, -v          Show detailed output (default)
@@ -106,6 +113,14 @@ while [[ $# -gt 0 ]]; do
             EXPLICIT_WHITELIST=true
             shift 2
             ;;
+        --enable-docker)
+            ENABLE_DOCKER=true
+            shift
+            ;;
+        --docker-image)
+            SOCKET_PROXY_IMAGE="$2"
+            shift 2
+            ;;
         --agent|-a)
             AGENT="$2"
             shift 2
@@ -141,6 +156,153 @@ done
 log_info() {
     [[ "$QUIET" = false ]] && echo -e "$@" >&2
 }
+
+# Check Docker availability when enabled
+validate_docker() {
+    if [[ "$ENABLE_DOCKER" != true ]]; then
+        return 0
+    fi
+
+    if ! command -v docker &>/dev/null; then
+        echo -e "${RED}Error: Docker is not installed or not in PATH${NC}" >&2
+        echo "Install Docker from: https://docs.docker.com/engine/install/" >&2
+        exit 1
+    fi
+
+    if ! docker info &>/dev/null; then
+        echo -e "${RED}Error: Docker daemon is not running or not accessible${NC}" >&2
+        echo "Ensure Docker service is started and you have permissions" >&2
+        exit 1
+    fi
+
+    if ! docker image inspect "$SOCKET_PROXY_IMAGE" &>/dev/null; then
+        log_info "${YELLOW}Socket proxy image not found, pulling: $SOCKET_PROXY_IMAGE${NC}"
+        if ! docker pull "$SOCKET_PROXY_IMAGE" >/dev/null; then
+            echo -e "${RED}Error: Failed to pull socket proxy image${NC}" >&2
+            exit 1
+        fi
+    fi
+}
+
+collect_allowed_mount_paths() {
+    local paths="$WORKING_DIR"
+
+    # Add read-write whitelist paths
+    for path in "${WHITELIST_PATHS_RW[@]}"; do
+        path="${path/#\~/$HOME}"
+        path="${path//\$HOME/$HOME}"
+        if [[ "$path" != /* ]]; then
+            path="$WORKING_DIR/$path"
+        fi
+        if [[ -e "$path" ]]; then
+            paths="$paths,$path"
+        fi
+    done
+
+    # Add read-write bind mounts from bubblewrap args
+    local i=0
+    while [[ $i -lt ${#BWRAP_ARGS[@]} ]]; do
+        if [[ "${BWRAP_ARGS[$i]}" == "--bind" ]]; then
+            local bind_path="${BWRAP_ARGS[$((i+1))]}"
+            if [[ -e "$bind_path" ]]; then
+                paths="$paths,$bind_path"
+            fi
+        fi
+        ((i++))
+    done
+
+    echo "$paths" | tr ',' '\n' | sed '/^$/d' | sort -u | tr '\n' ',' | sed 's/,$//'
+}
+
+start_socket_proxy() {
+    PROXY_CONTAINER_NAME="claude-sandbox-proxy-$$"
+    PROXY_SOCKET_DIR="$WORKING_DIR/.docker-proxy"
+    PROXY_SOCKET_PATH="$PROXY_SOCKET_DIR/docker.sock"
+    local docker_group_gid=""
+    local proxy_group_args=()
+
+    log_info "\n${GREEN}=== Starting Docker Socket Proxy ===${NC}"
+
+    local allowed_paths
+    allowed_paths=$(collect_allowed_mount_paths)
+
+    log_info "Allowed bind mount paths:"
+    echo "$allowed_paths" | tr ',' '\n' | while IFS= read -r p; do
+        [[ -n "$p" ]] && log_info "  ${GREEN}✓${NC} $p"
+    done
+
+    mkdir -p "$PROXY_SOCKET_DIR"
+    chmod 0777 "$PROXY_SOCKET_DIR" 2>/dev/null || true
+    rm -f "$PROXY_SOCKET_PATH"
+
+    docker_group_gid=$(getent group docker | cut -d: -f3 2>/dev/null || true)
+
+    if [[ -n "$docker_group_gid" ]]; then
+        proxy_group_args=(--group-add "$docker_group_gid")
+    fi
+
+    log_info "\nStarting proxy container: $PROXY_CONTAINER_NAME"
+    if ! docker run -d \
+        --name "$PROXY_CONTAINER_NAME" \
+        --rm \
+        --user 0:0 \
+        "${proxy_group_args[@]}" \
+        -v /var/run/docker.sock:/var/run/docker.sock:ro \
+        -v "$PROXY_SOCKET_DIR:/proxy" \
+        "$SOCKET_PROXY_IMAGE" \
+        -proxysocketendpoint=/proxy/docker.sock \
+        -proxysocketendpointfilemode=0666 \
+        -allowbindmountfrom="$allowed_paths" \
+        -allowGET='/v1\..{1,2}/.*' \
+        -allowHEAD='/_ping' \
+        -allowPOST='/v1\..{1,2}/.*' \
+        -allowPUT='/v1\..{1,2}/.*' \
+        -allowDELETE='/v1\..{1,2}/(containers|images|networks|volumes)/.*' \
+        >/dev/null; then
+        echo -e "${RED}Error: Failed to start socket proxy container${NC}" >&2
+        exit 1
+    fi
+
+    local timeout=20
+    while [[ ! -S "$PROXY_SOCKET_PATH" ]] && [[ $timeout -gt 0 ]]; do
+        sleep 0.5
+        ((timeout--))
+    done
+
+    if [[ ! -S "$PROXY_SOCKET_PATH" ]]; then
+        echo -e "${RED}Error: Socket proxy failed to create socket${NC}" >&2
+        if docker ps -a --format '{{.Names}}' | grep -q "^${PROXY_CONTAINER_NAME}$"; then
+            echo -e "${YELLOW}Socket proxy logs:${NC}" >&2
+            docker logs "$PROXY_CONTAINER_NAME" >&2 || true
+        fi
+        cleanup_socket_proxy
+        exit 1
+    fi
+
+    if ! DOCKER_HOST="unix://$PROXY_SOCKET_PATH" docker version &>/dev/null; then
+        echo -e "${YELLOW}Warning: Socket proxy may not be fully functional${NC}" >&2
+    fi
+
+    log_info "${GREEN}✓${NC} Socket proxy started successfully"
+    log_info "${GREEN}✓${NC} Proxy socket: $PROXY_SOCKET_PATH"
+    log_info "${GREEN}========================================${NC}\n"
+}
+
+cleanup_socket_proxy() {
+    if [[ -n "${PROXY_CONTAINER_NAME:-}" ]]; then
+        log_info "${YELLOW}Cleaning up socket proxy: $PROXY_CONTAINER_NAME${NC}"
+        docker stop "$PROXY_CONTAINER_NAME" 2>/dev/null || true
+        docker rm -f "$PROXY_CONTAINER_NAME" 2>/dev/null || true
+    fi
+    if [[ -n "${PROXY_SOCKET_PATH:-}" ]] && [[ -e "$PROXY_SOCKET_PATH" ]]; then
+        rm -f "$PROXY_SOCKET_PATH" 2>/dev/null || true
+    fi
+    if [[ -n "${PROXY_SOCKET_DIR:-}" ]] && [[ -d "$PROXY_SOCKET_DIR" ]]; then
+        rmdir "$PROXY_SOCKET_DIR" 2>/dev/null || true
+    fi
+}
+
+trap cleanup_socket_proxy EXIT INT TERM
 
 # Strip inline comments and trim whitespace from a line
 # Usage: result=$(strip_inline_comment "$line")
@@ -307,6 +469,8 @@ if [[ "$AGENT" != "claudecode" ]] && [[ "$AGENT" != "opencode" ]]; then
     echo -e "${RED}Error: Invalid agent '$AGENT'. Must be 'claudecode' or 'opencode'${NC}" >&2
     exit 1
 fi
+
+validate_docker
 
 # Cache command availability checks
 BWRAP_BIN=$(command -v bwrap 2>/dev/null)
@@ -682,6 +846,12 @@ fi
 BWRAP_ARGS+=(--unsetenv SSH_AUTH_SOCK)
 BWRAP_ARGS+=(--unsetenv SSH_AGENT_PID)
 
+if [[ "$ENABLE_DOCKER" = true ]]; then
+    BWRAP_ARGS+=(--setenv DOCKER_HOST "unix://$WORKING_DIR/.docker-proxy/docker.sock")
+    BWRAP_ARGS+=(--setenv TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE "$WORKING_DIR/.docker-proxy/docker.sock")
+    BWRAP_ARGS+=(--setenv TESTCONTAINERS_HOST_OVERRIDE "localhost")
+fi
+
 # Preserve agent-specific environment variables
 if [[ "$AGENT" = "claudecode" ]]; then
     if [[ -n "${CLAUDECODE:-}" ]]; then
@@ -705,6 +875,11 @@ for bfile in "${BLACKLIST_FILES[@]}"; do
     log_info "  ${YELLOW}$bfile${NC}"
 done
 log_info "${GREEN}=============================================${NC}\n"
+
+# Start socket proxy if Docker is enabled
+if [[ "$ENABLE_DOCKER" = true ]]; then
+    start_socket_proxy
+fi
 
 # Execute agent or bash (for dry-run) in sandbox
 if [[ "$DRY_RUN" = true ]]; then
