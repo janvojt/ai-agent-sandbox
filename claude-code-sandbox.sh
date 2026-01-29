@@ -19,6 +19,7 @@ BLACKLIST_FILES=()
 WHITELIST_PATHS_RO=()
 WHITELIST_PATHS_RW=()
 BLACKLIST_PATHS=()
+WHITELIST_OVERRIDE_ARGS=()
 EXPLICIT_WHITELIST=false
 EXPLICIT_BLACKLIST=false
 QUIET=false
@@ -54,10 +55,11 @@ IMPLICIT CONFIGURATION FILES (automatically included if they exist):
 
 CONFIGURATION FILE FORMAT:
     Whitelist: Contains absolute or relative paths/patterns (one per line) that Claude can read
-               Relative paths are resolved relative to working directory
-               Default: read-only bind mount
-               Suffix with :rw for read-write bind (e.g., /path/to/dir:rw or data/:rw)
-               Supports glob patterns: /etc/java* or src/** will expand to all matching paths
+                Relative paths are resolved relative to working directory
+                Default: read-only bind mount
+                Suffix with :rw for read-write bind (e.g., /path/to/dir:rw or data/:rw)
+                Supports glob patterns: /etc/java* or src/** will expand to all matching paths
+                Prefix with ! to override blacklist for a specific path (applied after blacklist)
     Blacklist: Contains paths relative to working directory that Claude cannot access
 
 EXAMPLES:
@@ -153,6 +155,19 @@ strip_inline_comment() {
     echo "$line"
 }
 
+# Parse override prefix in whitelist entries
+# Usage: read -r override path < <(parse_whitelist_override "$line")
+parse_whitelist_override() {
+    local line="$1"
+    local override="false"
+    if [[ "$line" == "!"* ]]; then
+        override="true"
+        line="${line#\!}"
+        line="${line#"${line%%[![:space:]]*}"}"
+    fi
+    echo "$override" "$line"
+}
+
 # Find matches for a pattern (supports ant-style ** patterns)
 # Usage: find_matches <base_dir> <pattern>
 # Returns: list of matching absolute paths (one per line)
@@ -204,6 +219,9 @@ find_matches() {
 whitelist_path() {
     local path="$1"
     local bind_mode="$2"
+    local target_array_name="${3:-BWRAP_ARGS}"
+    local label="${4:-Whitelisted}"
+    local -n target_array="$target_array_name"
 
     # Expand environment variables without eval (faster)
     path="${path/#\~/$HOME}"
@@ -242,11 +260,11 @@ whitelist_path() {
     while IFS= read -r match; do
         if [[ -e "$match" ]]; then
             if [[ "$bind_mode" = "rw" ]]; then
-                BWRAP_ARGS+=(--bind "$match" "$match")
-                log_info "${GREEN}✓${NC} Whitelisted (rw): $match"
+                target_array+=(--bind "$match" "$match")
+                log_info "${GREEN}✓${NC} ${label} (rw): $match"
             else
-                BWRAP_ARGS+=(--ro-bind "$match" "$match")
-                log_info "${GREEN}✓${NC} Whitelisted: $match"
+                target_array+=(--ro-bind "$match" "$match")
+                log_info "${GREEN}✓${NC} ${label}: $match"
             fi
             ((match_count++)) || true
         fi
@@ -450,6 +468,9 @@ for WHITELIST_FILE in "${WHITELIST_FILES[@]}"; do
         line=$(strip_inline_comment "$line")
         [[ -z "$line" ]] && continue
 
+        read -r override line < <(parse_whitelist_override "$line")
+        [[ -z "$line" ]] && continue
+
         # Check for read-write suffix (:rw)
         bind_mode="ro"
         if [[ "$line" =~ :rw$ ]]; then
@@ -458,7 +479,11 @@ for WHITELIST_FILE in "${WHITELIST_FILES[@]}"; do
         fi
 
         # Process the path using the helper function
-        whitelist_path "$line" "$bind_mode"
+        if [[ "$override" = "true" ]]; then
+            whitelist_path "$line" "$bind_mode" "WHITELIST_OVERRIDE_ARGS" "Whitelisted (override)"
+        else
+            whitelist_path "$line" "$bind_mode" "BWRAP_ARGS" "Whitelisted"
+        fi
     done < "$WHITELIST_FILE"
 done
 
@@ -466,7 +491,13 @@ done
 if [[ ${#WHITELIST_PATHS_RO[@]} -gt 0 ]]; then
     log_info "${GREEN}Processing direct whitelist paths (read-only):${NC}"
     for path in "${WHITELIST_PATHS_RO[@]}"; do
-        whitelist_path "$path" "ro"
+        read -r override path < <(parse_whitelist_override "$path")
+        [[ -z "$path" ]] && continue
+        if [[ "$override" = "true" ]]; then
+            whitelist_path "$path" "ro" "WHITELIST_OVERRIDE_ARGS" "Whitelisted (override)"
+        else
+            whitelist_path "$path" "ro" "BWRAP_ARGS" "Whitelisted"
+        fi
     done
 fi
 
@@ -474,7 +505,13 @@ fi
 if [[ ${#WHITELIST_PATHS_RW[@]} -gt 0 ]]; then
     log_info "${GREEN}Processing direct whitelist paths (read-write):${NC}"
     for path in "${WHITELIST_PATHS_RW[@]}"; do
-        whitelist_path "$path" "rw"
+        read -r override path < <(parse_whitelist_override "$path")
+        [[ -z "$path" ]] && continue
+        if [[ "$override" = "true" ]]; then
+            whitelist_path "$path" "rw" "WHITELIST_OVERRIDE_ARGS" "Whitelisted (override)"
+        else
+            whitelist_path "$path" "rw" "BWRAP_ARGS" "Whitelisted"
+        fi
     done
 fi
 
@@ -508,6 +545,12 @@ if [[ ${#BLACKLIST_PATHS[@]} -gt 0 ]]; then
     for pattern in "${BLACKLIST_PATHS[@]}"; do
         blacklist_pattern "$pattern"
     done
+fi
+
+# Apply whitelist overrides after blacklist so they take precedence
+if [[ ${#WHITELIST_OVERRIDE_ARGS[@]} -gt 0 ]]; then
+    log_info "\n${GREEN}Applying whitelist overrides (after blacklist):${NC}"
+    BWRAP_ARGS+=("${WHITELIST_OVERRIDE_ARGS[@]}")
 fi
 
 log_info "\n${YELLOW}Agent-specific configuration bindings:"

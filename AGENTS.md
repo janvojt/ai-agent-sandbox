@@ -30,6 +30,7 @@ This is a bash-based sandboxing solution for running Claude Code in isolated env
 - Blacklisted patterns expanded via `compgen -G` and hidden with `--tmpfs` mounts
 - This means blacklist patterns are expanded at sandbox start time, not dynamically
 - Unlike overlay filesystems, this doesn't copy files - just hides matching paths
+- **Whitelist overrides**: Entries prefixed with `!` are applied after blacklist mounts to re-allow specific paths
 
 **Network Configuration (lines 288-302)**:
 - Full network access enabled by default
@@ -139,6 +140,7 @@ shellcheck claude-code-sandbox.sh
 - Supports both absolute paths (e.g., `/usr/bin`) and relative paths (e.g., `data/`, `src/**/*.txt`)
 - Relative paths are resolved relative to the working directory
 - Environment variable expansion supported: `$HOME` or `~`
+- **Blacklist override**: Prefix with `!` to re-allow a specific path that would otherwise be blocked by the blacklist
 - **Pattern support**:
   - Simple glob: `*`, `?`, `[]` (e.g., `/etc/java*` or `*.json`)
   - **Ant-style recursive**: `**` for recursive matching (e.g., `/usr/**/lib64` or `src/**`)

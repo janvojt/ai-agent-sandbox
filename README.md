@@ -137,6 +137,9 @@ The whitelist file contains **absolute paths or glob patterns** (one per line) t
   - Default: all paths are mounted read-only (safer)
   - Use `:rw` only for paths where Claude needs write access (caches, build outputs, etc.)
   - Works with both literal paths and patterns (e.g., `/opt/cache-*:rw`)
+- **Blacklist override**: Prefix a path with `!` to re-allow a specific path that would otherwise be blocked by the blacklist
+  - Overrides are applied after the blacklist, so they take precedence
+  - Example: `!secrets/dev.key`
 - **Pattern support**:
   - Simple glob: `*`, `?`, `[]` (e.g., `/etc/java*` matches `/etc/java-11`, `/etc/java-17`)
   - **Ant-style recursive**: `**` for recursive directory matching (e.g., `/usr/**/lib64` matches any `lib64` directory under `/usr`)
@@ -253,9 +256,9 @@ Add the required paths to your whitelist file. Common additions:
 
 ### Claude needs to access a specific sensitive file
 If you genuinely need Claude to access a file that's blacklisted:
-1. Remove it from the blacklist, or
-2. Create a copy outside the blacklisted pattern, or
-3. Use `--blacklist /dev/null` to disable blacklist (not recommended)
+1. Add an override entry to the whitelist (prefix with `!`), or
+2. Remove it from the blacklist, or
+3. Create a copy outside the blacklisted pattern
 
 ## Examples
 
