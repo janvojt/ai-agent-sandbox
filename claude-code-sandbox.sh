@@ -860,6 +860,9 @@ if [[ "$AGENT" = "claudecode" ]]; then
     if [[ -n "${CLAUDE_CODE_ENTRYPOINT:-}" ]]; then
         BWRAP_ARGS+=(--setenv CLAUDE_CODE_ENTRYPOINT "$CLAUDE_CODE_ENTRYPOINT")
     fi
+elif [[ "$AGENT" = "opencode" ]]; then
+    # Force YOLO-style permissions inside sandboxed OpenCode runs.
+    BWRAP_ARGS+=(--setenv OPENCODE_PERMISSION '{"*":"allow"}')
 fi
 
 # Display configuration summary
@@ -881,10 +884,18 @@ if [[ "$ENABLE_DOCKER" = true ]]; then
     start_socket_proxy
 fi
 
+# Build default agent args (prepended before user args)
+DEFAULT_AGENT_ARGS=()
+if [[ "$AGENT" = "claudecode" ]]; then
+    DEFAULT_AGENT_ARGS+=(--dangerously-skip-permissions)
+elif [[ "$AGENT" = "opencode" ]]; then
+    DEFAULT_AGENT_ARGS+=(--agent build)
+fi
+
 # Execute agent or bash (for dry-run) in sandbox
 if [[ "$DRY_RUN" = true ]]; then
     log_info "${YELLOW}=== DRY RUN MODE: Starting bash shell in sandbox ===${NC}\n"
     exec "$BWRAP_BIN" "${BWRAP_ARGS[@]}" -- /bin/bash
 else
-    exec "$BWRAP_BIN" "${BWRAP_ARGS[@]}" -- "$AGENT_BIN" "${AGENT_ARGS[@]}"
+    exec "$BWRAP_BIN" "${BWRAP_ARGS[@]}" -- "$AGENT_BIN" "${DEFAULT_AGENT_ARGS[@]}" "${AGENT_ARGS[@]}"
 fi
