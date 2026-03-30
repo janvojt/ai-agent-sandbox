@@ -186,8 +186,17 @@ The blacklist file contains **relative paths** from the working directory that C
 - **Pattern support**:
   - Simple glob: `*`, `?` (e.g., `*.env` matches `.env.local`, `.env.prod`)
   - **Ant-style recursive**: `**` for recursive matching (e.g., `**/wallet.dat` matches `wallet.dat` anywhere in the working directory tree)
+- Trailing `/` is accepted and normalized (for example, `secret-data/` behaves like `secret-data`)
 - Lines starting with `#` are ignored
 - When using multiple blacklist files, all patterns from all files are blocked
+
+### Symlink behavior
+
+- Matching is done on paths inside the working directory, so symlink names can be matched by whitelist/blacklist patterns.
+- **Whitelist**: symlink paths are allowed when they resolve to an existing target at sandbox startup.
+- **Blacklist**: matched symlinks are resolved to their canonical target path.
+- If the resolved blacklist target is inside the working directory, the target is hidden.
+- If the resolved blacklist target is outside the working directory (or cannot be resolved), the entry is skipped.
 
 **Examples of ant-style patterns:**
 ```
