@@ -445,8 +445,28 @@ blacklist_pattern() {
     # Use find to match patterns (supports ant-style **)
     local match_count=0
     while IFS= read -r match; do
-        if [[ -e "$match" ]]; then
-            if [[ -d "$match" ]]; then
+        if [[ -e "$match" || -L "$match" ]]; then
+            if [[ -L "$match" ]]; then
+                local match_display="${match#$WORKING_DIR/}"
+                local target
+                target=$(readlink -f "$match" 2>/dev/null || true)
+
+                # bubblewrap cannot safely mount over symlink paths. If a symlink
+                # resolves inside the working directory, blacklist the resolved
+                # target instead. Otherwise skip it to avoid startup failure.
+                if [[ -n "$target" && -e "$target" && "$target" == "$WORKING_DIR"* ]]; then
+                    local target_display="${target#$WORKING_DIR/}"
+                    if [[ -d "$target" ]]; then
+                        BWRAP_ARGS+=(--tmpfs "$target")
+                        log_info "${RED}✗${NC} Blacklisted (symlink->dir target): ${match_display} -> ${target_display}"
+                    else
+                        BWRAP_ARGS+=(--ro-bind /dev/null "$target")
+                        log_info "${RED}✗${NC} Blacklisted (symlink->file target): ${match_display} -> ${target_display}"
+                    fi
+                else
+                    log_info "${YELLOW}⚠${NC} Skipping symlink blacklist for ${match_display} (target is outside working directory or unresolved)"
+                fi
+            elif [[ -d "$match" ]]; then
                 # Hide directories with tmpfs overlay
                 BWRAP_ARGS+=(--tmpfs "$match")
                 log_info "${RED}✗${NC} Blacklisted (dir): ${match#$WORKING_DIR/}"
