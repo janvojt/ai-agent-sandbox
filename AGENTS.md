@@ -38,7 +38,7 @@ This is a bash-based sandboxing solution for running Claude Code in isolated env
 - Binds system `/etc/resolv.conf` and `/etc/hosts` for DNS resolution
 
 **Docker Socket Proxy Integration**:
-- Optional `--enable-docker` starts a per-run socket proxy container
+- Optional `--enable-docker` (or `-d`) starts a per-run socket proxy container
 - Proxy socket is created at `$WORKING_DIR/.docker-proxy/docker.sock`
 - Proxy restricts bind mounts to paths already accessible in the sandbox
 - Allowed paths are collected from working directory, read-write whitelist entries, and `--bind` mounts in `BWRAP_ARGS`
@@ -251,7 +251,7 @@ When modifying the script:
 13. Test with missing additional files (should skip with warning, not fail)
 14. Test Claude Code can still access its config: check `~/.claude/` and `~/.claude.json`
 15. Verify configuration summary shows all whitelist/blacklist files being used (user, project, and explicit)
-16. If `--enable-docker` is used, verify proxy starts and socket exists
+16. If `--enable-docker` or `-d` is used, verify proxy starts and socket exists
 17. Verify bind mount restrictions: allowed for working dir, denied for `/etc` and `~/.ssh`
 18. Verify proxy cleanup on exit (no leftover container or socket file)
 

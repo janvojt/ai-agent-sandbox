@@ -45,7 +45,7 @@ OPTIONS:
     --whitelist-path PATH   Directly whitelist a path (read-only, can be specified multiple times)
     --whitelist-path-rw PATH Directly whitelist a path (read-write, can be specified multiple times)
     --blacklist-path PATH   Directly blacklist a path (relative to working dir, can be specified multiple times)
-    --enable-docker         Enable Docker access via filtered socket proxy
+    --enable-docker, -d     Enable Docker access via filtered socket proxy
     --docker-image IMAGE    Socket proxy image (default: ghcr.io/wollomatic/socket-proxy:1)
     --dry-run              Start bash shell instead of agent (for testing)
     --quiet, -q            Suppress informational output (faster startup)
@@ -113,7 +113,7 @@ while [[ $# -gt 0 ]]; do
             EXPLICIT_WHITELIST=true
             shift 2
             ;;
-        --enable-docker)
+        --enable-docker|-d)
             ENABLE_DOCKER=true
             shift
             ;;

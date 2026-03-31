@@ -78,12 +78,12 @@ nano ~/.config/claude-sandbox/blacklist.txt
 
 ### Docker support (Testcontainers)
 ```bash
-# Enable Docker access via filtered socket proxy
-./claude-code-sandbox.sh --enable-docker
+# Enable Docker access via filtered socket proxy (long or short flag)
+./claude-code-sandbox.sh -d
 
 # Add writable caches for dependency downloads
 ./claude-code-sandbox.sh \
-  --enable-docker \
+  -d \
   --whitelist-path-rw ~/.m2/repository \
   --whitelist-path-rw ~/.gradle/caches
 ```
