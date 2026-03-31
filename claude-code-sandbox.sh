@@ -19,6 +19,7 @@ BLACKLIST_FILES=()
 WHITELIST_PATHS_RO=()
 WHITELIST_PATHS_RW=()
 BLACKLIST_PATHS=()
+BLACKLISTED_DIRS=()
 WHITELIST_OVERRIDE_ARGS=()
 EXPLICIT_WHITELIST=false
 EXPLICIT_BLACKLIST=false
@@ -330,6 +331,26 @@ parse_whitelist_override() {
     echo "$override" "$line"
 }
 
+is_covered_by_blacklisted_dir() {
+    local path="$1"
+    local blocked_dir
+    for blocked_dir in "${BLACKLISTED_DIRS[@]}"; do
+        if [[ "$path" == "$blocked_dir" || "$path" == "$blocked_dir/"* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+remember_blacklisted_dir() {
+    local dir="$1"
+    local blocked_dir
+    for blocked_dir in "${BLACKLISTED_DIRS[@]}"; do
+        [[ "$blocked_dir" == "$dir" ]] && return
+    done
+    BLACKLISTED_DIRS+=("$dir")
+}
+
 # Find matches for a pattern (supports ant-style ** patterns)
 # Usage: find_matches <base_dir> <pattern>
 # Returns: list of matching absolute paths (one per line)
@@ -442,8 +463,14 @@ whitelist_path() {
 blacklist_pattern() {
     local pattern="$1"
 
+    # Normalize trailing slashes so entries like ".trees/" match correctly.
+    while [[ "$pattern" == */ && "$pattern" != "/" ]]; do
+        pattern="${pattern%/}"
+    done
+
     # Use find to match patterns (supports ant-style **)
     local match_count=0
+    local skip_count=0
     while IFS= read -r match; do
         if [[ -e "$match" || -L "$match" ]]; then
             if [[ -L "$match" ]]; then
@@ -455,9 +482,16 @@ blacklist_pattern() {
                 # resolves inside the working directory, blacklist the resolved
                 # target instead. Otherwise skip it to avoid startup failure.
                 if [[ -n "$target" && -e "$target" && "$target" == "$WORKING_DIR"* ]]; then
+                    if is_covered_by_blacklisted_dir "$target"; then
+                        log_info "${YELLOW}⚠${NC} Skipping blacklist for ${match_display} (already covered by blacklisted parent dir)"
+                        ((skip_count++)) || true
+                        continue
+                    fi
+
                     local target_display="${target#$WORKING_DIR/}"
                     if [[ -d "$target" ]]; then
                         BWRAP_ARGS+=(--tmpfs "$target")
+                        remember_blacklisted_dir "$target"
                         log_info "${RED}✗${NC} Blacklisted (symlink->dir target): ${match_display} -> ${target_display}"
                     else
                         BWRAP_ARGS+=(--ro-bind /dev/null "$target")
@@ -467,10 +501,23 @@ blacklist_pattern() {
                     log_info "${YELLOW}⚠${NC} Skipping symlink blacklist for ${match_display} (target is outside working directory or unresolved)"
                 fi
             elif [[ -d "$match" ]]; then
+                if is_covered_by_blacklisted_dir "$match"; then
+                    log_info "${YELLOW}⚠${NC} Skipping blacklist for ${match#$WORKING_DIR/} (already covered by blacklisted parent dir)"
+                    ((skip_count++)) || true
+                    continue
+                fi
+
                 # Hide directories with tmpfs overlay
                 BWRAP_ARGS+=(--tmpfs "$match")
+                remember_blacklisted_dir "$match"
                 log_info "${RED}✗${NC} Blacklisted (dir): ${match#$WORKING_DIR/}"
             else
+                if is_covered_by_blacklisted_dir "$match"; then
+                    log_info "${YELLOW}⚠${NC} Skipping blacklist for ${match#$WORKING_DIR/} (already covered by blacklisted parent dir)"
+                    ((skip_count++)) || true
+                    continue
+                fi
+
                 # Hide files by binding /dev/null over them
                 BWRAP_ARGS+=(--ro-bind /dev/null "$match")
                 log_info "${RED}✗${NC} Blacklisted (file): ${match#$WORKING_DIR/}"
@@ -479,7 +526,7 @@ blacklist_pattern() {
         fi
     done < <(find_matches "$WORKING_DIR" "$pattern")
 
-    if [[ $match_count -eq 0 ]]; then
+    if [[ $match_count -eq 0 && $skip_count -eq 0 ]]; then
         log_info "${YELLOW}⚠${NC} No matches for pattern: $pattern"
     fi
 }
