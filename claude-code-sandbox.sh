@@ -20,6 +20,7 @@ WHITELIST_PATHS_RO=()
 WHITELIST_PATHS_RW=()
 BLACKLIST_PATHS=()
 BLACKLISTED_DIRS=()
+BLACKLIST_SEARCH_ROOTS=()
 WHITELIST_OVERRIDE_ARGS=()
 EXPLICIT_WHITELIST=false
 EXPLICIT_BLACKLIST=false
@@ -351,6 +352,31 @@ remember_blacklisted_dir() {
     BLACKLISTED_DIRS+=("$dir")
 }
 
+remember_blacklist_search_root() {
+    local root="$1"
+    local existing_root
+
+    [[ -d "$root" ]] || return
+
+    for existing_root in "${BLACKLIST_SEARCH_ROOTS[@]}"; do
+        [[ "$existing_root" == "$root" ]] && return
+    done
+
+    BLACKLIST_SEARCH_ROOTS+=("$root")
+}
+
+display_path() {
+    local path="$1"
+
+    if [[ "$path" == "$WORKING_DIR" ]]; then
+        echo "."
+    elif [[ "$path" == "$WORKING_DIR/"* ]]; then
+        echo "${path#$WORKING_DIR/}"
+    else
+        echo "$path"
+    fi
+}
+
 # Find matches for a pattern (supports ant-style ** patterns)
 # Usage: find_matches <base_dir> <pattern>
 # Returns: list of matching absolute paths (one per line)
@@ -405,6 +431,7 @@ whitelist_path() {
     local target_array_name="${3:-BWRAP_ARGS}"
     local label="${4:-Whitelisted}"
     local -n target_array="$target_array_name"
+    local is_relative_path=false
 
     # Expand environment variables without eval (faster)
     path="${path/#\~/$HOME}"
@@ -412,6 +439,7 @@ whitelist_path() {
 
     # Convert relative paths to absolute (relative to working directory)
     if [[ "$path" != /* ]]; then
+        is_relative_path=true
         path="$WORKING_DIR/$path"
     fi
 
@@ -442,6 +470,14 @@ whitelist_path() {
     local match_count=0
     while IFS= read -r match; do
         if [[ -e "$match" ]]; then
+            if [[ "$is_relative_path" = true ]]; then
+                if [[ -d "$match" ]]; then
+                    remember_blacklist_search_root "$match"
+                else
+                    remember_blacklist_search_root "$(dirname "$match")"
+                fi
+            fi
+
             if [[ "$bind_mode" = "rw" ]]; then
                 target_array+=(--bind "$match" "$match")
                 log_info "${GREEN}✓${NC} ${label} (rw): $match"
@@ -462,6 +498,7 @@ whitelist_path() {
 # Usage: blacklist_pattern <pattern>
 blacklist_pattern() {
     local pattern="$1"
+    local search_root
 
     # Normalize trailing slashes so entries like ".trees/" match correctly.
     while [[ "$pattern" == */ && "$pattern" != "/" ]]; do
@@ -471,60 +508,77 @@ blacklist_pattern() {
     # Use find to match patterns (supports ant-style **)
     local match_count=0
     local skip_count=0
-    while IFS= read -r match; do
-        if [[ -e "$match" || -L "$match" ]]; then
-            if [[ -L "$match" ]]; then
-                local match_display="${match#$WORKING_DIR/}"
-                local target
-                target=$(readlink -f "$match" 2>/dev/null || true)
+    for search_root in "${BLACKLIST_SEARCH_ROOTS[@]}"; do
+        while IFS= read -r match; do
+            if [[ -e "$match" || -L "$match" ]]; then
+                if [[ -L "$match" ]]; then
+                    local match_display
+                    match_display=$(display_path "$match")
+                    local target
+                    target=$(readlink -f "$match" 2>/dev/null || true)
 
-                # bubblewrap cannot safely mount over symlink paths. If a symlink
-                # resolves inside the working directory, blacklist the resolved
-                # target instead. Otherwise skip it to avoid startup failure.
-                if [[ -n "$target" && -e "$target" && "$target" == "$WORKING_DIR"* ]]; then
-                    if is_covered_by_blacklisted_dir "$target"; then
-                        log_info "${YELLOW}⚠${NC} Skipping blacklist for ${match_display} (already covered by blacklisted parent dir)"
+                    # bubblewrap cannot safely mount over symlink paths. If a symlink
+                    # resolves inside one of the exposed blacklist search roots,
+                    # blacklist the resolved target instead. Otherwise skip it.
+                    if [[ -n "$target" && -e "$target" ]]; then
+                        local target_root=""
+                        local candidate_root
+                        for candidate_root in "${BLACKLIST_SEARCH_ROOTS[@]}"; do
+                            if [[ "$target" == "$candidate_root" || "$target" == "$candidate_root/"* ]]; then
+                                target_root="$candidate_root"
+                                break
+                            fi
+                        done
+
+                        if [[ -n "$target_root" ]]; then
+                            if is_covered_by_blacklisted_dir "$target"; then
+                                log_info "${YELLOW}⚠${NC} Skipping blacklist for ${match_display} (already covered by blacklisted parent dir)"
+                                ((skip_count++)) || true
+                                continue
+                            fi
+
+                            local target_display
+                            target_display=$(display_path "$target")
+                            if [[ -d "$target" ]]; then
+                                BWRAP_ARGS+=(--tmpfs "$target")
+                                remember_blacklisted_dir "$target"
+                                log_info "${RED}✗${NC} Blacklisted (symlink->dir target): ${match_display} -> ${target_display}"
+                            else
+                                BWRAP_ARGS+=(--ro-bind /dev/null "$target")
+                                log_info "${RED}✗${NC} Blacklisted (symlink->file target): ${match_display} -> ${target_display}"
+                            fi
+                        else
+                            log_info "${YELLOW}⚠${NC} Skipping symlink blacklist for ${match_display} (target is outside accessible roots or unresolved)"
+                        fi
+                    else
+                        log_info "${YELLOW}⚠${NC} Skipping symlink blacklist for ${match_display} (target is outside accessible roots or unresolved)"
+                    fi
+                elif [[ -d "$match" ]]; then
+                    if is_covered_by_blacklisted_dir "$match"; then
+                        log_info "${YELLOW}⚠${NC} Skipping blacklist for $(display_path "$match") (already covered by blacklisted parent dir)"
                         ((skip_count++)) || true
                         continue
                     fi
 
-                    local target_display="${target#$WORKING_DIR/}"
-                    if [[ -d "$target" ]]; then
-                        BWRAP_ARGS+=(--tmpfs "$target")
-                        remember_blacklisted_dir "$target"
-                        log_info "${RED}✗${NC} Blacklisted (symlink->dir target): ${match_display} -> ${target_display}"
-                    else
-                        BWRAP_ARGS+=(--ro-bind /dev/null "$target")
-                        log_info "${RED}✗${NC} Blacklisted (symlink->file target): ${match_display} -> ${target_display}"
-                    fi
+                    # Hide directories with tmpfs overlay
+                    BWRAP_ARGS+=(--tmpfs "$match")
+                    remember_blacklisted_dir "$match"
+                    log_info "${RED}✗${NC} Blacklisted (dir): $(display_path "$match")"
                 else
-                    log_info "${YELLOW}⚠${NC} Skipping symlink blacklist for ${match_display} (target is outside working directory or unresolved)"
-                fi
-            elif [[ -d "$match" ]]; then
-                if is_covered_by_blacklisted_dir "$match"; then
-                    log_info "${YELLOW}⚠${NC} Skipping blacklist for ${match#$WORKING_DIR/} (already covered by blacklisted parent dir)"
-                    ((skip_count++)) || true
-                    continue
-                fi
+                    if is_covered_by_blacklisted_dir "$match"; then
+                        log_info "${YELLOW}⚠${NC} Skipping blacklist for $(display_path "$match") (already covered by blacklisted parent dir)"
+                        ((skip_count++)) || true
+                        continue
+                    fi
 
-                # Hide directories with tmpfs overlay
-                BWRAP_ARGS+=(--tmpfs "$match")
-                remember_blacklisted_dir "$match"
-                log_info "${RED}✗${NC} Blacklisted (dir): ${match#$WORKING_DIR/}"
-            else
-                if is_covered_by_blacklisted_dir "$match"; then
-                    log_info "${YELLOW}⚠${NC} Skipping blacklist for ${match#$WORKING_DIR/} (already covered by blacklisted parent dir)"
-                    ((skip_count++)) || true
-                    continue
+                    # Hide files by binding /dev/null over them
+                    BWRAP_ARGS+=(--ro-bind /dev/null "$match")
+                    log_info "${RED}✗${NC} Blacklisted (file): $(display_path "$match")"
                 fi
-
-                # Hide files by binding /dev/null over them
-                BWRAP_ARGS+=(--ro-bind /dev/null "$match")
-                log_info "${RED}✗${NC} Blacklisted (file): ${match#$WORKING_DIR/}"
+                ((match_count++)) || true
             fi
-            ((match_count++)) || true
-        fi
-    done < <(find_matches "$WORKING_DIR" "$pattern")
+        done < <(find_matches "$search_root" "$pattern")
+    done
 
     if [[ $match_count -eq 0 && $skip_count -eq 0 ]]; then
         log_info "${YELLOW}⚠${NC} No matches for pattern: $pattern"
@@ -673,6 +727,7 @@ BWRAP_ARGS=(
 
 # Setup minimal home directory using tmpfs
 BWRAP_ARGS+=(--tmpfs "$HOME")
+BLACKLIST_SEARCH_ROOTS+=("$WORKING_DIR")
 
 # Bind working directory (after tmpfs home, so it's visible)
 BWRAP_ARGS+=(--bind "$WORKING_DIR" "$WORKING_DIR")
