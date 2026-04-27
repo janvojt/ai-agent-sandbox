@@ -12,13 +12,17 @@ NC='\033[0m' # No Color
 DEFAULT_WHITELIST_FILE="${AI_AGENT_SANDBOX_WHITELIST:-$HOME/.config/ai-agent-sandbox/whitelist.txt}"
 DEFAULT_BLACKLIST_FILE="${AI_AGENT_SANDBOX_BLACKLIST:-$HOME/.config/ai-agent-sandbox/blacklist.txt}"
 DEFAULT_ENV_FILE="${AI_AGENT_SANDBOX_ENV:-$HOME/.config/ai-agent-sandbox/.env}"
+DEFAULT_PATH_FILE="${AI_AGENT_SANDBOX_PATH:-$HOME/.config/ai-agent-sandbox/path-list.txt}"
 WORKING_DIR="$(pwd)"
 PROJECT_WHITELIST_FILE="$WORKING_DIR/.ai-agent-sandbox/whitelist.txt"
 PROJECT_BLACKLIST_FILE="$WORKING_DIR/.ai-agent-sandbox/blacklist.txt"
 PROJECT_ENV_FILE="$WORKING_DIR/.ai-agent-sandbox/.env"
+PROJECT_PATH_FILE="$WORKING_DIR/.ai-agent-sandbox/path-list.txt"
 WHITELIST_FILES=()
 BLACKLIST_FILES=()
 ENV_FILES=()
+PATH_FILES=()
+PATH_DIRS_DIRECT=()
 WHITELIST_PATHS_RO=()
 WHITELIST_PATHS_RW=()
 BLACKLIST_PATHS=()
@@ -28,6 +32,7 @@ BLACKLIST_SEARCH_ROOTS=()
 WHITELIST_OVERRIDE_ARGS=()
 EXPLICIT_WHITELIST=false
 EXPLICIT_BLACKLIST=false
+EXPLICIT_PATHS=false
 QUIET=false
 DRY_RUN=false
 AGENT="claudecode"
@@ -63,6 +68,8 @@ OPTIONS:
     --whitelist-path PATH   Directly whitelist a path (read-only, can be specified multiple times)
     --whitelist-path-rw PATH Directly whitelist a path (read-write, can be specified multiple times)
     --blacklist-path PATH   Directly blacklist a path (relative to working dir, can be specified multiple times)
+    --path-file FILE        Add file containing PATH directories (one per line)
+    --path-dir PATH         Append directory to PATH (can be specified multiple times)
     --enable-docker, -d     Enable Docker access via filtered socket proxy
     --venv                  Include active Python virtual environment in sandbox PATH
     --docker-image IMAGE    Socket proxy image (default: ghcr.io/wollomatic/socket-proxy:1)
@@ -76,10 +83,12 @@ IMPLICIT CONFIGURATION FILES (automatically included if they exist):
        - $DEFAULT_WHITELIST_FILE
        - $DEFAULT_BLACKLIST_FILE
        - $DEFAULT_ENV_FILE
+       - $DEFAULT_PATH_FILE (extra PATH entries)
     2. Project-level (if present):
        - .ai-agent-sandbox/whitelist.txt (in working directory)
        - .ai-agent-sandbox/blacklist.txt (in working directory)
        - .ai-agent-sandbox/.env (in working directory)
+       - .ai-agent-sandbox/path-list.txt (in working directory)
 
 CONFIGURATION FILE FORMAT:
     Whitelist: Contains absolute or relative paths/patterns (one per line) that the agent can read
@@ -144,6 +153,16 @@ while [[ $# -gt 0 ]]; do
         --whitelist-path-rw)
             WHITELIST_PATHS_RW+=("$2")
             EXPLICIT_WHITELIST=true
+            shift 2
+            ;;
+        --path-file)
+            PATH_FILES+=("$2")
+            EXPLICIT_PATHS=true
+            shift 2
+            ;;
+        --path-dir)
+            PATH_DIRS_DIRECT+=("$2")
+            EXPLICIT_PATHS=true
             shift 2
             ;;
         --enable-docker|-d)
@@ -488,6 +507,38 @@ set_sandbox_env() {
 
     BWRAP_ARGS+=(--setenv "$key" "$value")
     log_info "${GREEN}✓${NC} Environment variable: $key"
+}
+
+declare -a PATH_ENTRIES=()
+add_path_entry() {
+    local entry="$1"
+    [[ -z "$entry" ]] && return
+
+    entry="${entry/#\~/$HOME}"
+    entry="${entry//\$HOME/$HOME}"
+
+    if [[ "$entry" != /* ]]; then
+        entry="$WORKING_DIR/$entry"
+    fi
+
+    PATH_ENTRIES+=("$entry")
+    if [[ ! -d "$entry" ]]; then
+        log_info "${YELLOW}⚠${NC} PATH entry does not exist (will still be added): $entry"
+    fi
+}
+
+join_colon() {
+    local result=""
+    local segment
+    for segment in "$@"; do
+        [[ -z "$segment" ]] && continue
+        if [[ -z "$result" ]]; then
+            result="$segment"
+        else
+            result="$result:$segment"
+        fi
+    done
+    echo "$result"
 }
 
 # Parse override prefix in whitelist entries
@@ -865,6 +916,24 @@ EOBLACKLIST
     echo -e "${YELLOW}Please review and customize it for your needs${NC}" >&2
 fi
 
+# Create default path list if it doesn't exist and no explicit path file was given
+if [[ ! -f "$DEFAULT_PATH_FILE" ]] && [[ "$EXPLICIT_PATHS" = false ]]; then
+    echo -e "${YELLOW}Warning: PATH list not found at $DEFAULT_PATH_FILE${NC}" >&2
+    echo -e "${YELLOW}Creating default PATH list...${NC}" >&2
+    mkdir -p "$(dirname "$DEFAULT_PATH_FILE")"
+    cat > "$DEFAULT_PATH_FILE" << 'EOPATHS'
+# AI Agent Sandbox PATH Additions
+# Add absolute or relative directories (one per line) to append to PATH inside the sandbox
+# Relative entries are resolved against the working directory
+
+# Example: expose project-specific tools
+# tools/bin
+
+EOPATHS
+    echo -e "${GREEN}Created default PATH list at $DEFAULT_PATH_FILE${NC}" >&2
+    echo -e "${YELLOW}Add directories that should be appended to PATH${NC}" >&2
+fi
+
 # Always include default files in the arrays (at the beginning)
 if [[ -f "$DEFAULT_WHITELIST_FILE" ]]; then
     WHITELIST_FILES=("$DEFAULT_WHITELIST_FILE" "${WHITELIST_FILES[@]}")
@@ -874,6 +943,9 @@ if [[ -f "$DEFAULT_BLACKLIST_FILE" ]]; then
 fi
 if [[ -f "$DEFAULT_ENV_FILE" ]]; then
     ENV_FILES=("$DEFAULT_ENV_FILE" "${ENV_FILES[@]}")
+fi
+if [[ -f "$DEFAULT_PATH_FILE" ]]; then
+    PATH_FILES=("$DEFAULT_PATH_FILE" "${PATH_FILES[@]}")
 fi
 
 # Include project-level files if they exist (after default, before explicit)
@@ -885,6 +957,9 @@ if [[ -f "$PROJECT_BLACKLIST_FILE" ]]; then
 fi
 if [[ -f "$PROJECT_ENV_FILE" ]]; then
     ENV_FILES+=("$PROJECT_ENV_FILE")
+fi
+if [[ -f "$PROJECT_PATH_FILE" ]]; then
+    PATH_FILES+=("$PROJECT_PATH_FILE")
 fi
 
 # Build bubblewrap arguments
@@ -1028,6 +1103,34 @@ fi
 
 mount_docker_compose_plugins
 
+# Process PATH files for additional directories
+if [[ ${#PATH_FILES[@]} -gt 0 ]]; then
+    log_info "\n${GREEN}Processing PATH list files:${NC}"
+    for PATH_FILE in "${PATH_FILES[@]}"; do
+        if [[ ! -f "$PATH_FILE" ]]; then
+            echo -e "${YELLOW}Warning: PATH list file not found: $PATH_FILE (skipping)${NC}" >&2
+            continue
+        fi
+
+        log_info "${GREEN}Processing PATH file:${NC} $PATH_FILE"
+        while IFS= read -r entry || [[ -n "$entry" ]]; do
+            [[ "$entry" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "${entry// }" ]] && continue
+            entry=$(strip_inline_comment "$entry")
+            [[ -z "$entry" ]] && continue
+            add_path_entry "$entry"
+        done < "$PATH_FILE"
+    done
+fi
+
+# Process direct PATH directories
+if [[ ${#PATH_DIRS_DIRECT[@]} -gt 0 ]]; then
+    log_info "${GREEN}Processing direct PATH directories:${NC}"
+    for entry in "${PATH_DIRS_DIRECT[@]}"; do
+        add_path_entry "$entry"
+    done
+fi
+
 log_info "\n${YELLOW}Agent-specific configuration bindings:"
 if [[ "$AGENT" = "claudecode" ]]; then
     # Bind claude binary
@@ -1149,16 +1252,17 @@ fi
 
 # Set minimal environment
 BWRAP_ARGS+=(--setenv TERM "${TERM:-xterm-256color}")
-SANDBOX_PATH=""
-if [[ "$AGENT" = "claudecode" ]]; then
-    SANDBOX_PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
-elif [[ "$AGENT" = "opencode" ]]; then
-    SANDBOX_PATH="$HOME/.opencode/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
-fi
+declare -a BASE_PATH_COMPONENTS=()
 if [[ "$ENABLE_VENV" = true ]]; then
-    SANDBOX_PATH="$VENV_BIN_DIR:$SANDBOX_PATH"
+    BASE_PATH_COMPONENTS+=("$VENV_BIN_DIR")
 fi
-BWRAP_ARGS+=(--setenv PATH "$SANDBOX_PATH")
+if [[ "$AGENT" = "claudecode" ]]; then
+    BASE_PATH_COMPONENTS+=("$HOME/.local/bin" "/usr/local/bin" "/usr/bin" "/bin")
+elif [[ "$AGENT" = "opencode" ]]; then
+    BASE_PATH_COMPONENTS+=("$HOME/.opencode/bin" "$HOME/.local/bin" "/usr/local/bin" "/usr/bin" "/bin")
+fi
+FINAL_PATH_VALUE=$(join_colon "${BASE_PATH_COMPONENTS[@]}" "${PATH_ENTRIES[@]}")
+BWRAP_ARGS+=(--setenv PATH "$FINAL_PATH_VALUE")
 BWRAP_ARGS+=(--unsetenv SSH_AUTH_SOCK)
 BWRAP_ARGS+=(--unsetenv SSH_AGENT_PID)
 
@@ -1230,6 +1334,14 @@ for efile in "${ENV_FILES[@]}"; do
     log_info "  ${YELLOW}$efile${NC}"
 done
 log_info "Direct Environment Variables: ${YELLOW}${#ENV_VARS[@]}${NC}"
+log_info "Additional PATH Files (${#PATH_FILES[@]}):"
+for pfile in "${PATH_FILES[@]}"; do
+    log_info "  ${YELLOW}$pfile${NC}"
+done
+log_info "Appended PATH directories (${#PATH_ENTRIES[@]}):"
+for pdir in "${PATH_ENTRIES[@]}"; do
+    log_info "  ${YELLOW}$pdir${NC}"
+done
 log_info "${GREEN}=============================================${NC}\n"
 
 # Start socket proxy if Docker is enabled
