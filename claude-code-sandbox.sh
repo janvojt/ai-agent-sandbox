@@ -11,14 +11,18 @@ NC='\033[0m' # No Color
 # Default configuration
 DEFAULT_WHITELIST_FILE="${CLAUDE_SANDBOX_WHITELIST:-$HOME/.config/claude-sandbox/whitelist.txt}"
 DEFAULT_BLACKLIST_FILE="${CLAUDE_SANDBOX_BLACKLIST:-$HOME/.config/claude-sandbox/blacklist.txt}"
+DEFAULT_ENV_FILE="${CLAUDE_SANDBOX_ENV:-$HOME/.config/claude-sandbox/.env}"
 WORKING_DIR="$(pwd)"
 PROJECT_WHITELIST_FILE="$WORKING_DIR/.claude/whitelist.txt"
 PROJECT_BLACKLIST_FILE="$WORKING_DIR/.claude/blacklist.txt"
+PROJECT_ENV_FILE="$WORKING_DIR/.claude/.env"
 WHITELIST_FILES=()
 BLACKLIST_FILES=()
+ENV_FILES=()
 WHITELIST_PATHS_RO=()
 WHITELIST_PATHS_RW=()
 BLACKLIST_PATHS=()
+ENV_VARS=()
 BLACKLISTED_DIRS=()
 BLACKLIST_SEARCH_ROOTS=()
 WHITELIST_OVERRIDE_ARGS=()
@@ -44,6 +48,8 @@ OPTIONS:
     --agent, -a AGENT      AI coding agent to use: claudecode (default) or opencode
     --whitelist FILE        Add whitelist file (can be specified multiple times)
     --blacklist FILE        Add blacklist file (can be specified multiple times)
+    --env-path FILE         Add environment file (can be specified multiple times)
+    --env, -e KEY=VALUE     Set environment variable inside sandbox (can be specified multiple times)
     --whitelist-path PATH   Directly whitelist a path (read-only, can be specified multiple times)
     --whitelist-path-rw PATH Directly whitelist a path (read-write, can be specified multiple times)
     --blacklist-path PATH   Directly blacklist a path (relative to working dir, can be specified multiple times)
@@ -58,9 +64,11 @@ IMPLICIT CONFIGURATION FILES (automatically included if they exist):
     1. User-level (always):
        - $DEFAULT_WHITELIST_FILE
        - $DEFAULT_BLACKLIST_FILE
+       - $DEFAULT_ENV_FILE
     2. Project-level (if present):
        - .claude/whitelist.txt (in working directory)
        - .claude/blacklist.txt (in working directory)
+       - .claude/.env (in working directory)
 
 CONFIGURATION FILE FORMAT:
     Whitelist: Contains absolute or relative paths/patterns (one per line) that Claude can read
@@ -70,12 +78,15 @@ CONFIGURATION FILE FORMAT:
                 Supports glob patterns: /etc/java* or src/** will expand to all matching paths
                 Prefix with ! to override blacklist for a specific path (applied after blacklist)
     Blacklist: Contains paths relative to working directory that Claude cannot access
+    Env:       Contains KEY=VALUE entries to expose inside the sandbox
 
 EXAMPLES:
     $0
     $0 --agent opencode
     $0 --whitelist /path/to/custom-whitelist.txt
     $0 --whitelist file1.txt --whitelist file2.txt
+    $0 --env-path /path/to/.env
+    $0 --env API_TOKEN=secret
     $0 --whitelist-path /var/run/docker.sock
     $0 --whitelist-path-rw /shared/data
     $0 --blacklist-path .env --blacklist-path secrets/
@@ -98,6 +109,14 @@ while [[ $# -gt 0 ]]; do
         --blacklist)
             BLACKLIST_FILES+=("$2")
             EXPLICIT_BLACKLIST=true
+            shift 2
+            ;;
+        --env-path)
+            ENV_FILES+=("$2")
+            shift 2
+            ;;
+        --env|-e)
+            ENV_VARS+=("$2")
             shift 2
             ;;
         --blacklist-path)
@@ -317,6 +336,69 @@ strip_inline_comment() {
     # Trim trailing whitespace
     line="${line%"${line##*[![:space:]]}"}"
     echo "$line"
+}
+
+trim_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s\n' "$value"
+}
+
+parse_env_assignment() {
+    local line="$1"
+    local key_ref="$2"
+    local value_ref="$3"
+    local env_key
+    local env_value
+
+    line=$(trim_whitespace "$line")
+    [[ -z "$line" || "$line" =~ ^# ]] && return 1
+
+    if [[ "$line" == export[[:space:]]* ]]; then
+        line="${line#export}"
+        line=$(trim_whitespace "$line")
+    fi
+
+    [[ "$line" == *=* ]] || return 1
+
+    env_key=$(trim_whitespace "${line%%=*}")
+    env_value="${line#*=}"
+    env_value=$(trim_whitespace "$env_value")
+
+    if [[ ! "$env_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        log_info "${YELLOW}⚠${NC} Skipping invalid environment variable name: $env_key"
+        return 1
+    fi
+
+    if [[ "$env_value" == \"*\" && "$env_value" == *\" ]]; then
+        env_value="${env_value#\"}"
+        env_value="${env_value%\"}"
+    elif [[ "$env_value" == \'*\' && "$env_value" == *\' ]]; then
+        env_value="${env_value#\'}"
+        env_value="${env_value%\'}"
+    else
+        env_value="${env_value%%[[:space:]]#*}"
+        env_value=$(trim_whitespace "$env_value")
+    fi
+
+    printf -v "$key_ref" '%s' "$env_key"
+    printf -v "$value_ref" '%s' "$env_value"
+}
+
+set_sandbox_env() {
+    local assignment="$1"
+    local source_label="$2"
+    local key=""
+    local value=""
+
+    if ! parse_env_assignment "$assignment" key value; then
+        log_info "${YELLOW}⚠${NC} Skipping invalid environment entry from $source_label"
+        return 0
+    fi
+
+    BWRAP_ARGS+=(--setenv "$key" "$value")
+    log_info "${GREEN}✓${NC} Environment variable: $key"
 }
 
 # Parse override prefix in whitelist entries
@@ -699,6 +781,9 @@ fi
 if [[ -f "$DEFAULT_BLACKLIST_FILE" ]]; then
     BLACKLIST_FILES=("$DEFAULT_BLACKLIST_FILE" "${BLACKLIST_FILES[@]}")
 fi
+if [[ -f "$DEFAULT_ENV_FILE" ]]; then
+    ENV_FILES=("$DEFAULT_ENV_FILE" "${ENV_FILES[@]}")
+fi
 
 # Include project-level files if they exist (after default, before explicit)
 if [[ -f "$PROJECT_WHITELIST_FILE" ]]; then
@@ -706,6 +791,9 @@ if [[ -f "$PROJECT_WHITELIST_FILE" ]]; then
 fi
 if [[ -f "$PROJECT_BLACKLIST_FILE" ]]; then
     BLACKLIST_FILES+=("$PROJECT_BLACKLIST_FILE")
+fi
+if [[ -f "$PROJECT_ENV_FILE" ]]; then
+    ENV_FILES+=("$PROJECT_ENV_FILE")
 fi
 
 # Build bubblewrap arguments
@@ -987,6 +1075,33 @@ elif [[ "$AGENT" = "opencode" ]]; then
     BWRAP_ARGS+=(--setenv OPENCODE_PERMISSION '{"*":"allow"}')
 fi
 
+# Process environment files and direct environment variables last so explicit
+# sandbox environment entries can override earlier defaults.
+if [[ ${#ENV_FILES[@]} -gt 0 ]]; then
+    log_info "\n${GREEN}Processing environment files:${NC}"
+    for ENV_FILE in "${ENV_FILES[@]}"; do
+        if [[ ! -f "$ENV_FILE" ]]; then
+            log_info "${YELLOW}Warning: Environment file not found: $ENV_FILE (skipping)${NC}"
+            continue
+        fi
+
+        log_info "${GREEN}Processing env:${NC} $ENV_FILE"
+
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            trimmed_line=$(trim_whitespace "$line")
+            [[ -z "$trimmed_line" || "$trimmed_line" =~ ^# ]] && continue
+            set_sandbox_env "$line" "$ENV_FILE"
+        done < "$ENV_FILE"
+    done
+fi
+
+if [[ ${#ENV_VARS[@]} -gt 0 ]]; then
+    log_info "\n${GREEN}Processing direct environment variables:${NC}"
+    for env_var in "${ENV_VARS[@]}"; do
+        set_sandbox_env "$env_var" "--env"
+    done
+fi
+
 # Display configuration summary
 log_info "\n${GREEN}=== AI Coding Agent Sandbox Configuration ===${NC}"
 log_info "Agent: ${YELLOW}$AGENT${NC}"
@@ -999,6 +1114,11 @@ log_info "Blacklist Files (${#BLACKLIST_FILES[@]}):"
 for bfile in "${BLACKLIST_FILES[@]}"; do
     log_info "  ${YELLOW}$bfile${NC}"
 done
+log_info "Environment Files (${#ENV_FILES[@]}):"
+for efile in "${ENV_FILES[@]}"; do
+    log_info "  ${YELLOW}$efile${NC}"
+done
+log_info "Direct Environment Variables: ${YELLOW}${#ENV_VARS[@]}${NC}"
 log_info "${GREEN}=============================================${NC}\n"
 
 # Start socket proxy if Docker is enabled

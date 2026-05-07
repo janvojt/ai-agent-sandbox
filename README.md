@@ -7,7 +7,7 @@ A secure bubblewrap-based sandboxing solution for running Claude Code with stric
 - ✅ **Whitelist-based filesystem access** - Only explicitly allowed paths are readable
 - ✅ **Blacklist protection** - Block sensitive files within working directory
 - ✅ **Full network access** - Both local and internet access enabled
-- ✅ **Minimal environment** - Clean environment variables, no SSH agent access
+- ✅ **Configurable environment** - Optional `.env` files and direct variables, no SSH agent access
 - ✅ **Working directory isolation** - Full read-write only in current directory
 
 ## Requirements
@@ -71,6 +71,20 @@ nano ~/.config/claude-sandbox/blacklist.txt
 
 **Note:** The default whitelist and blacklist files (`~/.config/claude-sandbox/{whitelist,blacklist}.txt`) are always included automatically. Additional files specified via `--whitelist` and `--blacklist` are merged with the defaults.
 
+### Environment variables:
+```bash
+# Set a variable directly for this run
+./claude-code-sandbox.sh --env API_TOKEN=secret
+
+# Short form can be repeated
+./claude-code-sandbox.sh -e API_TOKEN=secret -e FEATURE_FLAG=true
+
+# Add one or more dotenv files
+./claude-code-sandbox.sh --env-path /path/to/.env
+```
+
+Environment files are optional. If present, `~/.config/claude-sandbox/.env` and `.claude/.env` are included automatically, and additional files from `--env-path` are merged with them. Direct `--env/-e` entries are applied last.
+
 ### Pass arguments to Claude Code:
 ```bash
 ./claude-code-sandbox.sh -- --model claude-sonnet-4-5
@@ -94,6 +108,7 @@ Docker access is provided through a per-run socket proxy created at `.docker-pro
 ```bash
 export CLAUDE_SANDBOX_WHITELIST=/path/to/whitelist.txt
 export CLAUDE_SANDBOX_BLACKLIST=/path/to/blacklist.txt
+export CLAUDE_SANDBOX_ENV=/path/to/.env
 ./claude-code-sandbox.sh
 ```
 
@@ -101,25 +116,45 @@ export CLAUDE_SANDBOX_BLACKLIST=/path/to/blacklist.txt
 
 ### Multiple Configuration Files
 
-The script supports **multiple whitelist and blacklist files**, which are processed in order:
+The script supports **multiple whitelist, blacklist, and environment files**, which are processed in order:
 
 1. **User-level files** (always included if they exist):
    - `~/.config/claude-sandbox/whitelist.txt`
    - `~/.config/claude-sandbox/blacklist.txt`
-   - **Auto-generated** if they don't exist and no explicit files are provided
+   - `~/.config/claude-sandbox/.env`
+   - Whitelist and blacklist files are auto-generated if they don't exist and no explicit files are provided; `.env` is optional and never auto-generated
 
 2. **Project-level files** (automatically included if they exist):
    - `.claude/whitelist.txt` (in working directory)
    - `.claude/blacklist.txt` (in working directory)
+   - `.claude/.env` (in working directory)
    - **Never auto-generated** - create manually if needed
 
-3. **Additional files** specified via `--whitelist` and `--blacklist` flags
+3. **Additional files** specified via `--whitelist`, `--blacklist`, and `--env-path` flags
 
 All files are merged together, allowing you to:
 - Maintain a base configuration in user-level files
 - Add project-specific rules in `.claude/` directory (can be committed to version control)
 - Override with additional files via command-line flags
 - Share configurations across teams and projects
+
+### Environment File Format
+
+Environment files use dotenv-style `KEY=VALUE` entries:
+
+```bash
+# Comments and blank lines are ignored
+API_TOKEN=secret
+FEATURE_FLAG=true
+QUOTED_VALUE="value with spaces"
+export TOOL_HOME=/opt/tooling
+```
+
+**Important:**
+- Values are exposed inside the sandbox via `bubblewrap --setenv`.
+- Later entries override earlier entries when the same key appears multiple times.
+- Variable names must match shell environment naming rules, such as `API_TOKEN` or `_PRIVATE`.
+- Logs show variable names only, not values.
 
 ### Whitelist Format
 
