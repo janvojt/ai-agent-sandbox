@@ -311,9 +311,11 @@ start_socket_proxy() {
 
 cleanup_socket_proxy() {
     if [[ -n "${PROXY_CONTAINER_NAME:-}" ]]; then
-        log_info "${YELLOW}Cleaning up socket proxy: $PROXY_CONTAINER_NAME${NC}"
-        docker stop "$PROXY_CONTAINER_NAME" 2>/dev/null || true
-        docker rm -f "$PROXY_CONTAINER_NAME" 2>/dev/null || true
+        local container_name="$PROXY_CONTAINER_NAME"
+        PROXY_CONTAINER_NAME=""
+        log_info "${YELLOW}Cleaning up socket proxy: $container_name${NC}"
+        docker stop "$container_name" 2>/dev/null || true
+        docker rm -f "$container_name" 2>/dev/null || true
     fi
     if [[ -n "${PROXY_SOCKET_PATH:-}" ]] && [[ -e "$PROXY_SOCKET_PATH" ]]; then
         rm -f "$PROXY_SOCKET_PATH" 2>/dev/null || true
@@ -323,7 +325,12 @@ cleanup_socket_proxy() {
     fi
 }
 
-trap cleanup_socket_proxy EXIT INT TERM
+# Shells conventionally report signal termination as 128 + signal number.
+SIGTERM_SIGNAL=15
+SIGTERM_EXIT_STATUS=$((128 + SIGTERM_SIGNAL))
+
+trap cleanup_socket_proxy EXIT
+trap 'exit "$SIGTERM_EXIT_STATUS"' TERM
 
 # Strip inline comments and trim whitespace from a line
 # Usage: result=$(strip_inline_comment "$line")
@@ -1135,9 +1142,12 @@ elif [[ "$AGENT" = "opencode" ]]; then
 fi
 
 # Execute agent or bash (for dry-run) in sandbox
+sandbox_status=0
 if [[ "$DRY_RUN" = true ]]; then
     log_info "${YELLOW}=== DRY RUN MODE: Starting bash shell in sandbox ===${NC}\n"
-    exec "$BWRAP_BIN" "${BWRAP_ARGS[@]}" -- /bin/bash
+    "$BWRAP_BIN" "${BWRAP_ARGS[@]}" -- /bin/bash || sandbox_status=$?
 else
-    exec "$BWRAP_BIN" "${BWRAP_ARGS[@]}" -- "$AGENT_BIN" "${DEFAULT_AGENT_ARGS[@]}" "${AGENT_ARGS[@]}"
+    "$BWRAP_BIN" "${BWRAP_ARGS[@]}" -- "$AGENT_BIN" "${DEFAULT_AGENT_ARGS[@]}" "${AGENT_ARGS[@]}" || sandbox_status=$?
 fi
+
+exit "$sandbox_status"
