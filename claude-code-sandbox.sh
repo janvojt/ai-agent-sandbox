@@ -326,10 +326,13 @@ cleanup_socket_proxy() {
 }
 
 # Shells conventionally report signal termination as 128 + signal number.
+SIGHUP_SIGNAL=1
 SIGTERM_SIGNAL=15
+SIGHUP_EXIT_STATUS=$((128 + SIGHUP_SIGNAL))
 SIGTERM_EXIT_STATUS=$((128 + SIGTERM_SIGNAL))
 
 trap cleanup_socket_proxy EXIT
+trap 'exit "$SIGHUP_EXIT_STATUS"' HUP
 trap 'exit "$SIGTERM_EXIT_STATUS"' TERM
 
 # Strip inline comments and trim whitespace from a line
