@@ -8,6 +8,7 @@ A secure bubblewrap-based sandboxing solution for running Claude Code with stric
 - ✅ **Blacklist protection** - Block sensitive files within working directory
 - ✅ **Full network access** - Both local and internet access enabled
 - ✅ **Configurable environment** - Optional `.env` files and direct variables, no SSH agent access
+- ✅ **Virtualenv support** - Optionally expose the active Python virtual environment
 - ✅ **Working directory isolation** - Full read-write only in current directory
 
 ## Requirements
@@ -84,6 +85,17 @@ nano ~/.config/claude-sandbox/blacklist.txt
 ```
 
 Environment files are optional. If present, `~/.config/claude-sandbox/.env` and `.claude/.env` are included automatically, and additional files from `--env-path` are merged with them. Direct `--env/-e` entries are applied last.
+
+### Python virtual environments:
+```bash
+# Activate a venv in your shell first
+source .venv/bin/activate
+
+# Expose the venv inside the sandbox and prepend its bin directory to PATH
+./claude-code-sandbox.sh --venv
+```
+
+`--venv` detects the active Python virtual environment from `VIRTUAL_ENV`, mounts the venv read-only, sets `VIRTUAL_ENV` inside the sandbox, and prepends `$VIRTUAL_ENV/bin` to `PATH`. If no active venv is detected, the option is ignored.
 
 ### Pass arguments to Claude Code:
 ```bash

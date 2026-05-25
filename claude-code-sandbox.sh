@@ -32,10 +32,13 @@ QUIET=false
 DRY_RUN=false
 AGENT="claudecode"
 ENABLE_DOCKER=false
+ENABLE_VENV=false
 SOCKET_PROXY_IMAGE="${CLAUDE_SANDBOX_DOCKER_PROXY:-ghcr.io/wollomatic/socket-proxy:1}"
 PROXY_CONTAINER_NAME=""
 PROXY_SOCKET_PATH=""
 PROXY_SOCKET_DIR=""
+VENV_PATH=""
+VENV_BIN_DIR=""
 
 # Print usage
 usage() {
@@ -54,6 +57,7 @@ OPTIONS:
     --whitelist-path-rw PATH Directly whitelist a path (read-write, can be specified multiple times)
     --blacklist-path PATH   Directly blacklist a path (relative to working dir, can be specified multiple times)
     --enable-docker, -d     Enable Docker access via filtered socket proxy
+    --venv                  Include active Python virtual environment in sandbox PATH
     --docker-image IMAGE    Socket proxy image (default: ghcr.io/wollomatic/socket-proxy:1)
     --dry-run              Start bash shell instead of agent (for testing)
     --quiet, -q            Suppress informational output (faster startup)
@@ -90,6 +94,7 @@ EXAMPLES:
     $0 --whitelist-path /var/run/docker.sock
     $0 --whitelist-path-rw /shared/data
     $0 --blacklist-path .env --blacklist-path secrets/
+    $0 --venv
     $0 -- --model claude-sonnet-4-5
     $0 -a opencode -- --model deepseek-chat
 
@@ -136,6 +141,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --enable-docker|-d)
             ENABLE_DOCKER=true
+            shift
+            ;;
+        --venv)
+            ENABLE_VENV=true
             shift
             ;;
         --docker-image)
@@ -202,6 +211,43 @@ validate_docker() {
             echo -e "${RED}Error: Failed to pull socket proxy image${NC}" >&2
             exit 1
         fi
+    fi
+}
+
+detect_venv() {
+    if [[ "$ENABLE_VENV" != true ]]; then
+        return 0
+    fi
+
+    if [[ -z "${VIRTUAL_ENV:-}" ]]; then
+        log_info "${YELLOW}Warning: --venv specified, but no active virtual environment was detected (continuing without venv)${NC}"
+        ENABLE_VENV=false
+        return 0
+    fi
+
+    VENV_PATH="${VIRTUAL_ENV/#\~/$HOME}"
+    VENV_PATH="${VENV_PATH//\$HOME/$HOME}"
+    if [[ "$VENV_PATH" != /* ]]; then
+        VENV_PATH="$WORKING_DIR/$VENV_PATH"
+    fi
+
+    while [[ "$VENV_PATH" == */ && "$VENV_PATH" != "/" ]]; do
+        VENV_PATH="${VENV_PATH%/}"
+    done
+
+    if [[ ! -d "$VENV_PATH" ]]; then
+        log_info "${YELLOW}Warning: active virtual environment does not exist: $VENV_PATH (continuing without venv)${NC}"
+        VENV_PATH=""
+        ENABLE_VENV=false
+        return 0
+    fi
+
+    VENV_BIN_DIR="$VENV_PATH/bin"
+    if [[ ! -d "$VENV_BIN_DIR" ]]; then
+        log_info "${YELLOW}Warning: active virtual environment has no bin directory: $VENV_BIN_DIR (continuing without venv)${NC}"
+        VENV_PATH=""
+        VENV_BIN_DIR=""
+        ENABLE_VENV=false
     fi
 }
 
@@ -684,6 +730,7 @@ if [[ "$AGENT" != "claudecode" ]] && [[ "$AGENT" != "opencode" ]]; then
 fi
 
 validate_docker
+detect_venv
 
 # Cache command availability checks
 BWRAP_BIN=$(command -v bwrap 2>/dev/null)
@@ -937,6 +984,14 @@ if [[ ${#WHITELIST_OVERRIDE_ARGS[@]} -gt 0 ]]; then
     BWRAP_ARGS+=("${WHITELIST_OVERRIDE_ARGS[@]}")
 fi
 
+if [[ "$ENABLE_VENV" = true ]]; then
+    log_info "\n${GREEN}Virtual environment:${NC} $VENV_PATH"
+    BWRAP_ARGS+=(--ro-bind "$VENV_PATH" "$VENV_PATH")
+    BWRAP_ARGS+=(--setenv VIRTUAL_ENV "$VENV_PATH")
+    BWRAP_ARGS+=(--unsetenv PYTHONHOME)
+    log_info "${GREEN}✓${NC} Mounted virtual environment: $VENV_PATH (read-only)"
+fi
+
 log_info "\n${YELLOW}Agent-specific configuration bindings:"
 if [[ "$AGENT" = "claudecode" ]]; then
     # Bind claude binary
@@ -1058,11 +1113,16 @@ fi
 
 # Set minimal environment
 BWRAP_ARGS+=(--setenv TERM "${TERM:-xterm-256color}")
+SANDBOX_PATH=""
 if [[ "$AGENT" = "claudecode" ]]; then
-    BWRAP_ARGS+=(--setenv PATH "$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin")
+    SANDBOX_PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 elif [[ "$AGENT" = "opencode" ]]; then
-    BWRAP_ARGS+=(--setenv PATH "$HOME/.opencode/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin")
+    SANDBOX_PATH="$HOME/.opencode/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 fi
+if [[ "$ENABLE_VENV" = true ]]; then
+    SANDBOX_PATH="$VENV_BIN_DIR:$SANDBOX_PATH"
+fi
+BWRAP_ARGS+=(--setenv PATH "$SANDBOX_PATH")
 BWRAP_ARGS+=(--unsetenv SSH_AUTH_SOCK)
 BWRAP_ARGS+=(--unsetenv SSH_AGENT_PID)
 
@@ -1116,6 +1176,11 @@ fi
 log_info "\n${GREEN}=== AI Coding Agent Sandbox Configuration ===${NC}"
 log_info "Agent: ${YELLOW}$AGENT${NC}"
 log_info "Working Directory: ${YELLOW}$WORKING_DIR${NC}"
+if [[ "$ENABLE_VENV" = true ]]; then
+    log_info "Virtual Environment: ${YELLOW}$VENV_PATH${NC}"
+else
+    log_info "Virtual Environment: ${YELLOW}disabled${NC}"
+fi
 log_info "Whitelist Files (${#WHITELIST_FILES[@]}):"
 for wfile in "${WHITELIST_FILES[@]}"; do
     log_info "  ${YELLOW}$wfile${NC}"
