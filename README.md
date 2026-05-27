@@ -1,6 +1,6 @@
-# Claude Code Sandbox Script
+# AI Agent Sandbox Script
 
-A secure bubblewrap-based sandboxing solution for running Claude Code with strict filesystem isolation.
+A secure bubblewrap-based sandboxing solution for running AI coding agents with strict filesystem isolation.
 
 ## Features
 
@@ -17,74 +17,74 @@ A secure bubblewrap-based sandboxing solution for running Claude Code with stric
   - Debian/Ubuntu: `sudo apt install bubblewrap`
   - Fedora: `sudo dnf install bubblewrap`
   - Arch: `sudo pacman -S bubblewrap`
-- **Claude Code** - Install from https://docs.claude.com/en/docs/claude-code
+- **An AI coding agent** - Claude Code or OpenCode are currently supported
 
 ## Installation
 
 1. Make the script executable:
 ```bash
-chmod +x claude-code-sandbox.sh
+chmod +x ai-agent-sandbox.sh
 ```
 
 2. (Optional) Move to a directory in your PATH:
 ```bash
-sudo mv claude-code-sandbox.sh /usr/local/bin/claude-sandbox
+sudo mv ai-agent-sandbox.sh /usr/local/bin/ai-agent-sandbox
 ```
 
 3. Create configuration directory:
 ```bash
-mkdir -p ~/.config/claude-sandbox
+mkdir -p ~/.config/ai-agent-sandbox
 ```
 
 4. Copy and customize the whitelist and blacklist files:
 ```bash
-cp whitelist-example.txt ~/.config/claude-sandbox/whitelist.txt
-cp blacklist-example.txt ~/.config/claude-sandbox/blacklist.txt
+cp whitelist-example.txt ~/.config/ai-agent-sandbox/whitelist.txt
+cp blacklist-example.txt ~/.config/ai-agent-sandbox/blacklist.txt
 ```
 
 5. Edit the files to match your needs:
 ```bash
-nano ~/.config/claude-sandbox/whitelist.txt
-nano ~/.config/claude-sandbox/blacklist.txt
+nano ~/.config/ai-agent-sandbox/whitelist.txt
+nano ~/.config/ai-agent-sandbox/blacklist.txt
 ```
 
 ## Usage
 
 ### Basic usage:
 ```bash
-./claude-code-sandbox.sh
+./ai-agent-sandbox.sh
 ```
 
 ### Custom whitelist/blacklist:
 ```bash
 # Single custom file (default file is still included)
-./claude-code-sandbox.sh \
+./ai-agent-sandbox.sh \
   --whitelist /path/to/my-whitelist.txt \
   --blacklist /path/to/my-blacklist.txt
 
 # Multiple whitelist/blacklist files
-./claude-code-sandbox.sh \
+./ai-agent-sandbox.sh \
   --whitelist ~/shared-whitelist.txt \
   --whitelist ./project-whitelist.txt \
   --blacklist ~/shared-blacklist.txt \
   --blacklist ./project-blacklist.txt
 ```
 
-**Note:** The default whitelist and blacklist files (`~/.config/claude-sandbox/{whitelist,blacklist}.txt`) are always included automatically. Additional files specified via `--whitelist` and `--blacklist` are merged with the defaults.
+**Note:** The default whitelist and blacklist files (`~/.config/ai-agent-sandbox/{whitelist,blacklist}.txt`) are always included automatically. Additional files specified via `--whitelist` and `--blacklist` are merged with the defaults.
 
 ### Environment variables:
 ```bash
 # Set a variable directly for this run
-./claude-code-sandbox.sh --env API_TOKEN=secret
+./ai-agent-sandbox.sh --env API_TOKEN=secret
 
 # Short form can be repeated
-./claude-code-sandbox.sh -e API_TOKEN=secret -e FEATURE_FLAG=true
+./ai-agent-sandbox.sh -e API_TOKEN=secret -e FEATURE_FLAG=true
 
 # Add one or more dotenv files
-./claude-code-sandbox.sh --env-path /path/to/.env
+./ai-agent-sandbox.sh --env-path /path/to/.env
 ```
 
-Environment files are optional. If present, `~/.config/claude-sandbox/.env` and `.claude/.env` are included automatically, and additional files from `--env-path` are merged with them. Direct `--env/-e` entries are applied last.
+Environment files are optional. If present, `~/.config/ai-agent-sandbox/.env` and `.ai-agent-sandbox/.env` are included automatically, and additional files from `--env-path` are merged with them. Direct `--env/-e` entries are applied last.
 
 ### Python virtual environments:
 ```bash
@@ -92,23 +92,23 @@ Environment files are optional. If present, `~/.config/claude-sandbox/.env` and 
 source .venv/bin/activate
 
 # Expose the venv inside the sandbox and prepend its bin directory to PATH
-./claude-code-sandbox.sh --venv
+./ai-agent-sandbox.sh --venv
 ```
 
 `--venv` detects the active Python virtual environment from `VIRTUAL_ENV`, mounts the venv read-only, sets `VIRTUAL_ENV` inside the sandbox, and prepends `$VIRTUAL_ENV/bin` to `PATH`. If no active venv is detected, the option is ignored.
 
-### Pass arguments to Claude Code:
+### Pass arguments to the selected agent:
 ```bash
-./claude-code-sandbox.sh -- --model claude-sonnet-4-5
+./ai-agent-sandbox.sh -- --model claude-sonnet-4-5
 ```
 
 ### Docker support (Testcontainers)
 ```bash
 # Enable Docker access via filtered socket proxy (long or short flag)
-./claude-code-sandbox.sh -d
+./ai-agent-sandbox.sh -d
 
 # Add writable caches for dependency downloads
-./claude-code-sandbox.sh \
+./ai-agent-sandbox.sh \
   -d \
   --whitelist-path-rw ~/.m2/repository \
   --whitelist-path-rw ~/.gradle/caches
@@ -118,10 +118,10 @@ Docker access is provided through a per-run socket proxy created at `.docker-pro
 
 ### Using environment variables:
 ```bash
-export CLAUDE_SANDBOX_WHITELIST=/path/to/whitelist.txt
-export CLAUDE_SANDBOX_BLACKLIST=/path/to/blacklist.txt
-export CLAUDE_SANDBOX_ENV=/path/to/.env
-./claude-code-sandbox.sh
+export AI_AGENT_SANDBOX_WHITELIST=/path/to/whitelist.txt
+export AI_AGENT_SANDBOX_BLACKLIST=/path/to/blacklist.txt
+export AI_AGENT_SANDBOX_ENV=/path/to/.env
+./ai-agent-sandbox.sh
 ```
 
 ## Configuration
@@ -131,22 +131,22 @@ export CLAUDE_SANDBOX_ENV=/path/to/.env
 The script supports **multiple whitelist, blacklist, and environment files**, which are processed in order:
 
 1. **User-level files** (always included if they exist):
-   - `~/.config/claude-sandbox/whitelist.txt`
-   - `~/.config/claude-sandbox/blacklist.txt`
-   - `~/.config/claude-sandbox/.env`
+   - `~/.config/ai-agent-sandbox/whitelist.txt`
+   - `~/.config/ai-agent-sandbox/blacklist.txt`
+   - `~/.config/ai-agent-sandbox/.env`
    - Whitelist and blacklist files are auto-generated if they don't exist and no explicit files are provided; `.env` is optional and never auto-generated
 
 2. **Project-level files** (automatically included if they exist):
-   - `.claude/whitelist.txt` (in working directory)
-   - `.claude/blacklist.txt` (in working directory)
-   - `.claude/.env` (in working directory)
+   - `.ai-agent-sandbox/whitelist.txt` (in working directory)
+   - `.ai-agent-sandbox/blacklist.txt` (in working directory)
+   - `.ai-agent-sandbox/.env` (in working directory)
    - **Never auto-generated** - create manually if needed
 
 3. **Additional files** specified via `--whitelist`, `--blacklist`, and `--env-path` flags
 
 All files are merged together, allowing you to:
 - Maintain a base configuration in user-level files
-- Add project-specific rules in `.claude/` directory (can be committed to version control)
+- Add project-specific rules in `.ai-agent-sandbox/` directory (can be committed to version control)
 - Override with additional files via command-line flags
 - Share configurations across teams and projects
 
@@ -170,7 +170,7 @@ export TOOL_HOME=/opt/tooling
 
 ### Whitelist Format
 
-The whitelist file contains **absolute paths or glob patterns** (one per line) that Claude can read:
+The whitelist file contains **absolute paths or glob patterns** (one per line) that the agent can read:
 
 ```
 # System binaries (read-only by default)
@@ -196,7 +196,7 @@ The whitelist file contains **absolute paths or glob patterns** (one per line) t
 - Paths must be absolute (start with `/`)
 - **Read-write access**: Suffix a path with `:rw` to mount it read-write (e.g., `/path/to/dir:rw`)
   - Default: all paths are mounted read-only (safer)
-  - Use `:rw` only for paths where Claude needs write access (caches, build outputs, etc.)
+  - Use `:rw` only for paths where the agent needs write access (caches, build outputs, etc.)
   - Works with both literal paths and patterns (e.g., `/opt/cache-*:rw`)
 - **Blacklist override**: Prefix a path with `!` to re-allow a specific path that would otherwise be blocked by the blacklist
   - Overrides are applied after the blacklist, so they take precedence
@@ -210,7 +210,7 @@ The whitelist file contains **absolute paths or glob patterns** (one per line) t
 
 ### Blacklist Format
 
-The blacklist file contains **relative paths** from the working directory that Claude cannot access:
+The blacklist file contains **relative paths** from the working directory that the agent cannot access:
 
 ```
 # Environment files
@@ -268,7 +268,7 @@ The blacklist file contains **relative paths** from the working directory that C
 1. ✅ **Filesystem access outside working directory** - Only whitelisted system paths are readable
 2. ✅ **Sensitive files in working directory** - Blacklisted patterns are hidden
 3. ✅ **SSH agent access** - SSH_AUTH_SOCK is removed from environment
-4. ✅ **Home directory access** - Only minimal Claude config is exposed
+4. ✅ **Home directory access** - Only minimal agent-specific config is exposed
 
 ### Limitations and Considerations
 
@@ -278,9 +278,9 @@ The blacklist file contains **relative paths** from the working directory that C
    - Glob patterns are expanded at sandbox start time
    - Performance impact is minimal
 
-3. ⚠️ **Working directory is still read-write** - Claude has full access to create/modify/delete files in the working directory (except blacklisted ones). This is necessary for Claude Code to function.
+3. ⚠️ **Working directory is still read-write** - The agent has full access to create/modify/delete files in the working directory (except blacklisted ones). This is necessary for coding agents to function.
 
-4. ⚠️ **No process isolation** - While filesystem is isolated, Claude Code processes run on the host system (though in separate namespaces).
+4. ⚠️ **No process isolation** - While filesystem is isolated, agent processes run on the host system (though in separate namespaces).
 
 ### Recommended Additional Hardening
 
@@ -289,12 +289,12 @@ For maximum security, consider:
 1. **Resource limits**:
 ```bash
 # Use systemd-run or ulimit to restrict CPU/memory
-systemd-run --scope -p CPUQuota=200% -p MemoryMax=4G ./claude-code-sandbox.sh
+systemd-run --scope -p CPUQuota=200% -p MemoryMax=4G ./ai-agent-sandbox.sh
 ```
 
 2. **Read-only working directory option**:
 ```bash
-# For analysis tasks where Claude shouldn't modify files
+# For analysis tasks where the agent shouldn't modify files
 # (Would need script modification to support this use case)
 ```
 
@@ -315,17 +315,17 @@ auditctl -w /path/to/project -p rwa
 ### "bubblewrap is not installed"
 Install bubblewrap using your package manager (see Requirements section).
 
-### "claude is not installed"
-Install Claude Code from https://docs.claude.com/en/docs/claude-code
+### "agent is not installed"
+Install the selected agent. Claude Code and OpenCode are currently supported.
 
-### Claude can't access necessary system libraries
+### The agent can't access necessary system libraries
 Add the required paths to your whitelist file. Common additions:
 - `/usr/lib/x86_64-linux-gnu` (Debian/Ubuntu)
 - `/usr/lib64` (RedHat/Fedora)
 - `/opt/custom-tools`
 
-### Claude needs to access a specific sensitive file
-If you genuinely need Claude to access a file that's blacklisted:
+### The agent needs to access a specific sensitive file
+If you genuinely need the agent to access a file that's blacklisted:
 1. Add an override entry to the whitelist (prefix with `!`), or
 2. Remove it from the blacklist, or
 3. Create a copy outside the blacklisted pattern
@@ -337,41 +337,41 @@ If you genuinely need Claude to access a file that's blacklisted:
 You can maintain layered configurations at different levels:
 
 ```bash
-# Layer 1: User-level (~/.config/claude-sandbox/whitelist.txt)
+# Layer 1: User-level (~/.config/ai-agent-sandbox/whitelist.txt)
 /usr/bin
 /usr/lib
 /usr/share
 
-# Layer 2: Project-level (.claude/whitelist.txt in your project)
+# Layer 2: Project-level (.ai-agent-sandbox/whitelist.txt in your project)
 /opt/custom-compiler
 /home/user/project-specific-libs
 
 # Layer 3: Additional files via command line
-claude-code-sandbox.sh --whitelist ./team-shared-whitelist.txt
+ai-agent-sandbox.sh --whitelist ./team-shared-whitelist.txt
 ```
 
 **Using project-level files:**
 ```bash
 # Create project-level configuration (can be committed to git)
-mkdir -p .claude
-cat > .claude/whitelist.txt << EOF
+mkdir -p .ai-agent-sandbox
+cat > .ai-agent-sandbox/whitelist.txt << EOF
 /opt/project-tools
 /usr/lib/project-dependencies
 EOF
 
-cat > .claude/blacklist.txt << EOF
+cat > .ai-agent-sandbox/blacklist.txt << EOF
 .env.local
 secrets/
 *.key
 EOF
 
 # Now these files are automatically used when running in this directory
-claude-code-sandbox.sh
+ai-agent-sandbox.sh
 ```
 
 This approach allows you to:
 - Keep common system paths in user-level files
-- Add project-specific rules in `.claude/` (version controlled)
+- Add project-specific rules in `.ai-agent-sandbox/` (version controlled)
 - Share configurations across team members
 - Override with additional files when needed
 
@@ -381,7 +381,7 @@ This approach allows you to:
 # Java tools
 /etc/java*
 /etc/maven
-~/.m2/repository:rw  # Maven cache (read-write so Claude can download dependencies)
+~/.m2/repository:rw  # Maven cache (read-write so the agent can download dependencies)
 
 # blacklist.txt
 .env

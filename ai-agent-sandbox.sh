@@ -9,13 +9,13 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Default configuration
-DEFAULT_WHITELIST_FILE="${CLAUDE_SANDBOX_WHITELIST:-$HOME/.config/claude-sandbox/whitelist.txt}"
-DEFAULT_BLACKLIST_FILE="${CLAUDE_SANDBOX_BLACKLIST:-$HOME/.config/claude-sandbox/blacklist.txt}"
-DEFAULT_ENV_FILE="${CLAUDE_SANDBOX_ENV:-$HOME/.config/claude-sandbox/.env}"
+DEFAULT_WHITELIST_FILE="${AI_AGENT_SANDBOX_WHITELIST:-$HOME/.config/ai-agent-sandbox/whitelist.txt}"
+DEFAULT_BLACKLIST_FILE="${AI_AGENT_SANDBOX_BLACKLIST:-$HOME/.config/ai-agent-sandbox/blacklist.txt}"
+DEFAULT_ENV_FILE="${AI_AGENT_SANDBOX_ENV:-$HOME/.config/ai-agent-sandbox/.env}"
 WORKING_DIR="$(pwd)"
-PROJECT_WHITELIST_FILE="$WORKING_DIR/.claude/whitelist.txt"
-PROJECT_BLACKLIST_FILE="$WORKING_DIR/.claude/blacklist.txt"
-PROJECT_ENV_FILE="$WORKING_DIR/.claude/.env"
+PROJECT_WHITELIST_FILE="$WORKING_DIR/.ai-agent-sandbox/whitelist.txt"
+PROJECT_BLACKLIST_FILE="$WORKING_DIR/.ai-agent-sandbox/blacklist.txt"
+PROJECT_ENV_FILE="$WORKING_DIR/.ai-agent-sandbox/.env"
 WHITELIST_FILES=()
 BLACKLIST_FILES=()
 ENV_FILES=()
@@ -33,7 +33,7 @@ DRY_RUN=false
 AGENT="claudecode"
 ENABLE_DOCKER=false
 ENABLE_VENV=false
-SOCKET_PROXY_IMAGE="${CLAUDE_SANDBOX_DOCKER_PROXY:-ghcr.io/wollomatic/socket-proxy:1}"
+SOCKET_PROXY_IMAGE="${AI_AGENT_SANDBOX_DOCKER_PROXY:-ghcr.io/wollomatic/socket-proxy:1}"
 PROXY_CONTAINER_NAME=""
 PROXY_SOCKET_PATH=""
 PROXY_SOCKET_DIR=""
@@ -70,18 +70,18 @@ IMPLICIT CONFIGURATION FILES (automatically included if they exist):
        - $DEFAULT_BLACKLIST_FILE
        - $DEFAULT_ENV_FILE
     2. Project-level (if present):
-       - .claude/whitelist.txt (in working directory)
-       - .claude/blacklist.txt (in working directory)
-       - .claude/.env (in working directory)
+       - .ai-agent-sandbox/whitelist.txt (in working directory)
+       - .ai-agent-sandbox/blacklist.txt (in working directory)
+       - .ai-agent-sandbox/.env (in working directory)
 
 CONFIGURATION FILE FORMAT:
-    Whitelist: Contains absolute or relative paths/patterns (one per line) that Claude can read
+    Whitelist: Contains absolute or relative paths/patterns (one per line) that the agent can read
                 Relative paths are resolved relative to working directory
                 Default: read-only bind mount
                 Suffix with :rw for read-write bind (e.g., /path/to/dir:rw or data/:rw)
                 Supports glob patterns: /etc/java* or src/** will expand to all matching paths
                 Prefix with ! to override blacklist for a specific path (applied after blacklist)
-    Blacklist: Contains paths relative to working directory that Claude cannot access
+    Blacklist: Contains paths relative to working directory that the agent cannot access
     Env:       Contains KEY=VALUE entries to expose inside the sandbox
 
 EXAMPLES:
@@ -282,7 +282,7 @@ collect_allowed_mount_paths() {
 }
 
 start_socket_proxy() {
-    PROXY_CONTAINER_NAME="claude-sandbox-proxy-$$"
+    PROXY_CONTAINER_NAME="ai-agent-sandbox-proxy-$$"
     PROXY_SOCKET_DIR="$WORKING_DIR/.docker-proxy"
     PROXY_SOCKET_PATH="$PROXY_SOCKET_DIR/docker.sock"
     local docker_group_gid=""
@@ -765,8 +765,8 @@ if [[ ! -f "$DEFAULT_WHITELIST_FILE" ]] && [[ "$EXPLICIT_WHITELIST" = false ]]; 
     echo -e "${YELLOW}Creating default whitelist...${NC}" >&2
     mkdir -p "$(dirname "$DEFAULT_WHITELIST_FILE")"
     cat > "$DEFAULT_WHITELIST_FILE" << 'EOWHITELIST'
-# Claude Code Sandbox Whitelist
-# Add absolute paths (one per line) that Claude should be able to read
+# AI Agent Sandbox Whitelist
+# Add absolute paths (one per line) that the agent should be able to read
 # Lines starting with # are ignored
 
 # Essential system directories
@@ -798,8 +798,8 @@ if [[ ! -f "$DEFAULT_BLACKLIST_FILE" ]] && [[ "$EXPLICIT_BLACKLIST" = false ]]; 
     echo -e "${YELLOW}Creating default blacklist...${NC}" >&2
     mkdir -p "$(dirname "$DEFAULT_BLACKLIST_FILE")"
     cat > "$DEFAULT_BLACKLIST_FILE" << 'EOBLACKLIST'
-# Claude Code Sandbox Blacklist
-# Add paths relative to working directory that Claude should NOT access
+# AI Agent Sandbox Blacklist
+# Add paths relative to working directory that the agent should NOT access
 # Lines starting with # are ignored
 
 # Common sensitive files
@@ -1024,7 +1024,7 @@ if [[ "$AGENT" = "claudecode" ]]; then
         BWRAP_ARGS+=(--bind "$HOME/.claude.json" "$HOME/.claude.json")
         log_info "${GREEN}✓${NC} Mounted ~/.claude.json (read-write)"
     else
-        # Create empty file if it doesn't exist so Claude can write to it
+        # Create empty file if it doesn't exist so Claude Code can write to it
         touch "$HOME/.claude.json"
         BWRAP_ARGS+=(--bind "$HOME/.claude.json" "$HOME/.claude.json")
         log_info "${YELLOW}✓${NC} Created and mounted ~/.claude.json (read-write)"

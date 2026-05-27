@@ -1,5 +1,5 @@
-# Claude Code Sandbox Blacklist
-# Add paths relative to working directory that Claude should NOT access
+# AI Agent Sandbox Blacklist
+# Add paths relative to working directory that the agent should NOT access
 # Lines starting with # are ignored
 # Supports glob patterns: *, ?
 # Supports ant-style recursive patterns: ** (e.g., **/wallet.dat matches anywhere)

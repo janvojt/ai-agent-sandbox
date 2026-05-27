@@ -1,5 +1,5 @@
-# Claude Code Sandbox Whitelist
-# Add absolute or relative paths (one per line) that Claude should be able to read
+# AI Agent Sandbox Whitelist
+# Add absolute or relative paths (one per line) that the agent should be able to read
 # - Absolute paths: start with / (e.g., /usr/bin)
 # - Relative paths: resolved relative to working directory (e.g., data/, src/**)
 # Lines starting with # are ignored

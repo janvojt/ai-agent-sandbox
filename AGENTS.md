@@ -1,25 +1,25 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI coding agents when working with code in this repository.
 
 ## Project Overview
 
-This is a bash-based sandboxing solution for running Claude Code in isolated environments using **bubblewrap**. The script (`claude-code-sandbox.sh`) provides filesystem isolation via whitelist/blacklist. Full network access (both local and internet) is enabled.
+This is a bash-based sandboxing solution for running AI coding agents in isolated environments using **bubblewrap**. The script (`ai-agent-sandbox.sh`) provides filesystem isolation via whitelist/blacklist. Full network access (both local and internet) is enabled.
 
 ## Architecture
 
 ### Core Components
 
-**Main Script: `claude-code-sandbox.sh`**
-- Single executable bash script that wraps Claude Code in a bubblewrap sandbox
+**Main Script: `ai-agent-sandbox.sh`**
+- Single executable bash script that wraps an AI coding agent in a bubblewrap sandbox
 - Implements two-tier filesystem access control with **multi-file support**:
-  1. **Whitelist**: Absolute or relative paths Claude can read (relative paths resolved relative to working directory)
-     - User-level: `~/.config/claude-sandbox/whitelist.txt` (always included, auto-generated)
-     - Project-level: `.claude/whitelist.txt` in working directory (included if exists)
+  1. **Whitelist**: Absolute or relative paths the agent can read (relative paths resolved relative to working directory)
+     - User-level: `~/.config/ai-agent-sandbox/whitelist.txt` (always included, auto-generated)
+     - Project-level: `.ai-agent-sandbox/whitelist.txt` in working directory (included if exists)
      - Additional files via `--whitelist` flag (can be specified multiple times)
-  2. **Blacklist**: Relative working directory paths Claude cannot access
-     - User-level: `~/.config/claude-sandbox/blacklist.txt` (always included, auto-generated)
-     - Project-level: `.claude/blacklist.txt` in working directory (included if exists)
+  2. **Blacklist**: Relative working directory paths the agent cannot access
+     - User-level: `~/.config/ai-agent-sandbox/blacklist.txt` (always included, auto-generated)
+     - Project-level: `.ai-agent-sandbox/blacklist.txt` in working directory (included if exists)
      - Additional files via `--blacklist` flag (can be specified multiple times)
 
 ### Key Design Patterns
@@ -46,13 +46,13 @@ This is a bash-based sandboxing solution for running Claude Code in isolated env
 
 **Configuration Resolution Order (Multi-File Support)**:
 1. **User-level files** (always included if they exist):
-   - `~/.config/claude-sandbox/whitelist.txt`
-   - `~/.config/claude-sandbox/blacklist.txt`
-   - Environment variables `CLAUDE_SANDBOX_WHITELIST` and `CLAUDE_SANDBOX_BLACKLIST` set the default file locations
+   - `~/.config/ai-agent-sandbox/whitelist.txt`
+   - `~/.config/ai-agent-sandbox/blacklist.txt`
+   - Environment variables `AI_AGENT_SANDBOX_WHITELIST` and `AI_AGENT_SANDBOX_BLACKLIST` set the default file locations
    - **Auto-generated** if they don't exist and no explicit files were provided (lines 111-191)
 2. **Project-level files** (automatically included if they exist, lines 201-207):
-   - `.claude/whitelist.txt` (in working directory)
-   - `.claude/blacklist.txt` (in working directory)
+   - `.ai-agent-sandbox/whitelist.txt` (in working directory)
+   - `.ai-agent-sandbox/blacklist.txt` (in working directory)
    - **Never auto-generated** - create manually for project-specific rules
 3. **Additional files** via `--whitelist` and `--blacklist` command-line arguments (can be specified multiple times)
 4. All files are merged - paths from all whitelist files are allowed, patterns from all blacklist files are blocked
@@ -76,32 +76,32 @@ This is a bash-based sandboxing solution for running Claude Code in isolated env
 
 ```bash
 # Run in current directory with default settings
-./claude-code-sandbox.sh
+./ai-agent-sandbox.sh
 
 # Test with single additional whitelist/blacklist (defaults still included)
-./claude-code-sandbox.sh \
+./ai-agent-sandbox.sh \
   --whitelist ./whitelist-example.txt \
   --blacklist ./blacklist-example.txt
 
 # Test with multiple whitelist/blacklist files
-./claude-code-sandbox.sh \
+./ai-agent-sandbox.sh \
   --whitelist ~/shared-whitelist.txt \
   --whitelist ./project-whitelist.txt \
   --blacklist ~/shared-blacklist.txt \
   --blacklist ./project-blacklist.txt
 
-# Pass arguments to underlying Claude Code
-./claude-code-sandbox.sh -- --model claude-sonnet-4-5
+# Pass arguments to underlying agent
+./ai-agent-sandbox.sh -- --model claude-sonnet-4-5
 ```
 
 ### Script Validation
 
 ```bash
 # Check bash syntax
-bash -n claude-code-sandbox.sh
+bash -n ai-agent-sandbox.sh
 
 # Check for common issues with shellcheck (if available)
-shellcheck claude-code-sandbox.sh
+shellcheck ai-agent-sandbox.sh
 ```
 
 ## Important Implementation Details
@@ -158,8 +158,8 @@ shellcheck claude-code-sandbox.sh
 - Comments start with `#`
 - Empty lines ignored
 - **Multi-file support**: All paths from all whitelist files are merged and allowed
-  - User-level: `~/.config/claude-sandbox/whitelist.txt`
-  - Project-level: `.claude/whitelist.txt` (if exists)
+  - User-level: `~/.config/ai-agent-sandbox/whitelist.txt`
+  - Project-level: `.ai-agent-sandbox/whitelist.txt` (if exists)
   - Additional: via `--whitelist` flags
 
 **Blacklist** (relative paths or patterns):
@@ -172,8 +172,8 @@ shellcheck claude-code-sandbox.sh
 - Comments start with `#`
 - Empty lines ignored
 - **Multi-file support**: All patterns from all blacklist files are merged and blocked
-  - User-level: `~/.config/claude-sandbox/blacklist.txt`
-  - Project-level: `.claude/blacklist.txt` (if exists)
+  - User-level: `~/.config/ai-agent-sandbox/blacklist.txt`
+  - Project-level: `.ai-agent-sandbox/blacklist.txt` (if exists)
   - Additional: via `--blacklist` flags
 
 **Common Ant-Style Pattern Examples**:
@@ -238,7 +238,7 @@ When adding mounts, remember:
 When modifying the script:
 1. Test with non-existent user-level whitelist/blacklist files (should auto-generate)
 2. Test with explicit whitelist/blacklist files (should NOT auto-generate user-level defaults)
-3. Test with project-level files (`.claude/whitelist.txt`, `.claude/blacklist.txt`) - verify they're included
+3. Test with project-level files (`.ai-agent-sandbox/whitelist.txt`, `.ai-agent-sandbox/blacklist.txt`) - verify they're included
 4. Test without project-level files (should work normally, no errors)
 5. Test with multiple whitelist files (verify all paths are merged)
 6. Test with multiple blacklist files (verify all patterns are merged)
@@ -257,16 +257,16 @@ When modifying the script:
 
 ## Files in Repository
 
-- `claude-code-sandbox.sh` - Main executable script (383 lines)
+- `ai-agent-sandbox.sh` - Main executable script
 - `README.md` - User-facing documentation
 - `whitelist-example.txt` - Example whitelist configuration
 - `blacklist-example.txt` - Example blacklist configuration
 - `.gitignore` - Git ignore patterns
-- `CLAUDE.md` - Developer documentation (this file)
+- `AGENTS.md` - Developer documentation (this file)
 
 ## Project-Level Configuration
 
-Projects can include their own whitelist/blacklist files in the `.claude/` directory:
+Projects can include their own whitelist/blacklist files in the `.ai-agent-sandbox/` directory:
 - These files are automatically detected and used when present
 - They are never auto-generated
 - Ideal for version-controlled, team-shared configurations
