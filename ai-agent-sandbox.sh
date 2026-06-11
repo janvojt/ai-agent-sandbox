@@ -743,16 +743,17 @@ if [[ -z "$BWRAP_BIN" ]]; then
 fi
 
 # Detect agent binary based on selection
+AGENT_BIN=""
 if [[ "$AGENT" = "claudecode" ]]; then
-    AGENT_BIN=$(command -v claude 2>/dev/null)
-    if [[ -z "$AGENT_BIN" ]]; then
+    AGENT_BIN=$(command -v claude 2>/dev/null || true)
+    if [[ -z "$AGENT_BIN" && "$DRY_RUN" = false ]]; then
         echo -e "${RED}Error: claude is not installed${NC}" >&2
         echo "Install it from: https://docs.claude.com/en/docs/claude-code" >&2
         exit 1
     fi
 elif [[ "$AGENT" = "opencode" ]]; then
     AGENT_BIN="$HOME/.opencode/bin/opencode"
-    if [[ ! -x "$AGENT_BIN" ]]; then
+    if [[ ! -x "$AGENT_BIN" && "$DRY_RUN" = false ]]; then
         echo -e "${RED}Error: opencode is not installed at $AGENT_BIN${NC}" >&2
         echo "Install it from: https://opencode.dev" >&2
         exit 1
