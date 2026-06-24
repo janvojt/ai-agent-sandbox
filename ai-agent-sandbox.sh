@@ -39,6 +39,13 @@ PROXY_SOCKET_PATH=""
 PROXY_SOCKET_DIR=""
 VENV_PATH=""
 VENV_BIN_DIR=""
+DOCKER_COMPOSE_PLUGIN_DIRS=(
+    "$HOME/.docker/cli-plugins"
+    /usr/local/lib/docker/cli-plugins
+    /usr/local/libexec/docker/cli-plugins
+    /usr/lib/docker/cli-plugins
+    /usr/libexec/docker/cli-plugins
+)
 
 # Print usage
 usage() {
@@ -205,12 +212,38 @@ validate_docker() {
         exit 1
     fi
 
+    if ! docker compose version &>/dev/null; then
+        log_info "${YELLOW}Warning: Docker Compose is not available on the host Docker client; install the Compose plugin for 'docker compose' support${NC}"
+    fi
+
     if ! docker image inspect "$SOCKET_PROXY_IMAGE" &>/dev/null; then
         log_info "${YELLOW}Socket proxy image not found, pulling: $SOCKET_PROXY_IMAGE${NC}"
         if ! docker pull "$SOCKET_PROXY_IMAGE" >/dev/null; then
             echo -e "${RED}Error: Failed to pull socket proxy image${NC}" >&2
             exit 1
         fi
+    fi
+}
+
+mount_docker_compose_plugins() {
+    [[ "$ENABLE_DOCKER" = true ]] || return 0
+
+    local mounted=false
+    local plugin_dir
+
+    for plugin_dir in "${DOCKER_COMPOSE_PLUGIN_DIRS[@]}"; do
+        if [[ -x "$plugin_dir/docker-compose" ]]; then
+            if [[ "$plugin_dir" == "$HOME/"* ]]; then
+                BWRAP_ARGS+=(--dir "$HOME/.docker")
+            fi
+            BWRAP_ARGS+=(--ro-bind "$plugin_dir" "$plugin_dir")
+            log_info "${GREEN}✓${NC} Mounted Docker CLI plugins: $plugin_dir"
+            mounted=true
+        fi
+    done
+
+    if [[ "$mounted" = false ]]; then
+        log_info "${YELLOW}Warning: No Docker Compose CLI plugin found in standard locations; 'docker compose' may be unavailable in the sandbox${NC}"
     fi
 }
 
@@ -992,6 +1025,8 @@ if [[ "$ENABLE_VENV" = true ]]; then
     BWRAP_ARGS+=(--unsetenv PYTHONHOME)
     log_info "${GREEN}✓${NC} Mounted virtual environment: $VENV_PATH (read-only)"
 fi
+
+mount_docker_compose_plugins
 
 log_info "\n${YELLOW}Agent-specific configuration bindings:"
 if [[ "$AGENT" = "claudecode" ]]; then

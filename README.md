@@ -116,6 +116,8 @@ source .venv/bin/activate
 
 Docker access is provided through a per-run socket proxy created at `.docker-proxy/docker.sock` in the working directory. The proxy only allows bind mounts from paths already accessible inside the sandbox (working directory and any read-write mounts).
 
+When Docker is enabled, the sandbox also mounts Docker CLI plugin directories from common host locations so `docker compose` works when the host Docker client has the Compose plugin installed. If `docker compose version` fails on the host, install Docker Compose on the host first.
+
 ### Using environment variables:
 ```bash
 export AI_AGENT_SANDBOX_WHITELIST=/path/to/whitelist.txt
