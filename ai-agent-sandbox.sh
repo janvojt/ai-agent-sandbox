@@ -1237,11 +1237,86 @@ if [[ "$ENABLE_DOCKER" = true ]]; then
     start_socket_proxy
 fi
 
+opencode_option_takes_value() {
+    case "$1" in
+        --agent|--attach|--command|--dir|--file|--hostname|--log-level|--mdns-domain|--method|--model|--password|--port|--prompt|--session|--title|--username|--variant|-f|-m|-p|-s|-u)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+opencode_command_accepts_default_agent() {
+    case "$1" in
+        ""|run)
+            return 0
+            ;;
+        acp|agent|attach|auth|completion|db|debug|export|github|import|mcp|models|plugin|plug|pr|providers|serve|session|stats|uninstall|upgrade|web)
+            return 1
+            ;;
+    esac
+
+    # Non-command positionals are treated as the default command's project path.
+    return 0
+}
+
+opencode_should_add_default_agent() {
+    local arg
+    local consume_next=false
+    local explicit_agent=false
+
+    for arg in "${AGENT_ARGS[@]}"; do
+        if [[ "$consume_next" = true ]]; then
+            consume_next=false
+            continue
+        fi
+
+        case "$arg" in
+            --)
+                break
+                ;;
+            --agent|--agent=*)
+                explicit_agent=true
+                if [[ "$arg" != *=* ]]; then
+                    consume_next=true
+                fi
+                continue
+                ;;
+            --*=*)
+                continue
+                ;;
+            --*)
+                if opencode_option_takes_value "$arg"; then
+                    consume_next=true
+                fi
+                continue
+                ;;
+            -f|-m|-p|-s|-u)
+                consume_next=true
+                continue
+                ;;
+            -*)
+                continue
+                ;;
+            *)
+                if [[ "$explicit_agent" = true ]]; then
+                    return 1
+                fi
+                opencode_command_accepts_default_agent "$arg"
+                return
+                ;;
+        esac
+    done
+
+    [[ "$explicit_agent" = false ]]
+}
+
 # Build default agent args (prepended before user args)
 DEFAULT_AGENT_ARGS=()
 if [[ "$AGENT" = "claudecode" ]]; then
     DEFAULT_AGENT_ARGS+=(--dangerously-skip-permissions)
-elif [[ "$AGENT" = "opencode" ]]; then
+elif [[ "$AGENT" = "opencode" ]] && opencode_should_add_default_agent; then
     DEFAULT_AGENT_ARGS+=(--agent build)
 fi
 
