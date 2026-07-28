@@ -565,16 +565,42 @@ find_matches() {
     # Convert ant-style pattern to find command
     if [[ "$pattern" == *"**"* ]]; then
         # Ant-style recursive pattern
-        # Extract the filename part after the last **
-        if [[ "$pattern" =~ \*\*/([^/]+)$ ]]; then
-            # Pattern like **/wallet.dat or src/**/wallet.dat
+        if [[ "$pattern" =~ ^\*\*/([^/]+)$ ]]; then
+            # Pattern like **/wallet.dat - match the filename at any depth
             local filename="${BASH_REMATCH[1]}"
             find_args=(-name "$filename")
         else
-            # Complex pattern like src/**/test/**/*.java
-            # Convert ** to */ for path matching
-            local path_pattern="${pattern//\*\*/\*}"
-            find_args=(-path "$base_dir/$path_pattern")
+            # Pattern with directory components like **/dir/file or
+            # src/**/test/**/*.java. Each **/ matches zero or more directories,
+            # but find -path has no alternation, so expand every **/ into both
+            # "*/" (one or more levels, * crosses /) and "" (zero levels), then
+            # OR all variants in a single find expression.
+            local -a path_patterns=("$pattern")
+            local expanding=true
+            local p
+            while [[ "$expanding" == true ]]; do
+                expanding=false
+                local -a expanded=()
+                for p in "${path_patterns[@]}"; do
+                    if [[ "$p" == *"**/"* ]]; then
+                        expanded+=("${p/\*\*\//*/}" "${p/\*\*\//}")
+                        expanding=true
+                    else
+                        expanded+=("$p")
+                    fi
+                done
+                path_patterns=("${expanded[@]}")
+            done
+
+            find_args=(\()
+            local first=true
+            for p in "${path_patterns[@]}"; do
+                [[ "$first" == true ]] || find_args+=(-o)
+                first=false
+                # Convert any remaining ** (trailing, not followed by /) to *
+                find_args+=(-path "$base_dir/${p//\*\*/\*}")
+            done
+            find_args+=(\))
         fi
     else
         # Simple glob pattern - limit to single level

@@ -118,7 +118,7 @@ shellcheck ai-agent-sandbox.sh
 - **Ant-style support**: Detects `**` patterns and handles them recursively
 - Simple patterns: Uses `-name` or `-path` with `-maxdepth 1` for performance
 - Recursive patterns: Uses `-name` or `-path` without depth limit
-- Complex patterns: Converts `**` to `*` for path matching (e.g., `src/**/test/**/*.java`)
+- Complex patterns (e.g., `**/dir/file`, `src/**/test/**/*.java`): each `**/` matches zero or more directories — expanded into all `*/`/empty variants and OR-ed in a single `find` expression
 - Returns list of absolute paths matching the pattern
 
 **Blacklist Implementation** (blacklist_pattern function, lines 246-271):
