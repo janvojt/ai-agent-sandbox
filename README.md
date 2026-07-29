@@ -62,12 +62,13 @@ nano ~/.config/ai-agent-sandbox/blacklist.txt
   --whitelist /path/to/my-whitelist.txt \
   --blacklist /path/to/my-blacklist.txt
 
-# Multiple whitelist/blacklist files
+# Multiple whitelist/blacklist files (plus extra PATH dirs)
 ./ai-agent-sandbox.sh \
   --whitelist ~/shared-whitelist.txt \
   --whitelist ./project-whitelist.txt \
   --blacklist ~/shared-blacklist.txt \
-  --blacklist ./project-blacklist.txt
+  --blacklist ./project-blacklist.txt \
+  --path-dir ./tools/bin
 ```
 
 **Note:** The default whitelist and blacklist files (`~/.config/ai-agent-sandbox/{whitelist,blacklist}.txt`) are always included automatically. Additional files specified via `--whitelist` and `--blacklist` are merged with the defaults.
@@ -123,6 +124,7 @@ When Docker is enabled, the sandbox also mounts Docker CLI plugin directories fr
 export AI_AGENT_SANDBOX_WHITELIST=/path/to/whitelist.txt
 export AI_AGENT_SANDBOX_BLACKLIST=/path/to/blacklist.txt
 export AI_AGENT_SANDBOX_ENV=/path/to/.env
+export AI_AGENT_SANDBOX_PATH=/path/to/path-list.txt
 ./ai-agent-sandbox.sh
 ```
 
@@ -136,21 +138,24 @@ The script supports **multiple whitelist, blacklist, and environment files**, wh
    - `~/.config/ai-agent-sandbox/whitelist.txt`
    - `~/.config/ai-agent-sandbox/blacklist.txt`
    - `~/.config/ai-agent-sandbox/.env`
+   - `~/.config/ai-agent-sandbox/path-list.txt`
    - Whitelist and blacklist files are auto-generated if they don't exist and no explicit files are provided; `.env` is optional and never auto-generated
 
 2. **Project-level files** (automatically included if they exist):
    - `.ai-agent-sandbox/whitelist.txt` (in working directory)
    - `.ai-agent-sandbox/blacklist.txt` (in working directory)
    - `.ai-agent-sandbox/.env` (in working directory)
+   - `.ai-agent-sandbox/path-list.txt` (in working directory)
    - **Never auto-generated** - create manually if needed
 
-3. **Additional files** specified via `--whitelist`, `--blacklist`, and `--env-path` flags
+3. **Additional files** specified via `--whitelist`, `--blacklist`, `--env-path`, and `--path-file` flags
 
 All files are merged together, allowing you to:
 - Maintain a base configuration in user-level files
 - Add project-specific rules in `.ai-agent-sandbox/` directory (can be committed to version control)
 - Override with additional files via command-line flags
 - Share configurations across teams and projects
+- Append extra PATH directories through config files or `--path-dir`
 
 ### Environment File Format
 
@@ -209,6 +214,26 @@ The whitelist file contains **absolute paths or glob patterns** (one per line) t
 - Lines starting with `#` are ignored
 - Environment variables like `$HOME` are expanded
 - When using multiple whitelist files, all paths from all files are allowed
+
+### PATH Additions Format
+
+`path-list.txt` files append directories to `PATH` inside the sandbox. Each non-empty, non-comment line is treated as a directory. Examples:
+
+```
+# Add project-specific tools
+tools/bin
+
+# Absolute path example
+/opt/custom-toolchain/bin
+
+# Give Claude access to local npm binaries
+node_modules/.bin
+```
+
+- Relative entries are resolved against the working directory
+- `~` and `$HOME` are expanded
+- Directories are added even if they do not currently exist (a warning is printed)
+- You can also append directories directly via `--path-dir /extra/bin` or load additional files with `--path-file ./my-paths.txt`
 
 ### Blacklist Format
 
