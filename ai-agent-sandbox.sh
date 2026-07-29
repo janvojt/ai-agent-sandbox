@@ -12,10 +12,12 @@ NC='\033[0m' # No Color
 DEFAULT_WHITELIST_FILE="${AI_AGENT_SANDBOX_WHITELIST:-$HOME/.config/ai-agent-sandbox/whitelist.txt}"
 DEFAULT_BLACKLIST_FILE="${AI_AGENT_SANDBOX_BLACKLIST:-$HOME/.config/ai-agent-sandbox/blacklist.txt}"
 DEFAULT_ENV_FILE="${AI_AGENT_SANDBOX_ENV:-$HOME/.config/ai-agent-sandbox/.env}"
+DEFAULT_ENV_LOCAL_FILE="${AI_AGENT_SANDBOX_ENV_LOCAL:-$HOME/.config/ai-agent-sandbox/.env.local}"
 WORKING_DIR="$(pwd)"
 PROJECT_WHITELIST_FILE="$WORKING_DIR/.ai-agent-sandbox/whitelist.txt"
 PROJECT_BLACKLIST_FILE="$WORKING_DIR/.ai-agent-sandbox/blacklist.txt"
 PROJECT_ENV_FILE="$WORKING_DIR/.ai-agent-sandbox/.env"
+PROJECT_ENV_LOCAL_FILE="$WORKING_DIR/.ai-agent-sandbox/.env.local"
 WHITELIST_FILES=()
 BLACKLIST_FILES=()
 ENV_FILES=()
@@ -76,10 +78,12 @@ IMPLICIT CONFIGURATION FILES (automatically included if they exist):
        - $DEFAULT_WHITELIST_FILE
        - $DEFAULT_BLACKLIST_FILE
        - $DEFAULT_ENV_FILE
+       - $DEFAULT_ENV_LOCAL_FILE
     2. Project-level (if present):
        - .ai-agent-sandbox/whitelist.txt (in working directory)
        - .ai-agent-sandbox/blacklist.txt (in working directory)
        - .ai-agent-sandbox/.env (in working directory)
+       - .ai-agent-sandbox/.env.local (in working directory)
 
 CONFIGURATION FILE FORMAT:
     Whitelist: Contains absolute or relative paths/patterns (one per line) that the agent can read
@@ -191,7 +195,9 @@ done
 
 # Helper function for conditional output
 log_info() {
-    [[ "$QUIET" = false ]] && echo -e "$@" >&2
+    if [[ "$QUIET" = false ]]; then
+        echo -e "$@" >&2
+    fi
 }
 
 # Check Docker availability when enabled
@@ -898,6 +904,9 @@ fi
 if [[ -f "$DEFAULT_BLACKLIST_FILE" ]]; then
     BLACKLIST_FILES=("$DEFAULT_BLACKLIST_FILE" "${BLACKLIST_FILES[@]}")
 fi
+if [[ -f "$DEFAULT_ENV_LOCAL_FILE" ]]; then
+    ENV_FILES=("$DEFAULT_ENV_LOCAL_FILE" "${ENV_FILES[@]}")
+fi
 if [[ -f "$DEFAULT_ENV_FILE" ]]; then
     ENV_FILES=("$DEFAULT_ENV_FILE" "${ENV_FILES[@]}")
 fi
@@ -911,6 +920,9 @@ if [[ -f "$PROJECT_BLACKLIST_FILE" ]]; then
 fi
 if [[ -f "$PROJECT_ENV_FILE" ]]; then
     ENV_FILES+=("$PROJECT_ENV_FILE")
+fi
+if [[ -f "$PROJECT_ENV_LOCAL_FILE" ]]; then
+    ENV_FILES+=("$PROJECT_ENV_LOCAL_FILE")
 fi
 
 # Build bubblewrap arguments

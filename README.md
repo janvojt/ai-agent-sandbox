@@ -84,7 +84,7 @@ nano ~/.config/ai-agent-sandbox/blacklist.txt
 ./ai-agent-sandbox.sh --env-path /path/to/.env
 ```
 
-Environment files are optional. If present, `~/.config/ai-agent-sandbox/.env` and `.ai-agent-sandbox/.env` are included automatically, and additional files from `--env-path` are merged with them. Direct `--env/-e` entries are applied last.
+Environment files are optional. If present, `~/.config/ai-agent-sandbox/.env`, `~/.config/ai-agent-sandbox/.env.local`, `.ai-agent-sandbox/.env`, and `.ai-agent-sandbox/.env.local` are included automatically (`.env.local` is loaded after `.env` so it can override values), and additional files from `--env-path` are merged with them. Direct `--env/-e` entries are applied last.
 
 ### Python virtual environments:
 ```bash
@@ -123,6 +123,7 @@ When Docker is enabled, the sandbox also mounts Docker CLI plugin directories fr
 export AI_AGENT_SANDBOX_WHITELIST=/path/to/whitelist.txt
 export AI_AGENT_SANDBOX_BLACKLIST=/path/to/blacklist.txt
 export AI_AGENT_SANDBOX_ENV=/path/to/.env
+export AI_AGENT_SANDBOX_ENV_LOCAL=/path/to/.env.local
 ./ai-agent-sandbox.sh
 ```
 
@@ -136,12 +137,14 @@ The script supports **multiple whitelist, blacklist, and environment files**, wh
    - `~/.config/ai-agent-sandbox/whitelist.txt`
    - `~/.config/ai-agent-sandbox/blacklist.txt`
    - `~/.config/ai-agent-sandbox/.env`
-   - Whitelist and blacklist files are auto-generated if they don't exist and no explicit files are provided; `.env` is optional and never auto-generated
+   - `~/.config/ai-agent-sandbox/.env.local` (loaded after `.env`, overrides its values)
+   - Whitelist and blacklist files are auto-generated if they don't exist and no explicit files are provided; `.env` and `.env.local` are optional and never auto-generated
 
 2. **Project-level files** (automatically included if they exist):
    - `.ai-agent-sandbox/whitelist.txt` (in working directory)
    - `.ai-agent-sandbox/blacklist.txt` (in working directory)
    - `.ai-agent-sandbox/.env` (in working directory)
+   - `.ai-agent-sandbox/.env.local` (in working directory, loaded after `.env`, overrides its values)
    - **Never auto-generated** - create manually if needed
 
 3. **Additional files** specified via `--whitelist`, `--blacklist`, and `--env-path` flags
