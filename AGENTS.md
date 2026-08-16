@@ -65,7 +65,9 @@ This is a bash-based sandboxing solution for running AI coding agents in isolate
 - SSH agent is explicitly disabled via `--unsetenv SSH_AUTH_SOCK` (line 307)
 
 **Claude Code Configuration Binding (lines 264-285)**:
-- Binds `~/.local/bin/claude` as read-only if exists
+- Native installs bind `~/.local/share/claude` read-write so downloaded versions persist
+- Uses a dedicated persistent launcher directory mounted at `~/.local/bin`, allowing updater symlink changes without exposing other user executables
+- Non-native `~/.local/bin/claude` installations remain read-only
 - Binds `~/.claude/` directory read-write for config
 - Binds/creates `~/.claude.json` for state persistence
 - Preserves Claude-specific environment variables (lines 311-316)

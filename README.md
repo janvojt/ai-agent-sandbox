@@ -102,6 +102,12 @@ source .venv/bin/activate
 ./ai-agent-sandbox.sh -- --model claude-sonnet-4-5
 ```
 
+Native Claude Code updates are persistent across sandbox runs. The sandbox mounts Claude's version store read-write and uses a dedicated persistent launcher directory, rather than exposing every executable in `~/.local/bin` to writes.
+
+```bash
+./ai-agent-sandbox.sh -- update
+```
+
 ### Docker support (Testcontainers)
 ```bash
 # Enable Docker access via filtered socket proxy (long or short flag)

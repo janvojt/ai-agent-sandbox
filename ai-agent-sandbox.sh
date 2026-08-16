@@ -41,6 +41,10 @@ PROXY_SOCKET_PATH=""
 PROXY_SOCKET_DIR=""
 VENV_PATH=""
 VENV_BIN_DIR=""
+CLAUDE_HOST_BIN="$HOME/.local/bin/claude"
+CLAUDE_NATIVE_DIR="$HOME/.local/share/claude"
+CLAUDE_SANDBOX_BIN_DIR="$HOME/.local/share/ai-agent-sandbox/claude-bin"
+CLAUDE_NATIVE_INSTALL=false
 DOCKER_COMPOSE_PLUGIN_DIRS=(
     "$HOME/.docker/cli-plugins"
     /usr/local/lib/docker/cli-plugins
@@ -788,6 +792,30 @@ blacklist_pattern() {
     fi
 }
 
+prepare_claude_native_install() {
+    local managed_launcher="$CLAUDE_SANDBOX_BIN_DIR/claude"
+    local host_target=""
+
+    # The dedicated launcher directory lets Claude update its symlink without
+    # giving the sandbox write access to every executable in ~/.local/bin.
+    if [[ -x "$managed_launcher" ]]; then
+        CLAUDE_NATIVE_INSTALL=true
+        return
+    fi
+
+    if [[ -L "$CLAUDE_HOST_BIN" ]]; then
+        host_target=$(readlink -f "$CLAUDE_HOST_BIN" 2>/dev/null || true)
+    fi
+    if [[ "$host_target" != "$CLAUDE_NATIVE_DIR/versions/"* || ! -x "$host_target" ]]; then
+        return
+    fi
+
+    mkdir -p "$CLAUDE_SANDBOX_BIN_DIR"
+    rm -f "$managed_launcher"
+    ln -s "$host_target" "$managed_launcher"
+    CLAUDE_NATIVE_INSTALL=true
+}
+
 # Validate agent selection
 if [[ "$AGENT" != "claudecode" ]] && [[ "$AGENT" != "opencode" ]]; then
     echo -e "${RED}Error: Invalid agent '$AGENT'. Must be 'claudecode' or 'opencode'${NC}" >&2
@@ -810,7 +838,12 @@ fi
 # Detect agent binary based on selection
 AGENT_BIN=""
 if [[ "$AGENT" = "claudecode" ]]; then
-    AGENT_BIN=$(command -v claude 2>/dev/null || true)
+    prepare_claude_native_install
+    if [[ "$CLAUDE_NATIVE_INSTALL" = true ]]; then
+        AGENT_BIN="$CLAUDE_HOST_BIN"
+    else
+        AGENT_BIN=$(command -v claude 2>/dev/null || true)
+    fi
     if [[ -z "$AGENT_BIN" && "$DRY_RUN" = false ]]; then
         echo -e "${RED}Error: claude is not installed${NC}" >&2
         echo "Install it from: https://docs.claude.com/en/docs/claude-code" >&2
@@ -1068,8 +1101,14 @@ mount_docker_compose_plugins
 
 log_info "\n${YELLOW}Agent-specific configuration bindings:"
 if [[ "$AGENT" = "claudecode" ]]; then
-    # Bind claude binary
-    if [[ -e "$HOME/.local/bin/claude" ]]; then
+    if [[ "$CLAUDE_NATIVE_INSTALL" = true ]]; then
+        # Persist both parts of a native Claude installation. The updater writes
+        # binaries under ~/.local/share and atomically replaces its launcher.
+        BWRAP_ARGS+=(--bind "$CLAUDE_NATIVE_DIR" "$CLAUDE_NATIVE_DIR")
+        BWRAP_ARGS+=(--bind "$CLAUDE_SANDBOX_BIN_DIR" "$HOME/.local/bin")
+        log_info "${GREEN}✓${NC} Mounted native Claude versions and launcher (read-write)"
+    # Bind non-native claude binary
+    elif [[ -e "$HOME/.local/bin/claude" ]]; then
         # If it's a symlink, we need to bind the target first, then create the symlink
         if [[ -L "$HOME/.local/bin/claude" ]]; then
             CLAUDE_TARGET=$(readlink -f "$HOME/.local/bin/claude")
