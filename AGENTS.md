@@ -66,8 +66,8 @@ This is a bash-based sandboxing solution for running AI coding agents in isolate
 
 **Claude Code Configuration Binding (lines 264-285)**:
 - Native installs bind `~/.local/share/claude` read-write so downloaded versions persist
-- Uses a dedicated persistent launcher directory mounted at `~/.local/bin`, allowing updater symlink changes without exposing other user executables
-- Non-native `~/.local/bin/claude` installations remain read-only
+- Uses a dedicated persistent launcher directory (`~/.local/share/ai-agent-sandbox/claude-bin`) mounted at its own path and prepended to `PATH`, allowing updater symlink changes without exposing other user executables and without shadowing a whitelisted `~/.local/bin`
+- Non-native `~/.local/bin/claude` installations remain read-only (the symlink/bind is skipped when `~/.local/bin` is already visible via a whitelist mount)
 - Binds `~/.claude/` directory read-write for config
 - Binds/creates `~/.claude.json` for state persistence
 - Preserves Claude-specific environment variables (lines 311-316)

@@ -792,6 +792,25 @@ blacklist_pattern() {
     fi
 }
 
+# Check whether a path is already visible inside the sandbox via an existing
+# bind mount in BWRAP_ARGS (the destination equals the path or is a parent of it)
+# Usage: is_path_bound <path>
+is_path_bound() {
+    local path="$1"
+    local i=0
+    local dest
+    while [[ $i -lt ${#BWRAP_ARGS[@]} ]]; do
+        if [[ "${BWRAP_ARGS[$i]}" == "--bind" || "${BWRAP_ARGS[$i]}" == "--ro-bind" ]]; then
+            dest="${BWRAP_ARGS[$((i+2))]}"
+            if [[ "$path" == "$dest" || "$path" == "$dest/"* ]]; then
+                return 0
+            fi
+        fi
+        ((i++)) || true
+    done
+    return 1
+}
+
 prepare_claude_native_install() {
     local managed_launcher="$CLAUDE_SANDBOX_BIN_DIR/claude"
     local host_target=""
@@ -840,7 +859,7 @@ AGENT_BIN=""
 if [[ "$AGENT" = "claudecode" ]]; then
     prepare_claude_native_install
     if [[ "$CLAUDE_NATIVE_INSTALL" = true ]]; then
-        AGENT_BIN="$CLAUDE_HOST_BIN"
+        AGENT_BIN="$CLAUDE_SANDBOX_BIN_DIR/claude"
     else
         AGENT_BIN=$(command -v claude 2>/dev/null || true)
     fi
@@ -1104,8 +1123,10 @@ if [[ "$AGENT" = "claudecode" ]]; then
     if [[ "$CLAUDE_NATIVE_INSTALL" = true ]]; then
         # Persist both parts of a native Claude installation. The updater writes
         # binaries under ~/.local/share and atomically replaces its launcher.
+        # The launcher dir is mounted at its own path (and prepended to PATH)
+        # so it never shadows a whitelisted ~/.local/bin.
         BWRAP_ARGS+=(--bind "$CLAUDE_NATIVE_DIR" "$CLAUDE_NATIVE_DIR")
-        BWRAP_ARGS+=(--bind "$CLAUDE_SANDBOX_BIN_DIR" "$HOME/.local/bin")
+        BWRAP_ARGS+=(--bind "$CLAUDE_SANDBOX_BIN_DIR" "$CLAUDE_SANDBOX_BIN_DIR")
         log_info "${GREEN}✓${NC} Mounted native Claude versions and launcher (read-write)"
     # Bind non-native claude binary
     elif [[ -e "$HOME/.local/bin/claude" ]]; then
@@ -1115,14 +1136,24 @@ if [[ "$AGENT" = "claudecode" ]]; then
             if [[ -f "$CLAUDE_TARGET" ]]; then
                 # Bind the actual binary/target
                 BWRAP_ARGS+=(--ro-bind "$CLAUDE_TARGET" "$CLAUDE_TARGET")
-                # Create a symlink in the sandbox
-                BWRAP_ARGS+=(--symlink "${CLAUDE_TARGET}" "$HOME/.local/bin/claude")
-                log_info "${GREEN}✓${NC} Mounted $CLAUDE_TARGET and created symlink at ~/.local/bin/claude (read-only)"
+                if is_path_bound "$HOME/.local/bin/claude"; then
+                    # Symlink is already visible through an existing mount
+                    # (e.g. whitelisted ~/.local/bin); creating it would fail.
+                    log_info "${GREEN}✓${NC} Mounted $CLAUDE_TARGET (~/.local/bin/claude already visible via existing mount)"
+                else
+                    # Create a symlink in the sandbox
+                    BWRAP_ARGS+=(--symlink "${CLAUDE_TARGET}" "$HOME/.local/bin/claude")
+                    log_info "${GREEN}✓${NC} Mounted $CLAUDE_TARGET and created symlink at ~/.local/bin/claude (read-only)"
+                fi
             fi
         elif [[ -x "$HOME/.local/bin/claude" ]]; then
-            # It's a regular file, bind it directly
-            BWRAP_ARGS+=(--ro-bind "$HOME/.local/bin/claude" "$HOME/.local/bin/claude")
-            log_info "${GREEN}✓${NC} Mounted ~/.local/bin/claude (read-only)"
+            if is_path_bound "$HOME/.local/bin/claude"; then
+                log_info "${GREEN}✓${NC} ~/.local/bin/claude already visible via existing mount"
+            else
+                # It's a regular file, bind it directly
+                BWRAP_ARGS+=(--ro-bind "$HOME/.local/bin/claude" "$HOME/.local/bin/claude")
+                log_info "${GREEN}✓${NC} Mounted ~/.local/bin/claude (read-only)"
+            fi
         fi
     fi
 
@@ -1229,6 +1260,11 @@ BWRAP_ARGS+=(--setenv TERM "${TERM:-xterm-256color}")
 SANDBOX_PATH=""
 if [[ "$AGENT" = "claudecode" ]]; then
     SANDBOX_PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    if [[ "$CLAUDE_NATIVE_INSTALL" = true ]]; then
+        # The managed launcher must win over any whitelisted ~/.local/bin/claude
+        # so updates applied inside the sandbox take effect.
+        SANDBOX_PATH="$CLAUDE_SANDBOX_BIN_DIR:$SANDBOX_PATH"
+    fi
 elif [[ "$AGENT" = "opencode" ]]; then
     SANDBOX_PATH="$HOME/.opencode/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 fi
