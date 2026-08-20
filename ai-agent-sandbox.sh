@@ -25,6 +25,7 @@ WHITELIST_PATHS_RO=()
 WHITELIST_PATHS_RW=()
 BLACKLIST_PATHS=()
 ENV_VARS=()
+declare -A SANDBOX_ENV=()
 BLACKLISTED_DIRS=()
 BLACKLIST_SEARCH_ROOTS=()
 WHITELIST_OVERRIDE_ARGS=()
@@ -444,12 +445,47 @@ trim_whitespace() {
     printf '%s\n' "$value"
 }
 
+# Expand $VAR / ${VAR} references and tildes in an environment value.
+# Variables resolve against values already set for the sandbox first, then the
+# host environment, and expand to empty when undefined. \$ produces a literal $.
+expand_env_value() {
+    local input="$1"
+    local output=""
+    local var_name
+
+    # Tilde expansion: at the start of the value and after each colon in
+    # PATH-style lists.
+    input="${input/#\~/$HOME}"
+    input="${input//:\~\//:$HOME/}"
+
+    while [[ -n "$input" ]]; do
+        if [[ "$input" == \\\$* ]]; then
+            output+='$'
+            input="${input:2}"
+        elif [[ "$input" =~ ^\$\{([A-Za-z_][A-Za-z0-9_]*)\} || "$input" =~ ^\$([A-Za-z_][A-Za-z0-9_]*) ]]; then
+            var_name="${BASH_REMATCH[1]}"
+            if [[ -v "SANDBOX_ENV[$var_name]" ]]; then
+                output+="${SANDBOX_ENV[$var_name]}"
+            else
+                output+="$(printenv "$var_name" || true)"
+            fi
+            input="${input:${#BASH_REMATCH[0]}}"
+        else
+            output+="${input:0:1}"
+            input="${input:1}"
+        fi
+    done
+
+    printf '%s\n' "$output"
+}
+
 parse_env_assignment() {
     local line="$1"
     local key_ref="$2"
     local value_ref="$3"
     local env_key
     local env_value
+    local single_quoted=false
 
     line=$(trim_whitespace "$line")
     [[ -z "$line" || "$line" =~ ^# ]] && return 1
@@ -476,13 +512,29 @@ parse_env_assignment() {
     elif [[ "$env_value" == \'*\' && "$env_value" == *\' ]]; then
         env_value="${env_value#\'}"
         env_value="${env_value%\'}"
+        single_quoted=true
     else
         env_value="${env_value%%[[:space:]]#*}"
         env_value=$(trim_whitespace "$env_value")
     fi
 
+    # Single-quoted values are literal; everything else gets variable and
+    # tilde expansion so entries like PATH="~/bin:$PATH" work.
+    if [[ "$single_quoted" != true ]]; then
+        env_value=$(expand_env_value "$env_value")
+    fi
+
     printf -v "$key_ref" '%s' "$env_key"
     printf -v "$value_ref" '%s' "$env_value"
+}
+
+# Set an environment variable inside the sandbox and remember its value so
+# later env entries can reference it (e.g. PATH="~/bin:$PATH").
+sandbox_setenv() {
+    local key="$1"
+    local value="$2"
+    BWRAP_ARGS+=(--setenv "$key" "$value")
+    SANDBOX_ENV[$key]="$value"
 }
 
 set_sandbox_env() {
@@ -496,7 +548,7 @@ set_sandbox_env() {
         return 0
     fi
 
-    BWRAP_ARGS+=(--setenv "$key" "$value")
+    sandbox_setenv "$key" "$value"
     log_info "${GREEN}✓${NC} Environment variable: $key"
 }
 
@@ -1111,7 +1163,7 @@ fi
 if [[ "$ENABLE_VENV" = true ]]; then
     log_info "\n${GREEN}Virtual environment:${NC} $VENV_PATH"
     BWRAP_ARGS+=(--ro-bind "$VENV_PATH" "$VENV_PATH")
-    BWRAP_ARGS+=(--setenv VIRTUAL_ENV "$VENV_PATH")
+    sandbox_setenv VIRTUAL_ENV "$VENV_PATH"
     BWRAP_ARGS+=(--unsetenv PYTHONHOME)
     log_info "${GREEN}✓${NC} Mounted virtual environment: $VENV_PATH (read-only)"
 fi
@@ -1235,8 +1287,8 @@ elif [[ "$AGENT" = "opencode" ]]; then
     fi
 fi
 
-BWRAP_ARGS+=(--setenv HOME "$HOME")
-BWRAP_ARGS+=(--setenv PWD "$WORKING_DIR")
+sandbox_setenv HOME "$HOME"
+sandbox_setenv PWD "$WORKING_DIR"
 BWRAP_ARGS+=(--chdir "$WORKING_DIR")
 
 # Network configuration - allow all network access
@@ -1256,7 +1308,7 @@ if [[ -f /etc/hosts ]]; then
 fi
 
 # Set minimal environment
-BWRAP_ARGS+=(--setenv TERM "${TERM:-xterm-256color}")
+sandbox_setenv TERM "${TERM:-xterm-256color}"
 SANDBOX_PATH=""
 if [[ "$AGENT" = "claudecode" ]]; then
     SANDBOX_PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
@@ -1271,27 +1323,27 @@ fi
 if [[ "$ENABLE_VENV" = true ]]; then
     SANDBOX_PATH="$VENV_BIN_DIR:$SANDBOX_PATH"
 fi
-BWRAP_ARGS+=(--setenv PATH "$SANDBOX_PATH")
+sandbox_setenv PATH "$SANDBOX_PATH"
 BWRAP_ARGS+=(--unsetenv SSH_AUTH_SOCK)
 BWRAP_ARGS+=(--unsetenv SSH_AGENT_PID)
 
 if [[ "$ENABLE_DOCKER" = true ]]; then
-    BWRAP_ARGS+=(--setenv DOCKER_HOST "unix://$WORKING_DIR/.docker-proxy/docker.sock")
-    BWRAP_ARGS+=(--setenv TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE "$WORKING_DIR/.docker-proxy/docker.sock")
-    BWRAP_ARGS+=(--setenv TESTCONTAINERS_HOST_OVERRIDE "localhost")
+    sandbox_setenv DOCKER_HOST "unix://$WORKING_DIR/.docker-proxy/docker.sock"
+    sandbox_setenv TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE "$WORKING_DIR/.docker-proxy/docker.sock"
+    sandbox_setenv TESTCONTAINERS_HOST_OVERRIDE "localhost"
 fi
 
 # Preserve agent-specific environment variables
 if [[ "$AGENT" = "claudecode" ]]; then
     if [[ -n "${CLAUDECODE:-}" ]]; then
-        BWRAP_ARGS+=(--setenv CLAUDECODE "$CLAUDECODE")
+        sandbox_setenv CLAUDECODE "$CLAUDECODE"
     fi
     if [[ -n "${CLAUDE_CODE_ENTRYPOINT:-}" ]]; then
-        BWRAP_ARGS+=(--setenv CLAUDE_CODE_ENTRYPOINT "$CLAUDE_CODE_ENTRYPOINT")
+        sandbox_setenv CLAUDE_CODE_ENTRYPOINT "$CLAUDE_CODE_ENTRYPOINT"
     fi
 elif [[ "$AGENT" = "opencode" ]]; then
     # Force YOLO-style permissions inside sandboxed OpenCode runs.
-    BWRAP_ARGS+=(--setenv OPENCODE_PERMISSION '{"*":"allow"}')
+    sandbox_setenv OPENCODE_PERMISSION '{"*":"allow"}'
 fi
 
 # Process environment files and direct environment variables last so explicit

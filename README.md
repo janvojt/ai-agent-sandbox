@@ -171,6 +171,11 @@ API_TOKEN=secret
 FEATURE_FLAG=true
 QUOTED_VALUE="value with spaces"
 export TOOL_HOME=/opt/tooling
+
+# Values may reference other variables and use ~ for $HOME
+PATH="~/.local/share/mise/installs/node/25/bin:$PATH"
+BASE=~/apps
+TOOL_BIN="$BASE/bin"
 ```
 
 **Important:**
@@ -178,6 +183,13 @@ export TOOL_HOME=/opt/tooling
 - Later entries override earlier entries when the same key appears multiple times.
 - Variable names must match shell environment naming rules, such as `API_TOKEN` or `_PRIVATE`.
 - Logs show variable names only, not values.
+
+**Variable expansion:**
+- `$VAR` and `${VAR}` references are expanded in unquoted and double-quoted values.
+- References resolve against the sandbox environment first (values set by earlier env entries or by the script itself, such as `PATH` and `HOME`), then fall back to the host environment; undefined variables expand to empty.
+- A leading `~` (and `~` after `:` in PATH-style lists) expands to `$HOME`.
+- Single-quoted values are taken literally with no expansion.
+- Use `\$` for a literal dollar sign in expanded values.
 
 ### Whitelist Format
 
