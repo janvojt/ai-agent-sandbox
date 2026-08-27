@@ -66,7 +66,10 @@ This is a bash-based sandboxing solution for running AI coding agents in isolate
 
 **Claude Code Configuration Binding (lines 264-285)**:
 - Native installs bind `~/.local/share/claude` read-write so downloaded versions persist
-- Uses a dedicated persistent launcher directory (`~/.local/share/ai-agent-sandbox/claude-bin`) mounted at its own path and prepended to `PATH`, allowing updater symlink changes without exposing other user executables and without shadowing a whitelisted `~/.local/bin`
+- Native installs mount `~/.local/bin` as an **overlayfs**: the host directory is the read-only lower layer and `~/.local/share/ai-agent-sandbox/claude-bin` is the writable upper layer (with `~/.local/share/ai-agent-sandbox/claude-work` as the overlay workdir). The in-sandbox updater's atomic launcher swap at `~/.local/bin/claude` lands in the upper layer and persists across runs, while other executables in `~/.local/bin` stay visible and the host directory is never modified
+- `prepare_claude_native_install` re-syncs at every launch: the upper-layer launcher is kept only while strictly newer than the host's (an in-sandbox update the host hasn't caught up to); broken symlinks, stale whiteouts, and entries at or behind the host launcher are removed so the host launcher shows through the lower layer
+- If bwrap lacks `--overlay` support, falls back to binding `claude-bin` over `~/.local/bin` (updates still persist, but other entries in `~/.local/bin` are hidden)
+- Concurrent sandbox runs share the overlay upper/work dirs, which the kernel may refuse for simultaneous mounts
 - Non-native `~/.local/bin/claude` installations remain read-only (the symlink/bind is skipped when `~/.local/bin` is already visible via a whitelist mount)
 - Binds `~/.claude/` directory read-write for config
 - Binds/creates `~/.claude.json` for state persistence
@@ -226,7 +229,8 @@ Network setup is at lines 288-302:
 ### Adding Claude Configuration Mounts
 
 Claude Code needs specific paths (lines 264-285):
-- Binary: `~/.local/bin/claude` (read-only)
+- Launcher: `~/.local/bin/claude` (native installs: overlayfs with writable upper layer so updater launcher swaps persist; non-native: read-only)
+- Versions: `~/.local/share/claude` (native installs, read-write)
 - Config directory: `~/.claude/` (read-write)
 - State file: `~/.claude.json` (read-write, auto-created if missing)
 

@@ -45,6 +45,7 @@ VENV_BIN_DIR=""
 CLAUDE_HOST_BIN="$HOME/.local/bin/claude"
 CLAUDE_NATIVE_DIR="$HOME/.local/share/claude"
 CLAUDE_SANDBOX_BIN_DIR="$HOME/.local/share/ai-agent-sandbox/claude-bin"
+CLAUDE_SANDBOX_WORK_DIR="$HOME/.local/share/ai-agent-sandbox/claude-work"
 CLAUDE_NATIVE_INSTALL=false
 DOCKER_COMPOSE_PLUGIN_DIRS=(
     "$HOME/.docker/cli-plugins"
@@ -865,26 +866,43 @@ is_path_bound() {
 
 prepare_claude_native_install() {
     local managed_launcher="$CLAUDE_SANDBOX_BIN_DIR/claude"
-    local host_target=""
+    local host_target="" managed_target=""
 
-    # The dedicated launcher directory lets Claude update its symlink without
-    # giving the sandbox write access to every executable in ~/.local/bin.
-    if [[ -x "$managed_launcher" ]]; then
-        CLAUDE_NATIVE_INSTALL=true
-        return
-    fi
-
+    # ~/.local/bin is mounted as an overlay: the host directory is the
+    # read-only lower layer and the managed dir is the writable upper layer,
+    # so the updater can atomically replace ~/.local/bin/claude inside the
+    # sandbox (the write lands in the upper layer and persists) without the
+    # sandbox getting write access to the rest of ~/.local/bin.
     if [[ -L "$CLAUDE_HOST_BIN" ]]; then
         host_target=$(readlink -f "$CLAUDE_HOST_BIN" 2>/dev/null || true)
+        if [[ "$host_target" != "$CLAUDE_NATIVE_DIR/versions/"* || ! -x "$host_target" ]]; then
+            host_target=""
+        fi
     fi
-    if [[ "$host_target" != "$CLAUDE_NATIVE_DIR/versions/"* || ! -x "$host_target" ]]; then
-        return
+    if [[ -L "$managed_launcher" ]]; then
+        managed_target=$(readlink -f "$managed_launcher" 2>/dev/null || true)
+        if [[ "$managed_target" != "$CLAUDE_NATIVE_DIR/versions/"* || ! -x "$managed_target" ]]; then
+            managed_target=""
+        fi
     fi
 
-    mkdir -p "$CLAUDE_SANDBOX_BIN_DIR"
-    rm -f "$managed_launcher"
-    ln -s "$host_target" "$managed_launcher"
-    CLAUDE_NATIVE_INSTALL=true
+    # Keep the upper-layer launcher only while it is strictly newer than the
+    # host's (an in-sandbox update the host hasn't caught up to). Otherwise
+    # remove it — including broken symlinks and stale whiteouts — so the host
+    # launcher shows through the lower layer.
+    if [[ -e "$managed_launcher" || -L "$managed_launcher" ]]; then
+        local host_ver="${host_target##*/}" managed_ver="${managed_target##*/}"
+        if [[ -z "$managed_target" ]] || { [[ -n "$host_target" ]] && \
+            [[ "$(printf '%s\n' "$managed_ver" "$host_ver" | sort -V | tail -n1)" == "$host_ver" ]]; }; then
+            rm -f "$managed_launcher"
+            managed_target=""
+        fi
+    fi
+
+    if [[ -n "$host_target" || -n "$managed_target" ]]; then
+        mkdir -p "$CLAUDE_SANDBOX_BIN_DIR" "$CLAUDE_SANDBOX_WORK_DIR"
+        CLAUDE_NATIVE_INSTALL=true
+    fi
 }
 
 # Validate agent selection
@@ -911,7 +929,7 @@ AGENT_BIN=""
 if [[ "$AGENT" = "claudecode" ]]; then
     prepare_claude_native_install
     if [[ "$CLAUDE_NATIVE_INSTALL" = true ]]; then
-        AGENT_BIN="$CLAUDE_SANDBOX_BIN_DIR/claude"
+        AGENT_BIN="$CLAUDE_HOST_BIN"
     else
         AGENT_BIN=$(command -v claude 2>/dev/null || true)
     fi
@@ -1174,12 +1192,26 @@ log_info "\n${YELLOW}Agent-specific configuration bindings:"
 if [[ "$AGENT" = "claudecode" ]]; then
     if [[ "$CLAUDE_NATIVE_INSTALL" = true ]]; then
         # Persist both parts of a native Claude installation. The updater writes
-        # binaries under ~/.local/share and atomically replaces its launcher.
-        # The launcher dir is mounted at its own path (and prepended to PATH)
-        # so it never shadows a whitelisted ~/.local/bin.
+        # binaries under ~/.local/share and atomically replaces its launcher at
+        # ~/.local/bin/claude. That path is mounted as an overlay (host dir as
+        # read-only lower layer, managed dir as writable upper layer) so the
+        # launcher swap persists across runs while the rest of ~/.local/bin
+        # stays visible and effectively read-only on the host. Note: concurrent
+        # sandboxes share the upper/work dirs, which overlayfs may refuse.
         BWRAP_ARGS+=(--bind "$CLAUDE_NATIVE_DIR" "$CLAUDE_NATIVE_DIR")
-        BWRAP_ARGS+=(--bind "$CLAUDE_SANDBOX_BIN_DIR" "$CLAUDE_SANDBOX_BIN_DIR")
-        log_info "${GREEN}✓${NC} Mounted native Claude versions and launcher (read-write)"
+        if [[ -d "$HOME/.local/bin" ]] && "$BWRAP_BIN" --help 2>&1 | grep -q -- '--overlay-src'; then
+            BWRAP_ARGS+=(--overlay-src "$HOME/.local/bin")
+            BWRAP_ARGS+=(--overlay "$CLAUDE_SANDBOX_BIN_DIR" "$CLAUDE_SANDBOX_WORK_DIR" "$HOME/.local/bin")
+            log_info "${GREEN}✓${NC} Mounted native Claude versions (read-write) and ~/.local/bin overlay (updates persist)"
+        else
+            # No overlay support: shadow ~/.local/bin with the managed dir so
+            # updates still persist, at the cost of hiding its other entries.
+            if [[ ! -e "$CLAUDE_SANDBOX_BIN_DIR/claude" ]] && [[ -x "$(readlink -f "$CLAUDE_HOST_BIN" 2>/dev/null)" ]]; then
+                ln -s "$(readlink -f "$CLAUDE_HOST_BIN")" "$CLAUDE_SANDBOX_BIN_DIR/claude"
+            fi
+            BWRAP_ARGS+=(--bind "$CLAUDE_SANDBOX_BIN_DIR" "$HOME/.local/bin")
+            log_info "${GREEN}✓${NC} Mounted native Claude versions and launcher (read-write, no overlay support)"
+        fi
     # Bind non-native claude binary
     elif [[ -e "$HOME/.local/bin/claude" ]]; then
         # If it's a symlink, we need to bind the target first, then create the symlink
@@ -1312,11 +1344,6 @@ sandbox_setenv TERM "${TERM:-xterm-256color}"
 SANDBOX_PATH=""
 if [[ "$AGENT" = "claudecode" ]]; then
     SANDBOX_PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
-    if [[ "$CLAUDE_NATIVE_INSTALL" = true ]]; then
-        # The managed launcher must win over any whitelisted ~/.local/bin/claude
-        # so updates applied inside the sandbox take effect.
-        SANDBOX_PATH="$CLAUDE_SANDBOX_BIN_DIR:$SANDBOX_PATH"
-    fi
 elif [[ "$AGENT" = "opencode" ]]; then
     SANDBOX_PATH="$HOME/.opencode/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 fi
