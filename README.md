@@ -97,6 +97,14 @@ source .venv/bin/activate
 
 `--venv` detects the active Python virtual environment from `VIRTUAL_ENV`, mounts the venv read-only, sets `VIRTUAL_ENV` inside the sandbox, and prepends `$VIRTUAL_ENV/bin` to `PATH`. If no active venv is detected, the option is ignored.
 
+### Git configuration:
+
+By default, `~/.gitconfig` is mounted read-only into the sandbox (if it exists) so git identity and settings (user name, email, aliases) work inside. To disable this:
+
+```bash
+./ai-agent-sandbox.sh --no-gitconfig
+```
+
 ### Pass arguments to the selected agent:
 ```bash
 ./ai-agent-sandbox.sh -- --model claude-sonnet-4-5

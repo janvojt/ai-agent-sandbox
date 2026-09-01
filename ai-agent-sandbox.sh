@@ -36,6 +36,7 @@ DRY_RUN=false
 AGENT="claudecode"
 ENABLE_DOCKER=false
 ENABLE_VENV=false
+MOUNT_GITCONFIG=true
 SOCKET_PROXY_IMAGE="${AI_AGENT_SANDBOX_DOCKER_PROXY:-ghcr.io/wollomatic/socket-proxy:1}"
 PROXY_CONTAINER_NAME=""
 PROXY_SOCKET_PATH=""
@@ -73,6 +74,7 @@ OPTIONS:
     --blacklist-path PATH   Directly blacklist a path (relative to working dir, can be specified multiple times)
     --enable-docker, -d     Enable Docker access via filtered socket proxy
     --venv                  Include active Python virtual environment in sandbox PATH
+    --no-gitconfig          Do not mount ~/.gitconfig into the sandbox
     --docker-image IMAGE    Socket proxy image (default: ghcr.io/wollomatic/socket-proxy:1)
     --dry-run              Start bash shell instead of agent (for testing)
     --quiet, -q            Suppress informational output (faster startup)
@@ -162,6 +164,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --venv)
             ENABLE_VENV=true
+            shift
+            ;;
+        --no-gitconfig)
+            MOUNT_GITCONFIG=false
             shift
             ;;
         --docker-image)
@@ -1317,6 +1323,12 @@ elif [[ "$AGENT" = "opencode" ]]; then
         BWRAP_ARGS+=(--bind "$HOME/.local/share/opencode" "$HOME/.local/share/opencode")
         log_info "${YELLOW}✓${NC} Created and mounted ~/.local/share/opencode (read-write)"
     fi
+fi
+
+# Bind ~/.gitconfig read-only so git identity and settings are available
+if [[ "$MOUNT_GITCONFIG" = true ]] && [[ -f "$HOME/.gitconfig" ]]; then
+    BWRAP_ARGS+=(--ro-bind "$HOME/.gitconfig" "$HOME/.gitconfig")
+    log_info "${GREEN}✓${NC} Mounted ~/.gitconfig (read-only)"
 fi
 
 sandbox_setenv HOME "$HOME"

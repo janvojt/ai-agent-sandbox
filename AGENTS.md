@@ -44,6 +44,10 @@ This is a bash-based sandboxing solution for running AI coding agents in isolate
 - Allowed paths are collected from working directory, read-write whitelist entries, and `--bind` mounts in `BWRAP_ARGS`
 - `DOCKER_HOST` is set inside sandbox to use the proxy socket
 
+**Git Configuration Mount**:
+- `~/.gitconfig` is bind-mounted read-only into the sandbox when it exists, so git identity and settings work inside
+- Disable with `--no-gitconfig`
+
 **Configuration Resolution Order (Multi-File Support)**:
 1. **User-level files** (always included if they exist):
    - `~/.config/ai-agent-sandbox/whitelist.txt`
