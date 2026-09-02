@@ -105,6 +105,24 @@ By default, `~/.gitconfig` is mounted read-only into the sandbox (if it exists) 
 ./ai-agent-sandbox.sh --no-gitconfig
 ```
 
+### GPG commit signing:
+
+To sign commits inside the sandbox without exposing your private keys, forward the host `gpg-agent`:
+
+```bash
+./ai-agent-sandbox.sh --gpg-agent
+```
+
+This works by forwarding the agent instead of the keys:
+
+- The host's restricted `gpg-agent` extra socket (`gpgconf --list-dirs agent-extra-socket`, typically `/run/user/<uid>/gnupg/S.gpg-agent.extra`) is bind-mounted read-only into the sandbox at `/run/user/<uid>/gnupg/S.gpg-agent`, where `gpg` looks for its agent. The agent is launched on the host first if it is not running.
+- Only **public keys** are imported into a temporary keyring that is mounted as `~/.gnupg` inside the sandbox and deleted on exit. Secret key material never enters the sandbox; the extra socket refuses key export and other privileged agent commands.
+- The public key of `git config user.signingkey` is used if set (repository config in the working directory is honoured). Otherwise every key with secret material or a smartcard stub on the host is exported.
+- The host's ownertrust for those keys is carried over so `git log --show-signature` verifies without trust warnings.
+- Passphrase and touch prompts are handled by the host agent, so a hardware key (YubiKey, smartcard) keeps prompting on the host as usual.
+
+`gpg` and `gpgconf` must be installed on the host and there must be at least one signing key. Only OpenPGP signing is forwarded; with `gpg.format = ssh` or `x509` a warning is printed.
+
 ### Pass arguments to the selected agent:
 ```bash
 ./ai-agent-sandbox.sh -- --model claude-sonnet-4-5

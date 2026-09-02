@@ -37,6 +37,9 @@ AGENT="claudecode"
 ENABLE_DOCKER=false
 ENABLE_VENV=false
 MOUNT_GITCONFIG=true
+ENABLE_GPG_AGENT=false
+GPG_HOST_EXTRA_SOCKET=""
+GPG_SANDBOX_HOME=""
 SOCKET_PROXY_IMAGE="${AI_AGENT_SANDBOX_DOCKER_PROXY:-ghcr.io/wollomatic/socket-proxy:1}"
 PROXY_CONTAINER_NAME=""
 PROXY_SOCKET_PATH=""
@@ -75,6 +78,7 @@ OPTIONS:
     --enable-docker, -d     Enable Docker access via filtered socket proxy
     --venv                  Include active Python virtual environment in sandbox PATH
     --no-gitconfig          Do not mount ~/.gitconfig into the sandbox
+    --gpg-agent             Forward the host gpg-agent for GPG commit signing (public keys only)
     --docker-image IMAGE    Socket proxy image (default: ghcr.io/wollomatic/socket-proxy:1)
     --dry-run              Start bash shell instead of agent (for testing)
     --quiet, -q            Suppress informational output (faster startup)
@@ -114,6 +118,7 @@ EXAMPLES:
     $0 --whitelist-path-rw /shared/data
     $0 --blacklist-path .env --blacklist-path secrets/
     $0 --venv
+    $0 --gpg-agent
     $0 -- --model claude-sonnet-4-5
     $0 -a opencode -- --model deepseek-chat
 
@@ -168,6 +173,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-gitconfig)
             MOUNT_GITCONFIG=false
+            shift
+            ;;
+        --gpg-agent)
+            ENABLE_GPG_AGENT=true
             shift
             ;;
         --docker-image)
@@ -241,6 +250,121 @@ validate_docker() {
             exit 1
         fi
     fi
+}
+
+# Check GPG agent forwarding prerequisites and prepare a public-key-only GnuPG
+# home directory for the sandbox. Secret keys stay on the host: the sandbox only
+# talks to the host gpg-agent through its restricted "extra" socket.
+validate_gpg_agent() {
+    if [[ "$ENABLE_GPG_AGENT" != true ]]; then
+        return 0
+    fi
+
+    local tool
+    for tool in gpg gpgconf; do
+        if ! command -v "$tool" &>/dev/null; then
+            echo -e "${RED}Error: $tool is not installed or not in PATH (required for --gpg-agent)${NC}" >&2
+            exit 1
+        fi
+    done
+
+    GPG_HOST_EXTRA_SOCKET="$(gpgconf --list-dirs agent-extra-socket 2>/dev/null || true)"
+    if [[ -z "$GPG_HOST_EXTRA_SOCKET" ]]; then
+        echo -e "${RED}Error: Could not determine the gpg-agent extra socket path${NC}" >&2
+        exit 1
+    fi
+
+    # Launch the host agent if it is not running yet so its sockets exist
+    if [[ ! -S "$GPG_HOST_EXTRA_SOCKET" ]]; then
+        gpgconf --launch gpg-agent 2>/dev/null || true
+    fi
+    if [[ ! -S "$GPG_HOST_EXTRA_SOCKET" ]]; then
+        echo -e "${RED}Error: gpg-agent extra socket not found: $GPG_HOST_EXTRA_SOCKET${NC}" >&2
+        echo "Start the agent on the host with: gpgconf --launch gpg-agent" >&2
+        exit 1
+    fi
+
+    local gpg_format
+    gpg_format="$(git -C "$WORKING_DIR" config --get gpg.format 2>/dev/null || true)"
+    if [[ -n "$gpg_format" && "$gpg_format" != "openpgp" ]]; then
+        log_info "${YELLOW}Warning: git gpg.format is '$gpg_format'; --gpg-agent only forwards OpenPGP signing${NC}"
+    fi
+
+    # Public keys to expose: the configured git signing key, or otherwise every
+    # key the host has secret material (or a smartcard stub) for
+    local -a key_ids=()
+    local signing_key
+    signing_key="$(git -C "$WORKING_DIR" config --get user.signingkey 2>/dev/null || true)"
+    if [[ -n "$signing_key" ]]; then
+        key_ids+=("$signing_key")
+    else
+        local fpr
+        while IFS= read -r fpr; do
+            [[ -n "$fpr" ]] && key_ids+=("$fpr")
+        done < <(gpg --batch --with-colons --list-secret-keys 2>/dev/null \
+            | awk -F: '$1 == "sec" { want = 1; next } $1 == "fpr" && want { print $10; want = 0 }')
+    fi
+    if [[ ${#key_ids[@]} -eq 0 ]]; then
+        echo -e "${RED}Error: No GPG signing key found on the host${NC}" >&2
+        echo "Set git user.signingkey or make sure 'gpg --list-secret-keys' shows a key" >&2
+        exit 1
+    fi
+
+    GPG_SANDBOX_HOME="$(mktemp -d "${TMPDIR:-/tmp}/ai-agent-sandbox-gnupg.XXXXXX")"
+    chmod 700 "$GPG_SANDBOX_HOME"
+
+    # Export public keys only into the temporary keyring
+    if ! gpg --batch --export -- "${key_ids[@]}" 2>/dev/null \
+        | gpg --batch --quiet --no-autostart --homedir "$GPG_SANDBOX_HOME" --import 2>/dev/null; then
+        echo -e "${RED}Error: Failed to export public key(s): ${key_ids[*]}${NC}" >&2
+        exit 1
+    fi
+
+    local -a exported_fprs=()
+    mapfile -t exported_fprs < <(gpg --batch --no-autostart --homedir "$GPG_SANDBOX_HOME" --with-colons --list-keys 2>/dev/null \
+        | awk -F: '$1 == "pub" { want = 1; next } $1 == "fpr" && want { print $10; want = 0 }')
+    if [[ ${#exported_fprs[@]} -eq 0 ]]; then
+        echo -e "${RED}Error: No public key exported for: ${key_ids[*]}${NC}" >&2
+        exit 1
+    fi
+
+    # Carry over the host's ownertrust so signature verification inside the
+    # sandbox does not warn about untrusted keys
+    gpg --batch --export-ownertrust 2>/dev/null \
+        | grep -F -f <(printf '%s:\n' "${exported_fprs[@]}") \
+        | gpg --batch --quiet --no-autostart --homedir "$GPG_SANDBOX_HOME" --import-ownertrust 2>/dev/null || true
+
+    local has_secret=false
+    for fpr in "${exported_fprs[@]}"; do
+        if gpg --batch --list-secret-keys -- "$fpr" &>/dev/null; then
+            has_secret=true
+            break
+        fi
+    done
+    if [[ "$has_secret" != true ]]; then
+        log_info "${YELLOW}Warning: The host has no secret key (or smartcard stub) for ${exported_fprs[*]}; signing may fail${NC}"
+    fi
+}
+
+# Forward the host gpg-agent into the sandbox
+mount_gpg_agent() {
+    [[ "$ENABLE_GPG_AGENT" = true ]] || return 0
+
+    local runtime_dir
+    runtime_dir="/run/user/$(id -u)"
+
+    # gpg only uses /run/user/<uid>/gnupg when both directories are owned by
+    # the user with mode 0700; otherwise it falls back to ~/.gnupg
+    BWRAP_ARGS+=(--perms 0700 --dir "$runtime_dir")
+    BWRAP_ARGS+=(--perms 0700 --dir "$runtime_dir/gnupg")
+    # The host's restricted extra socket becomes the sandbox's regular agent socket
+    BWRAP_ARGS+=(--ro-bind "$GPG_HOST_EXTRA_SOCKET" "$runtime_dir/gnupg/S.gpg-agent")
+    # Public-key-only keyring prepared by validate_gpg_agent
+    BWRAP_ARGS+=(--bind "$GPG_SANDBOX_HOME" "$HOME/.gnupg")
+    BWRAP_ARGS+=(--unsetenv GNUPGHOME)
+
+    log_info "${GREEN}✓${NC} Forwarded gpg-agent: $GPG_HOST_EXTRA_SOCKET -> $runtime_dir/gnupg/S.gpg-agent"
+    log_info "${GREEN}✓${NC} Mounted public-key-only keyring at ~/.gnupg"
 }
 
 mount_docker_compose_plugins() {
@@ -422,13 +546,24 @@ cleanup_socket_proxy() {
     fi
 }
 
+cleanup_gpg_agent() {
+    if [[ -n "${GPG_SANDBOX_HOME:-}" ]] && [[ -d "$GPG_SANDBOX_HOME" ]]; then
+        rm -rf "$GPG_SANDBOX_HOME" 2>/dev/null || true
+    fi
+}
+
+cleanup_sandbox() {
+    cleanup_socket_proxy
+    cleanup_gpg_agent
+}
+
 # Shells conventionally report signal termination as 128 + signal number.
 SIGHUP_SIGNAL=1
 SIGTERM_SIGNAL=15
 SIGHUP_EXIT_STATUS=$((128 + SIGHUP_SIGNAL))
 SIGTERM_EXIT_STATUS=$((128 + SIGTERM_SIGNAL))
 
-trap cleanup_socket_proxy EXIT
+trap cleanup_sandbox EXIT
 trap 'exit "$SIGHUP_EXIT_STATUS"' HUP
 trap 'exit "$SIGTERM_EXIT_STATUS"' TERM
 
@@ -918,6 +1053,7 @@ if [[ "$AGENT" != "claudecode" ]] && [[ "$AGENT" != "opencode" ]]; then
 fi
 
 validate_docker
+validate_gpg_agent
 detect_venv
 
 # Cache command availability checks
@@ -1076,6 +1212,10 @@ BLACKLIST_SEARCH_ROOTS+=("$WORKING_DIR")
 
 # Bind working directory (after tmpfs home, so it's visible)
 BWRAP_ARGS+=(--bind "$WORKING_DIR" "$WORKING_DIR")
+
+# Forward gpg-agent before whitelist processing: bwrap does not change the mode
+# of directories that already exist, and gpg requires /run/user/<uid> to be 0700
+mount_gpg_agent
 
 # Process all whitelist files and add to bubblewrap (after tmpfs so HOME paths work)
 if [[ ${#WHITELIST_FILES[@]} -eq 0 ]]; then
@@ -1420,6 +1560,11 @@ if [[ "$ENABLE_VENV" = true ]]; then
     log_info "Virtual Environment: ${YELLOW}$VENV_PATH${NC}"
 else
     log_info "Virtual Environment: ${YELLOW}disabled${NC}"
+fi
+if [[ "$ENABLE_GPG_AGENT" = true ]]; then
+    log_info "GPG Agent Forwarding: ${YELLOW}enabled${NC} ($GPG_HOST_EXTRA_SOCKET)"
+else
+    log_info "GPG Agent Forwarding: ${YELLOW}disabled${NC}"
 fi
 log_info "Whitelist Files (${#WHITELIST_FILES[@]}):"
 for wfile in "${WHITELIST_FILES[@]}"; do

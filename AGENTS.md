@@ -48,6 +48,14 @@ This is a bash-based sandboxing solution for running AI coding agents in isolate
 - `~/.gitconfig` is bind-mounted read-only into the sandbox when it exists, so git identity and settings work inside
 - Disable with `--no-gitconfig`
 
+**GPG Agent Forwarding (`--gpg-agent`)**:
+- Forwards the host `gpg-agent` instead of exposing keys, so commits can be GPG-signed inside the sandbox
+- `validate_gpg_agent` runs on the host before the sandbox starts: it resolves the extra socket via `gpgconf --list-dirs agent-extra-socket` (launching the agent if needed), picks the public key(s) to expose (`git config user.signingkey` from the working directory, else every key with secret material listed by `gpg --list-secret-keys`), exports them into a temporary `mktemp -d` GnuPG home (`--no-autostart`, public keys only) and carries over their ownertrust. Missing tools, socket, or keys are fatal errors
+- `mount_gpg_agent` adds the bwrap arguments: `--perms 0700 --dir` for `/run/user/<uid>` and `/run/user/<uid>/gnupg` (gpg only uses that socket directory when both are owned by the user with mode 0700, otherwise it falls back to `~/.gnupg`), a read-only bind of the host extra socket at `/run/user/<uid>/gnupg/S.gpg-agent`, a read-write bind of the temporary keyring at `~/.gnupg`, and `--unsetenv GNUPGHOME`
+- The mounts are added right after the working-directory bind and **before** whitelist processing: bwrap does not change the mode of a directory that already exists, so a whitelisted path under `/run/user/<uid>` must not create that directory first
+- The restricted extra socket allows signing but refuses secret key export and other privileged commands; pinentry runs on the host, so hardware keys keep prompting there
+- The temporary keyring is removed by `cleanup_gpg_agent`, which runs from the `cleanup_sandbox` EXIT trap together with the Docker proxy cleanup
+
 **Configuration Resolution Order (Multi-File Support)**:
 1. **User-level files** (always included if they exist):
    - `~/.config/ai-agent-sandbox/whitelist.txt`
@@ -264,6 +272,7 @@ When modifying the script:
 16. If `--enable-docker` or `-d` is used, verify proxy starts and socket exists
 17. Verify bind mount restrictions: allowed for working dir, denied for `/etc` and `~/.ssh`
 18. Verify proxy cleanup on exit (no leftover container or socket file)
+19. If `--gpg-agent` is used, verify `git commit -S` succeeds inside the sandbox, `gpg --export-secret-keys` fails with "Forbidden", and no `ai-agent-sandbox-gnupg.*` directory is left in `$TMPDIR` after exit
 
 ## Files in Repository
 
