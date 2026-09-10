@@ -66,7 +66,7 @@ This is a bash-based sandboxing solution for running AI coding agents in isolate
 - Fresh profiles are empty by design; seeding from the host is a manual `cp -a`
 
 **Config file (`config.yaml`)**:
-- Files: `DEFAULT_CONFIG_FILE` (`${AI_AGENT_SANDBOX_CONFIG:-~/.config/ai-agent-sandbox/config.yaml}`), `.ai-agent-sandbox/config.yaml`, `.ai-agent-sandbox/config.local.yaml`, loaded in that order by `load_config_files`. Never auto-generated; `config-example.yaml` documents every key
+- Files: `DEFAULT_CONFIG_FILE` (`${AI_AGENT_SANDBOX_CONFIG:-~/.config/ai-agent-sandbox/config.yaml}`), `DEFAULT_CONFIG_LOCAL_FILE` (`${AI_AGENT_SANDBOX_CONFIG_LOCAL:-~/.config/ai-agent-sandbox/config.local.yaml}`), `.ai-agent-sandbox/config.yaml`, `.ai-agent-sandbox/config.local.yaml`, loaded in that order by `load_config_files`. Never auto-generated; `config-example.yaml` documents every key
 - **Parsed before the command-line loop** into the same variables the flags set, so flags always win (`--verbose` beats `quiet: true`, `--profile default` beats a project `profile:`). One-way flags therefore have counterparts: `--no-docker`, `--no-venv`, `--no-gpg-agent`, `--gitconfig`, `--no-protect-project-config`. `log_info` and `trim_whitespace` are defined above the loop for this reason; parser warnings are buffered in `CONFIG_LOG_MESSAGES` and flushed by `flush_config_log` once `QUIET` is known; fatal errors (`config_error`, e.g. an invalid boolean) exit immediately
 - `parse_config_file` is a pure-bash state machine (`none`/`pending`/`list`/`env`/`skip`) supporting: `key: value` scalars (quoted or unquoted, `parse_yaml_scalar`; a `#` starts a comment only at the start of a value or after whitespace), block lists (`- item`), inline lists for list keys only when the value starts with `[` and ends with `]` (so globs like `/etc/java[0-9]*` stay scalars), `env:` block or inline mapping, `---`/`...`, CRLF, BOM and tab indentation. Everything else warns and is ignored
 - Keys: `profile`, `agent`, `docker_image` (strings); `docker`, `venv`, `gpg_agent`, `gitconfig`, `quiet`, `protect_project_config` (bools, `parse_yaml_bool`); `whitelist` (→ `WHITELIST_ENTRIES`, processed by `process_whitelist_entry` after whitelist files and before `--whitelist-path*`; does **not** set `EXPLICIT_WHITELIST`), `blacklist` (→ `BLACKLIST_PATHS`, does not set `EXPLICIT_BLACKLIST`), `whitelist_files`/`blacklist_files`/`env_files` (`expand_config_path`: `~`/`$HOME` expansion, relative to working dir; the first two set `EXPLICIT_*`), `agent_args` (→ `CONFIG_AGENT_ARGS`, prepended to `AGENT_ARGS` after the loop), `env` (`apply_config_env_item` pushes `KEY=<raw value>` to `ENV_VARS` so `parse_env_assignment` applies the `.env` quoting/expansion rules). `protect_project_config` is ignored with a warning when it comes from a project file
@@ -74,10 +74,10 @@ This is a bash-based sandboxing solution for running AI coding agents in isolate
 
 **Configuration Resolution Order (Multi-File Support)**:
 1. **User-level files** (always included if they exist):
-   - `~/.config/ai-agent-sandbox/config.yaml` (never auto-generated)
+   - `~/.config/ai-agent-sandbox/config.yaml` and `config.local.yaml` (never auto-generated)
    - `~/.config/ai-agent-sandbox/whitelist.txt`
    - `~/.config/ai-agent-sandbox/blacklist.txt`
-   - Environment variables `AI_AGENT_SANDBOX_CONFIG`, `AI_AGENT_SANDBOX_WHITELIST` and `AI_AGENT_SANDBOX_BLACKLIST` set the default file locations
+   - Environment variables `AI_AGENT_SANDBOX_CONFIG`, `AI_AGENT_SANDBOX_CONFIG_LOCAL`, `AI_AGENT_SANDBOX_WHITELIST` and `AI_AGENT_SANDBOX_BLACKLIST` set the default file locations
    - Whitelist/blacklist are **auto-generated** if they don't exist and no explicit files were provided
 2. **Project-level files** (automatically included if they exist):
    - `.ai-agent-sandbox/config.yaml` and `.ai-agent-sandbox/config.local.yaml` (in working directory)
@@ -298,7 +298,7 @@ When modifying the script:
 20. `--profile test --dry-run`: "Created new profile" is logged, `~/.claude` is empty and `~/.claude.json` is `{}` inside the sandbox, `CLAUDE_CONFIG_DIR` is unset, the store `~/.local/share/ai-agent-sandbox/profiles` is 0700 on the host and not visible inside the sandbox, and the host `~/.claude` is untouched. Without `--profile` the host configuration is used as before
 21. Log in with `/login` inside a new profile, exit, rerun with the same profile: no login prompt, `profiles/<name>/home/.claude/.credentials.json` exists. `--list-profiles` marks it as logged in
 22. Invalid profile names (`bad/name`, `../x`, `.hidden`) exit 1
-23. Config precedence: project `config.yaml` < `config.local.yaml` < `AI_AGENT_SANDBOX_PROFILE` < `--profile` (check the `Profile:` summary line); `docker: true` + `--no-docker` disables Docker; `whitelist`, `blacklist`, `env`, `agent_args` from config show up in mounts, environment and the final agent command
+23. Config precedence: user `config.yaml` < user `config.local.yaml` < project `config.yaml` < project `config.local.yaml` < `AI_AGENT_SANDBOX_PROFILE` < `--profile` (check the `Profile:` summary line); `docker: true` + `--no-docker` disables Docker; `whitelist`, `blacklist`, `env`, `agent_args` from config show up in mounts, environment and the final agent command
 24. Parser edge cases: CRLF file, tab indentation, `docker: ture` (fatal), unknown key (warning), `"value # not a comment"`, `docker_image: ghcr.io/x:1`, a glob with `[` as a whitelist entry, `profile: ~` (unset)
 25. A project config with a `whitelist:` list on a fresh `$HOME` still auto-generates the default whitelist/blacklist
 26. `.ai-agent-sandbox/` is read-only inside the sandbox (`touch .ai-agent-sandbox/x` fails) and blacklisted files in it are still hidden; `--no-protect-project-config` makes it writable again

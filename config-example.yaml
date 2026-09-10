@@ -2,10 +2,11 @@
 #
 # Copy to one of:
 #   ~/.config/ai-agent-sandbox/config.yaml        user-level defaults
+#   ~/.config/ai-agent-sandbox/config.local.yaml  user-level overrides (e.g. machine-specific)
 #   .ai-agent-sandbox/config.yaml                 project-level (commit to git)
 #   .ai-agent-sandbox/config.local.yaml           personal overrides (add to .gitignore)
 #
-# Precedence: user config < project config < project local config
+# Precedence: user config < user local config < project config < project local config
 #             < AI_AGENT_SANDBOX_PROFILE environment variable < command-line flags
 # Scalars override earlier values; lists are merged.
 #

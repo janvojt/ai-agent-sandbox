@@ -5,3 +5,5 @@
 
 # General rules
 *.local.json
+*.local.yaml
+.ai-agent-sandbox/.env.local

@@ -19,6 +19,7 @@ PROJECT_BLACKLIST_FILE="$WORKING_DIR/.ai-agent-sandbox/blacklist.txt"
 PROJECT_ENV_FILE="$WORKING_DIR/.ai-agent-sandbox/.env"
 PROJECT_ENV_LOCAL_FILE="$WORKING_DIR/.ai-agent-sandbox/.env.local"
 DEFAULT_CONFIG_FILE="${AI_AGENT_SANDBOX_CONFIG:-$HOME/.config/ai-agent-sandbox/config.yaml}"
+DEFAULT_CONFIG_LOCAL_FILE="${AI_AGENT_SANDBOX_CONFIG_LOCAL:-$HOME/.config/ai-agent-sandbox/config.local.yaml}"
 PROJECT_CONFIG_DIR="$WORKING_DIR/.ai-agent-sandbox"
 PROJECT_CONFIG_FILE="$PROJECT_CONFIG_DIR/config.yaml"
 PROJECT_CONFIG_LOCAL_FILE="$PROJECT_CONFIG_DIR/config.local.yaml"
@@ -111,6 +112,7 @@ OPTIONS:
 IMPLICIT CONFIGURATION FILES (automatically included if they exist):
     1. User-level (always):
        - $DEFAULT_CONFIG_FILE
+       - $DEFAULT_CONFIG_LOCAL_FILE
        - $DEFAULT_WHITELIST_FILE
        - $DEFAULT_BLACKLIST_FILE
        - $DEFAULT_ENV_FILE
@@ -122,8 +124,9 @@ IMPLICIT CONFIGURATION FILES (automatically included if they exist):
        - .ai-agent-sandbox/blacklist.txt (in working directory)
        - .ai-agent-sandbox/.env (in working directory)
        - .ai-agent-sandbox/.env.local (in working directory)
-    Precedence: user config < project config < project local config
-                < AI_AGENT_SANDBOX_PROFILE < command-line options
+    Precedence: user config < user local config < project config
+                < project local config < AI_AGENT_SANDBOX_PROFILE
+                < command-line options
 
 CONFIGURATION FILE FORMAT:
     Config:    YAML (flat subset). Keys: profile, agent, docker, docker_image, venv,
@@ -351,7 +354,7 @@ apply_config_scalar() {
                     # The project itself must not be able to switch off the
                     # protection of its own sandbox configuration
                     if [[ "$file" == "$PROJECT_CONFIG_DIR/"* ]]; then
-                        config_warn "Ignoring '$key' in $file (only allowed in $DEFAULT_CONFIG_FILE or on the command line)"
+                        config_warn "Ignoring '$key' in $file (only allowed in user-level config files or on the command line)"
                     else
                         PROTECT_PROJECT_CONFIG="$bool"
                     fi
@@ -547,7 +550,8 @@ parse_config_file() {
 
 load_config_files() {
     local file
-    for file in "$DEFAULT_CONFIG_FILE" "$PROJECT_CONFIG_FILE" "$PROJECT_CONFIG_LOCAL_FILE"; do
+    for file in "$DEFAULT_CONFIG_FILE" "$DEFAULT_CONFIG_LOCAL_FILE" \
+        "$PROJECT_CONFIG_FILE" "$PROJECT_CONFIG_LOCAL_FILE"; do
         [[ -f "$file" ]] || continue
         CONFIG_FILES_LOADED+=("$file")
         parse_config_file "$file"

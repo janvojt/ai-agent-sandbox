@@ -183,6 +183,7 @@ When Docker is enabled, the sandbox also mounts Docker CLI plugin directories fr
 ### Using environment variables:
 ```bash
 export AI_AGENT_SANDBOX_CONFIG=/path/to/config.yaml
+export AI_AGENT_SANDBOX_CONFIG_LOCAL=/path/to/config.local.yaml
 export AI_AGENT_SANDBOX_WHITELIST=/path/to/whitelist.txt
 export AI_AGENT_SANDBOX_BLACKLIST=/path/to/blacklist.txt
 export AI_AGENT_SANDBOX_ENV=/path/to/.env
@@ -200,11 +201,12 @@ The script supports **multiple config, whitelist, blacklist, and environment fil
 
 1. **User-level files** (always included if they exist):
    - `~/.config/ai-agent-sandbox/config.yaml`
+   - `~/.config/ai-agent-sandbox/config.local.yaml` (loaded after `config.yaml`, overrides its values)
    - `~/.config/ai-agent-sandbox/whitelist.txt`
    - `~/.config/ai-agent-sandbox/blacklist.txt`
    - `~/.config/ai-agent-sandbox/.env`
    - `~/.config/ai-agent-sandbox/.env.local` (loaded after `.env`, overrides its values)
-   - Whitelist and blacklist files are auto-generated if they don't exist and no explicit files are provided; `config.yaml`, `.env` and `.env.local` are optional and never auto-generated
+   - Whitelist and blacklist files are auto-generated if they don't exist and no explicit files are provided; `config.yaml`, `config.local.yaml`, `.env` and `.env.local` are optional and never auto-generated
 
 2. **Project-level files** (automatically included if they exist):
    - `.ai-agent-sandbox/config.yaml` (in working directory)
@@ -253,7 +255,7 @@ See [`config-example.yaml`](config-example.yaml) for a commented example of ever
 | `agent_args` | list | arguments always passed to the agent, before anything given after `--` |
 | `protect_project_config` | bool | `--no-protect-project-config`; only honoured in the user-level file |
 
-**Precedence:** `~/.config/ai-agent-sandbox/config.yaml` < `.ai-agent-sandbox/config.yaml` < `.ai-agent-sandbox/config.local.yaml` < `AI_AGENT_SANDBOX_PROFILE` < command-line flags. Scalars from a later source override earlier ones; lists are merged. Relative paths are resolved against the working directory, like in whitelist files.
+**Precedence:** `~/.config/ai-agent-sandbox/config.yaml` < `~/.config/ai-agent-sandbox/config.local.yaml` < `.ai-agent-sandbox/config.yaml` < `.ai-agent-sandbox/config.local.yaml` < `AI_AGENT_SANDBOX_PROFILE` < command-line flags. Scalars from a later source override earlier ones; lists are merged. Relative paths are resolved against the working directory, like in whitelist files.
 
 **Supported YAML subset.** The file is parsed by the script itself, without `yq`, so only a flat subset of YAML is understood:
 - `key: value` scalars; quoted (`"..."` or `'...'`) or unquoted. Booleans accept `true/false`, `yes/no`, `on/off`; anything else is an error.
