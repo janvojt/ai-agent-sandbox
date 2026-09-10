@@ -56,13 +56,31 @@ This is a bash-based sandboxing solution for running AI coding agents in isolate
 - The restricted extra socket allows signing but refuses secret key export and other privileged commands; pinentry runs on the host, so hardware keys keep prompting there
 - The temporary keyring is removed by `cleanup_gpg_agent`, which runs from the `cleanup_sandbox` EXIT trap together with the Docker proxy cleanup
 
+**Profiles (`--profile NAME`, `AI_AGENT_SANDBOX_PROFILE`, config key `profile`)**:
+- A profile is a separate set of agent configuration, credentials and memory. Store: `PROFILES_DIR` (`${AI_AGENT_SANDBOX_PROFILES_DIR:-~/.local/share/ai-agent-sandbox/profiles}`, created 0700), one `<name>/home/` directory per profile that **mirrors the home directory layout**. `PROFILE_HOME` is `$HOME` for the reserved profile `default` (host configuration, the behaviour without `--profile`), otherwise `$PROFILES_DIR/<name>/home`
+- `bind_profile_dir <rel>` / `bind_profile_file <rel> [initial]` bind `$PROFILE_HOME/<rel>` at `$HOME/<rel>` read-write, creating the source on first use. `mount_claude_config` uses them for `.claude/` and `.claude.json` (seeded with `{}` so onboarding and `/login` start cleanly; `.claude.json.backup` is bound when present) and adds `--unsetenv CLAUDE_CONFIG_DIR` so a host env var cannot bypass the mount. `mount_opencode_config` does the same for `.opencode.json`, `.config/opencode`, `.cache/opencode`, `.local/state/opencode`, `.local/share/opencode` and unsets the `XDG_*_HOME` variables; `~/.opencode` (the installation, contains the binary) stays shared from the host. Adding a new agent means adding its dotfile paths here
+- `prepare_profile_home` creates the profile directory on first use and logs it; `validate_profile_name` enforces `^[A-Za-z0-9][A-Za-z0-9._-]*$`; `list_profiles` implements `--list-profiles` (exits before any side effects)
+- Resolution: config files < `AI_AGENT_SANDBOX_PROFILE` < `--profile`. The env var deliberately beats project config so a repository cannot silently switch the user's credentials
+- After whitelist processing, if `PROFILES_DIR` is visible through another mount (e.g. a whitelisted `~/.local/share`) it is covered with `--tmpfs` so no profile can read another profile's credentials. `warn_shadowed_binds` warns about whitelist mounts under `~/.claude` that the profile bind would hide
+- `collect_allowed_mount_paths` (Docker) intentionally uses bind **sources**: the Docker daemon resolves host paths, so allowing destinations would let a non-default profile bind-mount the host's own `~/.claude`
+- Fresh profiles are empty by design; seeding from the host is a manual `cp -a`
+
+**Config file (`config.yaml`)**:
+- Files: `DEFAULT_CONFIG_FILE` (`${AI_AGENT_SANDBOX_CONFIG:-~/.config/ai-agent-sandbox/config.yaml}`), `.ai-agent-sandbox/config.yaml`, `.ai-agent-sandbox/config.local.yaml`, loaded in that order by `load_config_files`. Never auto-generated; `config-example.yaml` documents every key
+- **Parsed before the command-line loop** into the same variables the flags set, so flags always win (`--verbose` beats `quiet: true`, `--profile default` beats a project `profile:`). One-way flags therefore have counterparts: `--no-docker`, `--no-venv`, `--no-gpg-agent`, `--gitconfig`, `--no-protect-project-config`. `log_info` and `trim_whitespace` are defined above the loop for this reason; parser warnings are buffered in `CONFIG_LOG_MESSAGES` and flushed by `flush_config_log` once `QUIET` is known; fatal errors (`config_error`, e.g. an invalid boolean) exit immediately
+- `parse_config_file` is a pure-bash state machine (`none`/`pending`/`list`/`env`/`skip`) supporting: `key: value` scalars (quoted or unquoted, `parse_yaml_scalar`; a `#` starts a comment only at the start of a value or after whitespace), block lists (`- item`), inline lists for list keys only when the value starts with `[` and ends with `]` (so globs like `/etc/java[0-9]*` stay scalars), `env:` block or inline mapping, `---`/`...`, CRLF, BOM and tab indentation. Everything else warns and is ignored
+- Keys: `profile`, `agent`, `docker_image` (strings); `docker`, `venv`, `gpg_agent`, `gitconfig`, `quiet`, `protect_project_config` (bools, `parse_yaml_bool`); `whitelist` (→ `WHITELIST_ENTRIES`, processed by `process_whitelist_entry` after whitelist files and before `--whitelist-path*`; does **not** set `EXPLICIT_WHITELIST`), `blacklist` (→ `BLACKLIST_PATHS`, does not set `EXPLICIT_BLACKLIST`), `whitelist_files`/`blacklist_files`/`env_files` (`expand_config_path`: `~`/`$HOME` expansion, relative to working dir; the first two set `EXPLICIT_*`), `agent_args` (→ `CONFIG_AGENT_ARGS`, prepended to `AGENT_ARGS` after the loop), `env` (`apply_config_env_item` pushes `KEY=<raw value>` to `ENV_VARS` so `parse_env_assignment` applies the `.env` quoting/expansion rules). `protect_project_config` is ignored with a warning when it comes from a project file
+- `protect_project_config_dir` ro-binds `$WORKING_DIR/.ai-agent-sandbox` right after the working-directory bind (blacklist `/dev/null` binds nest on top), so the agent cannot rewrite the profile/whitelist/env that apply to the next run. Residual risk: the agent can create the directory if it does not exist
+
 **Configuration Resolution Order (Multi-File Support)**:
 1. **User-level files** (always included if they exist):
+   - `~/.config/ai-agent-sandbox/config.yaml` (never auto-generated)
    - `~/.config/ai-agent-sandbox/whitelist.txt`
    - `~/.config/ai-agent-sandbox/blacklist.txt`
-   - Environment variables `AI_AGENT_SANDBOX_WHITELIST` and `AI_AGENT_SANDBOX_BLACKLIST` set the default file locations
-   - **Auto-generated** if they don't exist and no explicit files were provided (lines 111-191)
-2. **Project-level files** (automatically included if they exist, lines 201-207):
+   - Environment variables `AI_AGENT_SANDBOX_CONFIG`, `AI_AGENT_SANDBOX_WHITELIST` and `AI_AGENT_SANDBOX_BLACKLIST` set the default file locations
+   - Whitelist/blacklist are **auto-generated** if they don't exist and no explicit files were provided
+2. **Project-level files** (automatically included if they exist):
+   - `.ai-agent-sandbox/config.yaml` and `.ai-agent-sandbox/config.local.yaml` (in working directory)
    - `.ai-agent-sandbox/whitelist.txt` (in working directory)
    - `.ai-agent-sandbox/blacklist.txt` (in working directory)
    - **Never auto-generated** - create manually for project-specific rules
@@ -83,9 +101,8 @@ This is a bash-based sandboxing solution for running AI coding agents in isolate
 - If bwrap lacks `--overlay` support, falls back to binding `claude-bin` over `~/.local/bin` (updates still persist, but other entries in `~/.local/bin` are hidden)
 - Concurrent sandbox runs share the overlay upper/work dirs, which the kernel may refuse for simultaneous mounts
 - Non-native `~/.local/bin/claude` installations remain read-only (the symlink/bind is skipped when `~/.local/bin` is already visible via a whitelist mount)
-- Binds `~/.claude/` directory read-write for config
-- Binds/creates `~/.claude.json` for state persistence
-- Preserves Claude-specific environment variables (lines 311-316)
+- `mount_claude_config` binds `$PROFILE_HOME/.claude/` and `$PROFILE_HOME/.claude.json` read-write at `~/.claude` / `~/.claude.json` (host paths for the `default` profile, profile store otherwise; created on first use, `.claude.json` seeded with `{}`)
+- Preserves Claude-specific environment variables; unsets `CLAUDE_CONFIG_DIR`
 
 ## Development Commands
 
@@ -240,16 +257,21 @@ Network setup is at lines 288-302:
 
 ### Adding Claude Configuration Mounts
 
-Claude Code needs specific paths (lines 264-285):
-- Launcher: `~/.local/bin/claude` (native installs: overlayfs with writable upper layer so updater launcher swaps persist; non-native: read-only)
-- Versions: `~/.local/share/claude` (native installs, read-write)
-- Config directory: `~/.claude/` (read-write)
-- State file: `~/.claude.json` (read-write, auto-created if missing)
+Claude Code needs specific paths (`mount_claude_config`):
+- Launcher: `~/.local/bin/claude` (native installs: overlayfs with writable upper layer so updater launcher swaps persist; non-native: read-only) - shared by all profiles
+- Versions: `~/.local/share/claude` (native installs, read-write) - shared by all profiles
+- Config directory: `~/.claude/` (read-write, from `$PROFILE_HOME`)
+- State file: `~/.claude.json` (read-write, from `$PROFILE_HOME`, auto-created with `{}` if missing)
 
 When adding mounts, remember:
-- Bind after `--tmpfs "$HOME"` (line 230) or they'll be hidden
+- Bind after `--tmpfs "$HOME"` or they'll be hidden
 - Use `--ro-bind` for read-only, `--bind` for read-write
 - Non-existent paths should be checked before binding
+- Per-profile state must go through `bind_profile_dir` / `bind_profile_file` so it comes from `$PROFILE_HOME`; shared installation files are bound from `$HOME` directly
+
+### Adding Config File Keys
+
+Add the key to `is_config_list_key` (lists) and to `apply_config_list_item`, or to `apply_config_scalar` (scalars/bools). Config keys must set exactly the variables the equivalent flag sets; if the flag is one-way (only enables), add a `--no-...` counterpart so the command line can still override the file. Keys that must not be controllable from inside a project (security-relevant) follow the `protect_project_config` pattern: check `"$file" == "$PROJECT_CONFIG_DIR/"*` and warn. Document the key in `usage()`, `README.md` and `config-example.yaml`.
 
 ## Testing Checklist
 
@@ -273,6 +295,14 @@ When modifying the script:
 17. Verify bind mount restrictions: allowed for working dir, denied for `/etc` and `~/.ssh`
 18. Verify proxy cleanup on exit (no leftover container or socket file)
 19. If `--gpg-agent` is used, verify `git commit -S` succeeds inside the sandbox, `gpg --export-secret-keys` fails with "Forbidden", and no `ai-agent-sandbox-gnupg.*` directory is left in `$TMPDIR` after exit
+20. `--profile test --dry-run`: "Created new profile" is logged, `~/.claude` is empty and `~/.claude.json` is `{}` inside the sandbox, `CLAUDE_CONFIG_DIR` is unset, the store `~/.local/share/ai-agent-sandbox/profiles` is 0700 on the host and not visible inside the sandbox, and the host `~/.claude` is untouched. Without `--profile` the host configuration is used as before
+21. Log in with `/login` inside a new profile, exit, rerun with the same profile: no login prompt, `profiles/<name>/home/.claude/.credentials.json` exists. `--list-profiles` marks it as logged in
+22. Invalid profile names (`bad/name`, `../x`, `.hidden`) exit 1
+23. Config precedence: project `config.yaml` < `config.local.yaml` < `AI_AGENT_SANDBOX_PROFILE` < `--profile` (check the `Profile:` summary line); `docker: true` + `--no-docker` disables Docker; `whitelist`, `blacklist`, `env`, `agent_args` from config show up in mounts, environment and the final agent command
+24. Parser edge cases: CRLF file, tab indentation, `docker: ture` (fatal), unknown key (warning), `"value # not a comment"`, `docker_image: ghcr.io/x:1`, a glob with `[` as a whitelist entry, `profile: ~` (unset)
+25. A project config with a `whitelist:` list on a fresh `$HOME` still auto-generates the default whitelist/blacklist
+26. `.ai-agent-sandbox/` is read-only inside the sandbox (`touch .ai-agent-sandbox/x` fails) and blacklisted files in it are still hidden; `--no-protect-project-config` makes it writable again
+27. `-d --profile test`: the proxy's allowed bind paths include the profile's `.claude` source path, not the host `~/.claude`
 
 ## Files in Repository
 
@@ -280,13 +310,15 @@ When modifying the script:
 - `README.md` - User-facing documentation
 - `whitelist-example.txt` - Example whitelist configuration
 - `blacklist-example.txt` - Example blacklist configuration
+- `config-example.yaml` - Example config file (profile and other options)
 - `.gitignore` - Git ignore patterns
 - `AGENTS.md` - Developer documentation (this file)
 
 ## Project-Level Configuration
 
-Projects can include their own whitelist/blacklist files in the `.ai-agent-sandbox/` directory:
+Projects can include their own config/whitelist/blacklist files in the `.ai-agent-sandbox/` directory:
 - These files are automatically detected and used when present
 - They are never auto-generated
-- Ideal for version-controlled, team-shared configurations
+- Ideal for version-controlled, team-shared configurations (`config.local.yaml` is for personal overrides and should be gitignored)
 - Merged with user-level and explicit files
+- The directory is mounted read-only inside the sandbox by default (`protect_project_config`)

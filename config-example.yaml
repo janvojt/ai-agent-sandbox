@@ -1,0 +1,63 @@
+# AI Agent Sandbox configuration file
+#
+# Copy to one of:
+#   ~/.config/ai-agent-sandbox/config.yaml        user-level defaults
+#   .ai-agent-sandbox/config.yaml                 project-level (commit to git)
+#   .ai-agent-sandbox/config.local.yaml           personal overrides (add to .gitignore)
+#
+# Precedence: user config < project config < project local config
+#             < AI_AGENT_SANDBOX_PROFILE environment variable < command-line flags
+# Scalars override earlier values; lists are merged.
+#
+# Only a flat subset of YAML is supported: "key: value" scalars, block lists
+# ("- item" lines), inline lists ("[a, b]", items may not contain commas) and,
+# for "env", one level of "KEY: value" entries. Comments start with "#".
+
+# Named agent profile. Each profile has its own login, settings and memory.
+# "default" is the host configuration. New profiles start empty: run /login
+# inside the sandbox once and the profile stays logged in.
+profile: work
+
+# Agent to run: claudecode (default) or opencode
+# agent: claudecode
+
+# Feature toggles (same as the corresponding command-line flags)
+# docker: true          # --enable-docker / --no-docker
+# docker_image: ghcr.io/wollomatic/socket-proxy:1
+# venv: true            # --venv / --no-venv
+# gitconfig: false      # --gitconfig / --no-gitconfig
+# gpg_agent: true       # --gpg-agent / --no-gpg-agent
+# quiet: true           # --quiet / --verbose
+
+# Extra whitelist entries, same syntax as whitelist files (absolute or
+# relative paths, globs, ** patterns, ":rw" suffix, "!" blacklist override)
+whitelist:
+  - ~/.m2/repository:rw
+  - /opt/company-tools
+  - "!secrets/dev.key"
+
+# Extra blacklist patterns, relative to the working directory
+blacklist:
+  - secrets/
+  - "**/*.pem"
+
+# Additional whitelist / blacklist / environment files
+# whitelist_files: [~/shared/whitelist.txt]
+# blacklist_files: [~/shared/blacklist.txt]
+# env_files: [./ci/.env]
+
+# Environment variables inside the sandbox. Values follow .env rules:
+# double quotes expand $VAR and ~, single quotes are literal.
+env:
+  NODE_OPTIONS: "--max-old-space-size=4096"
+  TOOL_HOME: "~/tools"
+  LITERAL: 'no $expansion here'
+
+# Arguments always passed to the agent (before any arguments given after --)
+agent_args:
+  - --model
+  - claude-sonnet-4-5
+
+# Only honoured in the user-level file (or via --no-protect-project-config):
+# mount .ai-agent-sandbox/ read-only so the agent cannot rewrite these rules.
+# protect_project_config: true

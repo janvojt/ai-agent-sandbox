@@ -10,6 +10,8 @@ A secure bubblewrap-based sandboxing solution for running AI coding agents with 
 - ✅ **Configurable environment** - Optional `.env` files and direct variables, no SSH agent access
 - ✅ **Virtualenv support** - Optionally expose the active Python virtual environment
 - ✅ **Working directory isolation** - Full read-write only in current directory
+- ✅ **Named profiles** - Separate agent logins, settings and memory per profile (work, client, private)
+- ✅ **Project configuration file** - `.ai-agent-sandbox/config.yaml` pins the profile and other options per project
 
 ## Requirements
 
@@ -123,6 +125,34 @@ This works by forwarding the agent instead of the keys:
 
 `gpg` and `gpgconf` must be installed on the host and there must be at least one signing key. Only OpenPGP signing is forwarded; with `gpg.format = ssh` or `x509` a warning is printed.
 
+### Profiles:
+
+Profiles keep separate agent identities. Each profile has its own login, settings, memory and history, so you can use one Claude Code account for work, another provided by a customer, and a private one, without them ever seeing each other's data.
+
+```bash
+# Run with a named profile (created empty on first use)
+./ai-agent-sandbox.sh --profile customer-x
+
+# Same, via environment variable
+AI_AGENT_SANDBOX_PROFILE=customer-x ./ai-agent-sandbox.sh
+
+# List profiles
+./ai-agent-sandbox.sh --list-profiles
+
+# Force the host configuration even if the project pins a profile
+./ai-agent-sandbox.sh --profile default
+```
+
+- The reserved profile `default` is the host configuration (`~/.claude`, `~/.claude.json`), which is what runs when no profile is given.
+- A new profile starts with an empty configuration. Claude Code shows its onboarding and you log in with `/login` once; the credentials are stored in the profile, so the next run with that profile is already logged in.
+- Profile data lives in `~/.local/share/ai-agent-sandbox/profiles/<name>/home/` (override the store with `AI_AGENT_SANDBOX_PROFILES_DIR`). The directory mirrors your home directory, so `profiles/<name>/home/.claude` is mounted at `~/.claude` inside the sandbox. OpenCode uses the same mechanism for `~/.config/opencode`, `~/.local/share/opencode`, `~/.local/state/opencode`, `~/.cache/opencode` and `~/.opencode.json`.
+- The agent binary and its updates stay shared between profiles; only configuration, credentials and memory are per profile.
+- Profile names may contain letters, digits, `.`, `_` and `-`.
+- To seed a new profile from your host settings without the login, copy what you want by hand, for example `cp -a ~/.claude/settings.json ~/.claude/skills ~/.local/share/ai-agent-sandbox/profiles/<name>/home/.claude/`.
+- The profile store is hidden inside the sandbox even when a whitelist entry covers it (for example `~/.local/share`), so one profile can never read another profile's credentials.
+
+Usually you do not pass `--profile` by hand: pin it per project in `.ai-agent-sandbox/config.yaml` (see [Configuration file](#configuration-file-configyaml)).
+
 ### Pass arguments to the selected agent:
 ```bash
 ./ai-agent-sandbox.sh -- --model claude-sonnet-4-5
@@ -152,10 +182,13 @@ When Docker is enabled, the sandbox also mounts Docker CLI plugin directories fr
 
 ### Using environment variables:
 ```bash
+export AI_AGENT_SANDBOX_CONFIG=/path/to/config.yaml
 export AI_AGENT_SANDBOX_WHITELIST=/path/to/whitelist.txt
 export AI_AGENT_SANDBOX_BLACKLIST=/path/to/blacklist.txt
 export AI_AGENT_SANDBOX_ENV=/path/to/.env
 export AI_AGENT_SANDBOX_ENV_LOCAL=/path/to/.env.local
+export AI_AGENT_SANDBOX_PROFILE=work
+export AI_AGENT_SANDBOX_PROFILES_DIR=/path/to/profile-store
 ./ai-agent-sandbox.sh
 ```
 
@@ -163,16 +196,19 @@ export AI_AGENT_SANDBOX_ENV_LOCAL=/path/to/.env.local
 
 ### Multiple Configuration Files
 
-The script supports **multiple whitelist, blacklist, and environment files**, which are processed in order:
+The script supports **multiple config, whitelist, blacklist, and environment files**, which are processed in order:
 
 1. **User-level files** (always included if they exist):
+   - `~/.config/ai-agent-sandbox/config.yaml`
    - `~/.config/ai-agent-sandbox/whitelist.txt`
    - `~/.config/ai-agent-sandbox/blacklist.txt`
    - `~/.config/ai-agent-sandbox/.env`
    - `~/.config/ai-agent-sandbox/.env.local` (loaded after `.env`, overrides its values)
-   - Whitelist and blacklist files are auto-generated if they don't exist and no explicit files are provided; `.env` and `.env.local` are optional and never auto-generated
+   - Whitelist and blacklist files are auto-generated if they don't exist and no explicit files are provided; `config.yaml`, `.env` and `.env.local` are optional and never auto-generated
 
 2. **Project-level files** (automatically included if they exist):
+   - `.ai-agent-sandbox/config.yaml` (in working directory)
+   - `.ai-agent-sandbox/config.local.yaml` (in working directory, personal overrides, add to `.gitignore`)
    - `.ai-agent-sandbox/whitelist.txt` (in working directory)
    - `.ai-agent-sandbox/blacklist.txt` (in working directory)
    - `.ai-agent-sandbox/.env` (in working directory)
@@ -180,6 +216,53 @@ The script supports **multiple whitelist, blacklist, and environment files**, wh
    - **Never auto-generated** - create manually if needed
 
 3. **Additional files** specified via `--whitelist`, `--blacklist`, and `--env-path` flags
+
+### Configuration file (config.yaml)
+
+Everything that can be passed on the command line can also be put into a YAML config file. A typical project file pins the profile and a few paths:
+
+```yaml
+# .ai-agent-sandbox/config.yaml
+profile: customer-x
+docker: true
+whitelist:
+  - ~/.m2/repository:rw
+blacklist:
+  - secrets/
+env:
+  NODE_OPTIONS: "--max-old-space-size=4096"
+agent_args: [--model, claude-sonnet-4-5]
+```
+
+See [`config-example.yaml`](config-example.yaml) for a commented example of every key.
+
+| Key | Type | Equivalent flag |
+|---|---|---|
+| `profile` | string | `--profile NAME` (`default` = host configuration) |
+| `agent` | string | `--agent claudecode\|opencode` |
+| `docker` | bool | `--enable-docker` / `--no-docker` |
+| `docker_image` | string | `--docker-image IMAGE` |
+| `venv` | bool | `--venv` / `--no-venv` |
+| `gitconfig` | bool | `--gitconfig` / `--no-gitconfig` |
+| `gpg_agent` | bool | `--gpg-agent` / `--no-gpg-agent` |
+| `quiet` | bool | `--quiet` / `--verbose` |
+| `whitelist` | list | whitelist entries with the same syntax as whitelist files (relative paths, globs, `**`, `:rw`, `!`) |
+| `blacklist` | list | `--blacklist-path PATTERN` |
+| `whitelist_files`, `blacklist_files`, `env_files` | list | `--whitelist FILE`, `--blacklist FILE`, `--env-path FILE` |
+| `env` | mapping | `--env KEY=VALUE`; values follow the [environment file rules](#environment-file-format) |
+| `agent_args` | list | arguments always passed to the agent, before anything given after `--` |
+| `protect_project_config` | bool | `--no-protect-project-config`; only honoured in the user-level file |
+
+**Precedence:** `~/.config/ai-agent-sandbox/config.yaml` < `.ai-agent-sandbox/config.yaml` < `.ai-agent-sandbox/config.local.yaml` < `AI_AGENT_SANDBOX_PROFILE` < command-line flags. Scalars from a later source override earlier ones; lists are merged. Relative paths are resolved against the working directory, like in whitelist files.
+
+**Supported YAML subset.** The file is parsed by the script itself, without `yq`, so only a flat subset of YAML is understood:
+- `key: value` scalars; quoted (`"..."` or `'...'`) or unquoted. Booleans accept `true/false`, `yes/no`, `on/off`; anything else is an error.
+- Block lists (`key:` followed by `- item` lines) and inline lists (`key: [a, b]`, items may not contain commas). A single scalar is accepted for a list key.
+- `env:` followed by indented `KEY: value` lines, or inline `env: {KEY: value}`.
+- Comments (`#` at the start of a line or after whitespace), `---` document markers, tabs and CRLF line endings are tolerated. `~` or `null` unsets a scalar.
+- Nested mappings (other than `env`), anchors, multi-line strings and unknown keys are reported as warnings and ignored.
+
+**Project config protection.** Because `.ai-agent-sandbox/` lives inside the read-write working directory, an agent could otherwise edit its own sandbox rules (switch to the host profile, whitelist `~/.ssh`, change `ANTHROPIC_BASE_URL`) to take effect on the next run. The directory is therefore mounted read-only inside the sandbox by default. Disable it with `--no-protect-project-config` or `protect_project_config: false` in the user-level config; the setting is deliberately ignored in project files. If the directory does not exist yet, the agent can still create it, so review a new `.ai-agent-sandbox/` before your next run. The resolved profile and its source are printed in the startup summary.
 
 All files are merged together, allowing you to:
 - Maintain a base configuration in user-level files
@@ -318,6 +401,8 @@ The blacklist file contains **relative paths** from the working directory that t
 2. ✅ **Sensitive files in working directory** - Blacklisted patterns are hidden
 3. ✅ **SSH agent access** - SSH_AUTH_SOCK is removed from environment
 4. ✅ **Home directory access** - Only minimal agent-specific config is exposed
+5. ✅ **Credential separation** - With profiles, a project only sees the login, settings and memory of its own profile; the profile store itself is never visible inside the sandbox
+6. ✅ **Self-modifying sandbox rules** - `.ai-agent-sandbox/` is mounted read-only so the agent cannot change the profile, whitelist or environment it runs with next time
 
 ### Limitations and Considerations
 
@@ -372,6 +457,9 @@ Add the required paths to your whitelist file. Common additions:
 - `/usr/lib/x86_64-linux-gnu` (Debian/Ubuntu)
 - `/usr/lib64` (RedHat/Fedora)
 - `/opt/custom-tools`
+
+### The sandbox uses the wrong Claude account
+Check the `Profile:` line in the startup summary; it shows the profile and where it came from (`.ai-agent-sandbox/config.yaml`, `config.local.yaml`, `AI_AGENT_SANDBOX_PROFILE` or `--profile`). Use `--profile default` to force the host configuration, or `--list-profiles` to see which profiles are logged in.
 
 ### The agent needs to access a specific sensitive file
 If you genuinely need the agent to access a file that's blacklisted:

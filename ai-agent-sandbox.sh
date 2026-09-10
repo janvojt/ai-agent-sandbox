@@ -18,6 +18,20 @@ PROJECT_WHITELIST_FILE="$WORKING_DIR/.ai-agent-sandbox/whitelist.txt"
 PROJECT_BLACKLIST_FILE="$WORKING_DIR/.ai-agent-sandbox/blacklist.txt"
 PROJECT_ENV_FILE="$WORKING_DIR/.ai-agent-sandbox/.env"
 PROJECT_ENV_LOCAL_FILE="$WORKING_DIR/.ai-agent-sandbox/.env.local"
+DEFAULT_CONFIG_FILE="${AI_AGENT_SANDBOX_CONFIG:-$HOME/.config/ai-agent-sandbox/config.yaml}"
+PROJECT_CONFIG_DIR="$WORKING_DIR/.ai-agent-sandbox"
+PROJECT_CONFIG_FILE="$PROJECT_CONFIG_DIR/config.yaml"
+PROJECT_CONFIG_LOCAL_FILE="$PROJECT_CONFIG_DIR/config.local.yaml"
+CONFIG_FILES_LOADED=()
+CONFIG_LOG_MESSAGES=()
+CONFIG_AGENT_ARGS=()
+WHITELIST_ENTRIES=()
+PROFILE=""
+PROFILE_SOURCE=""
+PROFILES_DIR="${AI_AGENT_SANDBOX_PROFILES_DIR:-$HOME/.local/share/ai-agent-sandbox/profiles}"
+PROFILE_HOME=""
+LIST_PROFILES=false
+PROTECT_PROJECT_CONFIG=true
 WHITELIST_FILES=()
 BLACKLIST_FILES=()
 ENV_FILES=()
@@ -68,6 +82,9 @@ Securely run AI coding agents in a sandboxed environment using bubblewrap.
 
 OPTIONS:
     --agent, -a AGENT      AI coding agent to use: claudecode (default) or opencode
+    --profile, -p NAME      Use a named agent profile (separate login, settings, memory);
+                            'default' is the host configuration. New profiles start empty.
+    --list-profiles         List available profiles and exit
     --whitelist FILE        Add whitelist file (can be specified multiple times)
     --blacklist FILE        Add blacklist file (can be specified multiple times)
     --env-path FILE         Add environment file (can be specified multiple times)
@@ -76,9 +93,15 @@ OPTIONS:
     --whitelist-path-rw PATH Directly whitelist a path (read-write, can be specified multiple times)
     --blacklist-path PATH   Directly blacklist a path (relative to working dir, can be specified multiple times)
     --enable-docker, -d     Enable Docker access via filtered socket proxy
+    --no-docker             Disable Docker access (overrides config files)
     --venv                  Include active Python virtual environment in sandbox PATH
+    --no-venv               Do not include the virtual environment (overrides config files)
+    --gitconfig             Mount ~/.gitconfig read-only into the sandbox (default)
     --no-gitconfig          Do not mount ~/.gitconfig into the sandbox
     --gpg-agent             Forward the host gpg-agent for GPG commit signing (public keys only)
+    --no-gpg-agent          Do not forward the gpg-agent (overrides config files)
+    --no-protect-project-config
+                            Mount .ai-agent-sandbox/ read-write instead of read-only
     --docker-image IMAGE    Socket proxy image (default: ghcr.io/wollomatic/socket-proxy:1)
     --dry-run              Start bash shell instead of agent (for testing)
     --quiet, -q            Suppress informational output (faster startup)
@@ -87,17 +110,26 @@ OPTIONS:
 
 IMPLICIT CONFIGURATION FILES (automatically included if they exist):
     1. User-level (always):
+       - $DEFAULT_CONFIG_FILE
        - $DEFAULT_WHITELIST_FILE
        - $DEFAULT_BLACKLIST_FILE
        - $DEFAULT_ENV_FILE
        - $DEFAULT_ENV_LOCAL_FILE
     2. Project-level (if present):
+       - .ai-agent-sandbox/config.yaml (in working directory)
+       - .ai-agent-sandbox/config.local.yaml (in working directory, personal overrides)
        - .ai-agent-sandbox/whitelist.txt (in working directory)
        - .ai-agent-sandbox/blacklist.txt (in working directory)
        - .ai-agent-sandbox/.env (in working directory)
        - .ai-agent-sandbox/.env.local (in working directory)
+    Precedence: user config < project config < project local config
+                < AI_AGENT_SANDBOX_PROFILE < command-line options
 
 CONFIGURATION FILE FORMAT:
+    Config:    YAML (flat subset). Keys: profile, agent, docker, docker_image, venv,
+                gitconfig, gpg_agent, quiet, protect_project_config (user-level only),
+                whitelist, blacklist, whitelist_files, blacklist_files, env_files,
+                agent_args (lists), env (KEY: VALUE mapping)
     Whitelist: Contains absolute or relative paths/patterns (one per line) that the agent can read
                 Relative paths are resolved relative to working directory
                 Default: read-only bind mount
@@ -107,8 +139,15 @@ CONFIGURATION FILE FORMAT:
     Blacklist: Contains paths relative to working directory that the agent cannot access
     Env:       Contains KEY=VALUE entries to expose inside the sandbox
 
+PROFILES:
+    Profile data is stored under $PROFILES_DIR/<name>/home
+    and mirrors the home directory layout (e.g. .claude/, .claude.json). The agent
+    binary stays shared; only configuration, credentials and memory are per profile.
+
 EXAMPLES:
     $0
+    $0 --profile work
+    $0 --list-profiles
     $0 --agent opencode
     $0 --whitelist /path/to/custom-whitelist.txt
     $0 --whitelist file1.txt --whitelist file2.txt
@@ -126,6 +165,489 @@ EOF
     exit 1
 }
 
+# Helper function for conditional output
+log_info() {
+    if [[ "$QUIET" = false ]]; then
+        echo -e "$@" >&2
+    fi
+}
+
+trim_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s\n' "$value"
+}
+
+# --- Configuration file (config.yaml) support ---------------------------------
+#
+# Config files are parsed BEFORE the command line so that command-line flags
+# override them. Messages from the parser are buffered until --quiet/--verbose
+# are known; fatal errors are reported immediately.
+
+config_warn() {
+    CONFIG_LOG_MESSAGES+=("${YELLOW}⚠${NC} $*")
+}
+
+config_error() {
+    echo -e "${RED}Error: $*${NC}" >&2
+    exit 1
+}
+
+flush_config_log() {
+    local msg
+    for msg in "${CONFIG_LOG_MESSAGES[@]}"; do
+        log_info "$msg"
+    done
+    CONFIG_LOG_MESSAGES=()
+}
+
+is_config_list_key() {
+    case "$1" in
+        whitelist|blacklist|whitelist_files|blacklist_files|env_files|agent_args)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# Strip a trailing comment from an unquoted YAML scalar. A '#' only starts a
+# comment at the beginning of the value or when preceded by whitespace, so
+# values like ghcr.io/image#tag or glob patterns stay intact.
+strip_yaml_comment() {
+    local value="$1"
+    if [[ "$value" == "#"* ]]; then
+        value=""
+    else
+        value="${value%%[[:space:]]#*}"
+    fi
+    trim_whitespace "$value"
+}
+
+# Normalize a raw YAML scalar into the variable named by $2: handles single and
+# double quotes (a trailing comment after the closing quote is dropped) and
+# strips comments from unquoted values. Returns 1 for null (~, null, empty).
+# Must not be called in a subshell: it may buffer warnings.
+parse_yaml_scalar() {
+    local raw="$1"
+    local out_ref="$2"
+    local _pys_value _pys_quote _pys_prefix _pys_idx _pys_rest
+
+    raw=$(trim_whitespace "$raw")
+    if [[ "$raw" == \"* || "$raw" == \'* ]]; then
+        _pys_quote="${raw:0:1}"
+        _pys_prefix="${raw%"$_pys_quote"*}"
+        _pys_idx=${#_pys_prefix}
+        if [[ $_pys_idx -gt 0 ]]; then
+            _pys_value="${raw:1:_pys_idx-1}"
+            _pys_rest=$(trim_whitespace "${raw:_pys_idx+1}")
+            if [[ -n "$_pys_rest" && "$_pys_rest" != "#"* ]]; then
+                config_warn "Ignoring unexpected text after quoted value: $_pys_rest"
+            fi
+            if [[ "$_pys_quote" == '"' ]]; then
+                _pys_value="${_pys_value//\\\"/\"}"
+                _pys_value="${_pys_value//\\\\/\\}"
+            else
+                _pys_value="${_pys_value//\'\'/\'}"
+            fi
+            printf -v "$out_ref" '%s' "$_pys_value"
+            return 0
+        fi
+        config_warn "Unterminated quoted value treated literally: $raw"
+    fi
+
+    _pys_value=$(strip_yaml_comment "$raw")
+    case "$_pys_value" in
+        ""|"~"|null|Null|NULL)
+            printf -v "$out_ref" '%s' ""
+            return 1
+            ;;
+    esac
+    printf -v "$out_ref" '%s' "$_pys_value"
+    return 0
+}
+
+parse_yaml_bool() {
+    local value="$1" key="$2" file="$3"
+    case "${value,,}" in
+        true|yes|on) echo true ;;
+        false|no|off) echo false ;;
+        *) config_error "Invalid boolean for '$key' in $file: '$value' (expected true or false)" ;;
+    esac
+}
+
+# Expand ~ and $HOME and resolve relative paths against the working directory
+# (the same rule that applies to whitelist files)
+expand_config_path() {
+    local path="$1"
+    path="${path/#\~/$HOME}"
+    path="${path//\$HOME/$HOME}"
+    if [[ "$path" != /* ]]; then
+        path="$WORKING_DIR/$path"
+    fi
+    printf '%s\n' "$path"
+}
+
+apply_config_list_item() {
+    local key="$1" item="$2" file="$3"
+    case "$key" in
+        whitelist)
+            WHITELIST_ENTRIES+=("$item")
+            ;;
+        blacklist)
+            BLACKLIST_PATHS+=("$item")
+            ;;
+        whitelist_files)
+            WHITELIST_FILES+=("$(expand_config_path "$item")")
+            EXPLICIT_WHITELIST=true
+            ;;
+        blacklist_files)
+            BLACKLIST_FILES+=("$(expand_config_path "$item")")
+            EXPLICIT_BLACKLIST=true
+            ;;
+        env_files)
+            ENV_FILES+=("$(expand_config_path "$item")")
+            ;;
+        agent_args)
+            CONFIG_AGENT_ARGS+=("$item")
+            ;;
+        *)
+            config_warn "Key '$key' in $file does not accept a list (ignored)"
+            ;;
+    esac
+}
+
+# is_null=true means the key was present without a value (or ~/null)
+apply_config_scalar() {
+    local key="$1" value="$2" file="$3" is_null="$4"
+    local bool
+
+    case "$key" in
+        profile)
+            if [[ "$is_null" = true ]]; then
+                PROFILE=""
+                PROFILE_SOURCE=""
+            else
+                PROFILE="$value"
+                PROFILE_SOURCE="$file"
+            fi
+            ;;
+        agent)
+            [[ "$is_null" = true ]] || AGENT="$value"
+            ;;
+        docker_image)
+            [[ "$is_null" = true ]] || SOCKET_PROXY_IMAGE="$value"
+            ;;
+        docker|venv|gpg_agent|gitconfig|quiet|protect_project_config)
+            [[ "$is_null" = true ]] && return 0
+            bool=$(parse_yaml_bool "$value" "$key" "$file") || exit 1
+            case "$key" in
+                docker) ENABLE_DOCKER="$bool" ;;
+                venv) ENABLE_VENV="$bool" ;;
+                gpg_agent) ENABLE_GPG_AGENT="$bool" ;;
+                gitconfig) MOUNT_GITCONFIG="$bool" ;;
+                quiet) QUIET="$bool" ;;
+                protect_project_config)
+                    # The project itself must not be able to switch off the
+                    # protection of its own sandbox configuration
+                    if [[ "$file" == "$PROJECT_CONFIG_DIR/"* ]]; then
+                        config_warn "Ignoring '$key' in $file (only allowed in $DEFAULT_CONFIG_FILE or on the command line)"
+                    else
+                        PROTECT_PROJECT_CONFIG="$bool"
+                    fi
+                    ;;
+            esac
+            ;;
+        env)
+            config_warn "Ignoring '$key' in $file: expected an indented KEY: VALUE mapping"
+            ;;
+        *)
+            if is_config_list_key "$key"; then
+                # A single scalar is accepted as a one-item list
+                [[ "$is_null" = true ]] || apply_config_list_item "$key" "$value" "$file"
+            else
+                config_warn "Unknown configuration key '$key' in $file (ignored)"
+            fi
+            ;;
+    esac
+}
+
+# env: entries are handed to parse_env_assignment as KEY=<raw value> later so
+# quoting, comments, ~ and $VAR expansion behave exactly like in .env files.
+apply_config_env_item() {
+    local key="$1" raw="$2" file="$3"
+    local quote prefix idx
+
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        config_warn "Skipping invalid environment variable name in $file: $key"
+        return 0
+    fi
+
+    raw=$(trim_whitespace "$raw")
+    # Drop a trailing comment after a closing quote ("value" # comment)
+    if [[ "$raw" == \"* || "$raw" == \'* ]]; then
+        quote="${raw:0:1}"
+        prefix="${raw%"$quote"*}"
+        idx=${#prefix}
+        if [[ $idx -gt 0 ]]; then
+            raw="${raw:0:idx+1}"
+        fi
+    fi
+
+    ENV_VARS+=("$key=$raw")
+}
+
+# Flow sequence: key: [a, b, c]. Items may not contain commas.
+parse_yaml_flow_list() {
+    local key="$1" raw="$2" file="$3"
+    local body item value
+    local -a items=()
+
+    body=$(strip_yaml_comment "$raw")
+    body="${body#\[}"
+    body="${body%\]}"
+    IFS=',' read -r -a items <<< "$body"
+    for item in "${items[@]}"; do
+        if parse_yaml_scalar "$item" value; then
+            apply_config_list_item "$key" "$value" "$file"
+        fi
+    done
+}
+
+# Flow mapping for env: {KEY: value, OTHER: value}. Values may not contain commas.
+parse_yaml_flow_map() {
+    local raw="$1" file="$2" lineno="$3"
+    local body entry
+    local -a entries=()
+
+    body=$(strip_yaml_comment "$raw")
+    body="${body#\{}"
+    body="${body%\}}"
+    IFS=',' read -r -a entries <<< "$body"
+    for entry in "${entries[@]}"; do
+        entry=$(trim_whitespace "$entry")
+        [[ -z "$entry" ]] && continue
+        if [[ "$entry" =~ ^([A-Za-z_][A-Za-z0-9_]*):([[:space:]]+(.*))?$ ]]; then
+            apply_config_env_item "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "$file"
+        else
+            config_warn "$file:$lineno: invalid env entry '$entry' (ignored)"
+        fi
+    done
+}
+
+# Parse one config.yaml file. Supported subset of YAML:
+#   key: value            scalars (quoted or unquoted, true/false booleans)
+#   key:                  followed by indented "- item" lines (block list)
+#   key: [a, b]           flow list (list keys only)
+#   env:                  followed by indented "KEY: value" lines (mapping)
+#   env: {KEY: value}     flow mapping
+#   # comments, ---/... document markers, CRLF line endings, tab indentation
+# Anything else produces a warning and is ignored.
+parse_config_file() {
+    local file="$1"
+    local raw_line line lineno=0
+    local state=none current_key=""
+    local indent key rhs rhs_trimmed item value
+
+    while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+        ((lineno++)) || true
+        line="${raw_line%$'\r'}"
+        if [[ $lineno -eq 1 ]]; then
+            line="${line#$'\xEF\xBB\xBF'}"
+        fi
+
+        [[ -z "${line//[[:space:]]/}" ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" == "---"* || "$line" == "..." ]] && continue
+
+        # Block list item
+        if [[ "$line" =~ ^[[:space:]]*-([[:space:]]+(.*))?$ ]]; then
+            item="${BASH_REMATCH[2]}"
+            if [[ ( "$state" == pending || "$state" == list ) && -n "$current_key" ]]; then
+                if [[ "$state" == pending ]] && ! is_config_list_key "$current_key"; then
+                    config_warn "$file:$lineno: key '$current_key' does not accept a list (ignored)"
+                    state=skip
+                    continue
+                fi
+                state=list
+                if parse_yaml_scalar "$item" value; then
+                    apply_config_list_item "$current_key" "$value" "$file"
+                fi
+            elif [[ "$state" != skip ]]; then
+                config_warn "$file:$lineno: list item outside of a list (ignored)"
+            fi
+            continue
+        fi
+
+        # key: value / key:
+        if [[ "$line" =~ ^([[:space:]]*)([A-Za-z_][A-Za-z0-9_]*):([[:space:]]+(.*))?$ ]]; then
+            indent="${#BASH_REMATCH[1]}"
+            key="${BASH_REMATCH[2]}"
+            rhs="${BASH_REMATCH[4]}"
+
+            if [[ $indent -gt 0 ]]; then
+                if [[ "$state" == pending && "$current_key" == env ]]; then
+                    state=env
+                fi
+                case "$state" in
+                    env)
+                        apply_config_env_item "$key" "$rhs" "$file"
+                        continue
+                        ;;
+                    pending)
+                        config_warn "$file:$lineno: nested mapping under '$current_key' is not supported (ignored)"
+                        state=skip
+                        continue
+                        ;;
+                    skip)
+                        continue
+                        ;;
+                    *)
+                        config_warn "$file:$lineno: unexpected indentation, treating '$key' as a top-level key"
+                        ;;
+                esac
+            fi
+
+            # A previous key without a value and without a block is null
+            if [[ "$state" == pending ]]; then
+                apply_config_scalar "$current_key" "" "$file" true
+            fi
+            state=none
+            current_key=""
+
+            rhs_trimmed=$(trim_whitespace "$rhs")
+            if [[ -z "$rhs_trimmed" || "$rhs_trimmed" == "#"* ]]; then
+                # Header of a block list / mapping, or a null value
+                current_key="$key"
+                state=pending
+                continue
+            fi
+
+            if is_config_list_key "$key" && [[ "$rhs_trimmed" == "["* && "$(strip_yaml_comment "$rhs_trimmed")" == *"]" ]]; then
+                parse_yaml_flow_list "$key" "$rhs_trimmed" "$file"
+            elif [[ "$key" == env && "$rhs_trimmed" == "{"* ]]; then
+                parse_yaml_flow_map "$rhs_trimmed" "$file" "$lineno"
+            elif [[ "$rhs_trimmed" == [\|\>\&\*\{]* ]]; then
+                config_warn "$file:$lineno: unsupported YAML syntax for '$key' (ignored)"
+            elif parse_yaml_scalar "$rhs" value; then
+                apply_config_scalar "$key" "$value" "$file" false
+            else
+                apply_config_scalar "$key" "" "$file" true
+            fi
+            continue
+        fi
+
+        config_warn "$file:$lineno: unsupported syntax (ignored): $(trim_whitespace "$line")"
+    done < "$file"
+
+    if [[ "$state" == pending ]]; then
+        apply_config_scalar "$current_key" "" "$file" true
+    fi
+}
+
+load_config_files() {
+    local file
+    for file in "$DEFAULT_CONFIG_FILE" "$PROJECT_CONFIG_FILE" "$PROJECT_CONFIG_LOCAL_FILE"; do
+        [[ -f "$file" ]] || continue
+        CONFIG_FILES_LOADED+=("$file")
+        parse_config_file "$file"
+    done
+}
+
+# --- Profiles -----------------------------------------------------------------
+#
+# A profile holds the agent's configuration, credentials and memory. Profile
+# data lives in $PROFILES_DIR/<name>/home and mirrors the home directory layout
+# (e.g. .claude/, .claude.json), so any agent's dotfiles map 1:1 into $HOME.
+# The reserved profile "default" uses the host's own home directory.
+
+validate_profile_name() {
+    if [[ ! "$PROFILE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        echo -e "${RED}Error: Invalid profile name '$PROFILE'${NC}" >&2
+        echo "Profile names may contain letters, digits, '.', '_' and '-', and must start with a letter or digit" >&2
+        exit 1
+    fi
+}
+
+resolve_profile_home() {
+    if [[ "$PROFILE" == "default" ]]; then
+        PROFILE_HOME="$HOME"
+    else
+        PROFILE_HOME="$PROFILES_DIR/$PROFILE/home"
+    fi
+}
+
+list_profiles() {
+    local dir name marker
+    echo "default (host configuration)"
+    [[ -d "$PROFILES_DIR" ]] || return 0
+    for dir in "$PROFILES_DIR"/*/; do
+        [[ -d "$dir" ]] || continue
+        name="${dir%/}"
+        name="${name##*/}"
+        marker=""
+        if [[ -f "$dir/home/.claude/.credentials.json" ]]; then
+            marker=" (claude: logged in)"
+        fi
+        echo "$name$marker"
+    done
+}
+
+# Create the profile directory on first use. The store is 0700 because it
+# holds credentials of every profile.
+prepare_profile_home() {
+    [[ "$PROFILE" != "default" ]] || return 0
+    [[ -d "$PROFILES_DIR/$PROFILE" ]] && return 0
+
+    if [[ ! -d "$PROFILES_DIR" ]]; then
+        mkdir -p "$PROFILES_DIR"
+        chmod 700 "$PROFILES_DIR"
+    fi
+    mkdir -p "$PROFILE_HOME"
+    log_info "${YELLOW}Created new profile '$PROFILE' at $PROFILES_DIR/$PROFILE (empty configuration, log in inside the sandbox)${NC}"
+}
+
+# Bind a directory from the profile home into the sandbox at the same relative
+# location under $HOME, creating it on first use.
+bind_profile_dir() {
+    local rel="$1"
+    local src="$PROFILE_HOME/$rel"
+
+    if [[ -d "$src" ]]; then
+        log_info "${GREEN}✓${NC} Mounted ~/$rel (read-write)"
+    else
+        mkdir -p "$src"
+        log_info "${YELLOW}✓${NC} Created and mounted ~/$rel (read-write)"
+    fi
+    BWRAP_ARGS+=(--bind "$src" "$HOME/$rel")
+}
+
+# Bind a file from the profile home into the sandbox, creating it with the
+# given initial content on first use.
+bind_profile_file() {
+    local rel="$1"
+    local initial="${2-}"
+    local src="$PROFILE_HOME/$rel"
+
+    if [[ -f "$src" ]]; then
+        log_info "${GREEN}✓${NC} Mounted ~/$rel (read-write)"
+    else
+        mkdir -p "$(dirname "$src")"
+        printf '%s' "$initial" > "$src"
+        log_info "${YELLOW}✓${NC} Created and mounted ~/$rel (read-write)"
+    fi
+    BWRAP_ARGS+=(--bind "$src" "$HOME/$rel")
+}
+
+load_config_files
+
+# The environment variable beats config files on purpose: a repository must not
+# be able to silently switch the credentials a user chose in their shell.
+if [[ -n "${AI_AGENT_SANDBOX_PROFILE:-}" ]]; then
+    PROFILE="$AI_AGENT_SANDBOX_PROFILE"
+    PROFILE_SOURCE="AI_AGENT_SANDBOX_PROFILE"
+fi
+
 # Parse command line arguments
 AGENT_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -134,6 +656,35 @@ while [[ $# -gt 0 ]]; do
             WHITELIST_FILES+=("$2")
             EXPLICIT_WHITELIST=true
             shift 2
+            ;;
+        --profile|-p)
+            PROFILE="$2"
+            PROFILE_SOURCE="--profile"
+            shift 2
+            ;;
+        --list-profiles)
+            LIST_PROFILES=true
+            shift
+            ;;
+        --no-docker)
+            ENABLE_DOCKER=false
+            shift
+            ;;
+        --no-venv)
+            ENABLE_VENV=false
+            shift
+            ;;
+        --gitconfig)
+            MOUNT_GITCONFIG=true
+            shift
+            ;;
+        --no-gpg-agent)
+            ENABLE_GPG_AGENT=false
+            shift
+            ;;
+        --no-protect-project-config)
+            PROTECT_PROJECT_CONFIG=false
+            shift
             ;;
         --blacklist)
             BLACKLIST_FILES+=("$2")
@@ -214,12 +765,22 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Helper function for conditional output
-log_info() {
-    if [[ "$QUIET" = false ]]; then
-        echo -e "$@" >&2
-    fi
-}
+# Configuration files were parsed before the command line so that flags win;
+# now that --quiet/--verbose are known, report what the parser had to say.
+AGENT_ARGS=("${CONFIG_AGENT_ARGS[@]}" "${AGENT_ARGS[@]}")
+flush_config_log
+
+if [[ "$LIST_PROFILES" = true ]]; then
+    list_profiles
+    exit 0
+fi
+
+if [[ -z "$PROFILE" ]]; then
+    PROFILE="default"
+    PROFILE_SOURCE="default"
+fi
+validate_profile_name
+resolve_profile_home
 
 # Check Docker availability when enabled
 validate_docker() {
@@ -441,7 +1002,10 @@ collect_allowed_mount_paths() {
         fi
     done
 
-    # Add read-write bind mounts from bubblewrap args
+    # Add read-write bind mounts from bubblewrap args. This intentionally uses
+    # the bind SOURCE (host path), not the destination: the Docker daemon
+    # resolves paths on the host, so allowing the destination would let a
+    # non-default profile mount the host's own ~/.claude (default profile).
     local i=0
     while [[ $i -lt ${#BWRAP_ARGS[@]} ]]; do
         if [[ "${BWRAP_ARGS[$i]}" == "--bind" ]]; then
@@ -578,13 +1142,6 @@ strip_inline_comment() {
     # Trim trailing whitespace
     line="${line%"${line##*[![:space:]]}"}"
     echo "$line"
-}
-
-trim_whitespace() {
-    local value="$1"
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
-    printf '%s\n' "$value"
 }
 
 # Expand $VAR / ${VAR} references and tildes in an environment value.
@@ -1005,6 +1562,97 @@ is_path_bound() {
     return 1
 }
 
+# Warn about earlier bind mounts whose destination is at or under <dest>: they
+# become invisible once <dest> is mounted over them (e.g. a whitelisted
+# ~/.claude/skills hidden by the profile's ~/.claude mount)
+warn_shadowed_binds() {
+    local dest="$1"
+    local i=0
+    local existing
+    while [[ $i -lt ${#BWRAP_ARGS[@]} ]]; do
+        if [[ "${BWRAP_ARGS[$i]}" == "--bind" || "${BWRAP_ARGS[$i]}" == "--ro-bind" ]]; then
+            existing="${BWRAP_ARGS[$((i+2))]}"
+            if [[ "$existing" == "$dest" || "$existing" == "$dest/"* ]]; then
+                log_info "${YELLOW}⚠${NC} Mount at $existing is shadowed by the profile mount at $dest"
+            fi
+        fi
+        ((i++)) || true
+    done
+}
+
+# Process one whitelist entry (a line from a whitelist file or a config
+# `whitelist:` item): handles the ! override prefix and the :rw suffix
+process_whitelist_entry() {
+    local line="$1"
+    local override bind_mode
+
+    read -r override line < <(parse_whitelist_override "$line")
+    [[ -z "$line" ]] && return 0
+
+    bind_mode="ro"
+    if [[ "$line" =~ :rw$ ]]; then
+        bind_mode="rw"
+        line="${line%:rw}"
+    fi
+
+    if [[ "$override" = "true" ]]; then
+        whitelist_path "$line" "$bind_mode" "WHITELIST_OVERRIDE_ARGS" "Whitelisted (override)"
+    else
+        whitelist_path "$line" "$bind_mode" "BWRAP_ARGS" "Whitelisted"
+    fi
+}
+
+# Mount .ai-agent-sandbox/ read-only so the agent cannot rewrite the sandbox
+# configuration (profile, whitelist, env) that will apply to the next run.
+# Blacklist mounts are added later and nest on top of this bind.
+protect_project_config_dir() {
+    [[ "$PROTECT_PROJECT_CONFIG" = true ]] || return 0
+    [[ -d "$PROJECT_CONFIG_DIR" ]] || return 0
+    BWRAP_ARGS+=(--ro-bind "$PROJECT_CONFIG_DIR" "$PROJECT_CONFIG_DIR")
+    log_info "${GREEN}✓${NC} Mounted .ai-agent-sandbox/ read-only (sandbox configuration protected)"
+}
+
+# Bind Claude Code configuration and state from the active profile
+mount_claude_config() {
+    prepare_profile_home
+    warn_shadowed_binds "$HOME/.claude"
+    warn_shadowed_binds "$HOME/.claude.json"
+
+    # ~/.claude holds settings, credentials, memory, plugins, history;
+    # ~/.claude.json holds onboarding state, account and per-project trust.
+    # A fresh profile starts with an empty directory and an empty JSON object.
+    bind_profile_dir ".claude"
+    bind_profile_file ".claude.json" "{}"
+    if [[ -f "$PROFILE_HOME/.claude.json.backup" ]]; then
+        BWRAP_ARGS+=(--bind "$PROFILE_HOME/.claude.json.backup" "$HOME/.claude.json.backup")
+    fi
+
+    # A CLAUDE_CONFIG_DIR inherited from the host would bypass the profile mount
+    BWRAP_ARGS+=(--unsetenv CLAUDE_CONFIG_DIR)
+}
+
+# Bind OpenCode configuration and state from the active profile. The
+# installation directory ~/.opencode (contains the binary) stays shared.
+mount_opencode_config() {
+    prepare_profile_home
+
+    if [[ -d "$HOME/.opencode" ]]; then
+        BWRAP_ARGS+=(--bind "$HOME/.opencode" "$HOME/.opencode")
+        log_info "${GREEN}✓${NC} Mounted ~/.opencode (read-write, shared installation)"
+    fi
+
+    bind_profile_file ".opencode.json"
+    # OpenCode follows the XDG Base Directory Specification
+    bind_profile_dir ".config/opencode"
+    bind_profile_dir ".cache/opencode"
+    bind_profile_dir ".local/state/opencode"
+    bind_profile_dir ".local/share/opencode"
+
+    # XDG_* overrides inherited from the host would bypass the profile mounts
+    BWRAP_ARGS+=(--unsetenv XDG_CONFIG_HOME --unsetenv XDG_CACHE_HOME)
+    BWRAP_ARGS+=(--unsetenv XDG_STATE_HOME --unsetenv XDG_DATA_HOME)
+}
+
 prepare_claude_native_install() {
     local managed_launcher="$CLAUDE_SANDBOX_BIN_DIR/claude"
     local host_target="" managed_target=""
@@ -1212,14 +1860,16 @@ BLACKLIST_SEARCH_ROOTS+=("$WORKING_DIR")
 
 # Bind working directory (after tmpfs home, so it's visible)
 BWRAP_ARGS+=(--bind "$WORKING_DIR" "$WORKING_DIR")
+protect_project_config_dir
 
 # Forward gpg-agent before whitelist processing: bwrap does not change the mode
 # of directories that already exist, and gpg requires /run/user/<uid> to be 0700
 mount_gpg_agent
 
 # Process all whitelist files and add to bubblewrap (after tmpfs so HOME paths work)
-if [[ ${#WHITELIST_FILES[@]} -eq 0 ]]; then
-    echo -e "${RED}Error: No whitelist files found${NC}" >&2
+if [[ ${#WHITELIST_FILES[@]} -eq 0 && ${#WHITELIST_ENTRIES[@]} -eq 0 \
+    && ${#WHITELIST_PATHS_RO[@]} -eq 0 && ${#WHITELIST_PATHS_RW[@]} -eq 0 ]]; then
+    echo -e "${RED}Error: No whitelist files or entries found${NC}" >&2
     exit 1
 fi
 
@@ -1239,24 +1889,17 @@ for WHITELIST_FILE in "${WHITELIST_FILES[@]}"; do
         line=$(strip_inline_comment "$line")
         [[ -z "$line" ]] && continue
 
-        read -r override line < <(parse_whitelist_override "$line")
-        [[ -z "$line" ]] && continue
-
-        # Check for read-write suffix (:rw)
-        bind_mode="ro"
-        if [[ "$line" =~ :rw$ ]]; then
-            bind_mode="rw"
-            line="${line%:rw}"  # Strip :rw suffix
-        fi
-
-        # Process the path using the helper function
-        if [[ "$override" = "true" ]]; then
-            whitelist_path "$line" "$bind_mode" "WHITELIST_OVERRIDE_ARGS" "Whitelisted (override)"
-        else
-            whitelist_path "$line" "$bind_mode" "BWRAP_ARGS" "Whitelisted"
-        fi
+        process_whitelist_entry "$line"
     done < "$WHITELIST_FILE"
 done
+
+# Process whitelist entries from config files (same syntax as whitelist files)
+if [[ ${#WHITELIST_ENTRIES[@]} -gt 0 ]]; then
+    log_info "${GREEN}Processing whitelist entries from config files:${NC}"
+    for entry in "${WHITELIST_ENTRIES[@]}"; do
+        process_whitelist_entry "$entry"
+    done
+fi
 
 # Process direct whitelist paths (read-only)
 if [[ ${#WHITELIST_PATHS_RO[@]} -gt 0 ]]; then
@@ -1324,6 +1967,13 @@ if [[ ${#WHITELIST_OVERRIDE_ARGS[@]} -gt 0 ]]; then
     BWRAP_ARGS+=("${WHITELIST_OVERRIDE_ARGS[@]}")
 fi
 
+# Never expose other profiles' credentials, even when a whitelist entry covers
+# the profile store (e.g. ~/.local/share); the active profile is bound separately
+if [[ -d "$PROFILES_DIR" ]] && is_path_bound "$PROFILES_DIR"; then
+    BWRAP_ARGS+=(--tmpfs "$PROFILES_DIR")
+    log_info "${YELLOW}✓${NC} Hidden profile store $PROFILES_DIR (covered by another mount)"
+fi
+
 if [[ "$ENABLE_VENV" = true ]]; then
     log_info "\n${GREEN}Virtual environment:${NC} $VENV_PATH"
     BWRAP_ARGS+=(--ro-bind "$VENV_PATH" "$VENV_PATH")
@@ -1387,82 +2037,9 @@ if [[ "$AGENT" = "claudecode" ]]; then
         fi
     fi
 
-    # Bind ~/.claude directory (main config location)
-    if [[ -d "$HOME/.claude" ]]; then
-        BWRAP_ARGS+=(--bind "$HOME/.claude" "$HOME/.claude")
-        log_info "${GREEN}✓${NC} Mounted ~/.claude (read-write)"
-    fi
-
-    # Bind ~/.claude.json file (state file in home directory)
-    if [[ -f "$HOME/.claude.json" ]]; then
-        BWRAP_ARGS+=(--bind "$HOME/.claude.json" "$HOME/.claude.json")
-        log_info "${GREEN}✓${NC} Mounted ~/.claude.json (read-write)"
-    else
-        # Create empty file if it doesn't exist so Claude Code can write to it
-        touch "$HOME/.claude.json"
-        BWRAP_ARGS+=(--bind "$HOME/.claude.json" "$HOME/.claude.json")
-        log_info "${YELLOW}✓${NC} Created and mounted ~/.claude.json (read-write)"
-    fi
-
-    # Bind ~/.claude.json.backup if it exists
-    if [[ -f "$HOME/.claude.json.backup" ]]; then
-        BWRAP_ARGS+=(--bind "$HOME/.claude.json.backup" "$HOME/.claude.json.backup")
-    fi
+    mount_claude_config
 elif [[ "$AGENT" = "opencode" ]]; then
-    # Bind opencode binary and directory
-    if [[ -d "$HOME/.opencode" ]]; then
-        BWRAP_ARGS+=(--bind "$HOME/.opencode" "$HOME/.opencode")
-        log_info "${GREEN}✓${NC} Mounted ~/.opencode (read-write)"
-    fi
-
-    # Bind ~/.opencode.json file (state file in home directory)
-    if [[ -f "$HOME/.opencode.json" ]]; then
-        BWRAP_ARGS+=(--bind "$HOME/.opencode.json" "$HOME/.opencode.json")
-        log_info "${GREEN}✓${NC} Mounted ~/.opencode.json (read-write)"
-    else
-        # Create empty file if it doesn't exist so opencode can write to it
-        touch "$HOME/.opencode.json"
-        BWRAP_ARGS+=(--bind "$HOME/.opencode.json" "$HOME/.opencode.json")
-        log_info "${YELLOW}✓${NC} Created and mounted ~/.opencode.json (read-write)"
-    fi
-
-    # Bind XDG directories for OpenCode (settings, cache, state, data)
-    # OpenCode follows XDG Base Directory Specification
-    if [[ -d "$HOME/.config/opencode" ]]; then
-        BWRAP_ARGS+=(--bind "$HOME/.config/opencode" "$HOME/.config/opencode")
-        log_info "${GREEN}✓${NC} Mounted ~/.config/opencode (read-write)"
-    else
-        mkdir -p "$HOME/.config/opencode"
-        BWRAP_ARGS+=(--bind "$HOME/.config/opencode" "$HOME/.config/opencode")
-        log_info "${YELLOW}✓${NC} Created and mounted ~/.config/opencode (read-write)"
-    fi
-
-    if [[ -d "$HOME/.cache/opencode" ]]; then
-        BWRAP_ARGS+=(--bind "$HOME/.cache/opencode" "$HOME/.cache/opencode")
-        log_info "${GREEN}✓${NC} Mounted ~/.cache/opencode (read-write)"
-    else
-        mkdir -p "$HOME/.cache/opencode"
-        BWRAP_ARGS+=(--bind "$HOME/.cache/opencode" "$HOME/.cache/opencode")
-        log_info "${YELLOW}✓${NC} Created and mounted ~/.cache/opencode (read-write)"
-    fi
-
-    if [[ -d "$HOME/.local/state/opencode" ]]; then
-        BWRAP_ARGS+=(--bind "$HOME/.local/state/opencode" "$HOME/.local/state/opencode")
-        log_info "${GREEN}✓${NC} Mounted ~/.local/state/opencode (read-write)"
-    else
-        mkdir -p "$HOME/.local/state/opencode"
-        BWRAP_ARGS+=(--bind "$HOME/.local/state/opencode" "$HOME/.local/state/opencode")
-        log_info "${YELLOW}✓${NC} Created and mounted ~/.local/state/opencode (read-write)"
-    fi
-
-    if [[ -d "$HOME/.local/share/opencode" ]]; then
-        BWRAP_ARGS+=(--bind "$HOME/.local/share/opencode" "$HOME/.local/share/opencode")
-        log_info "${GREEN}✓${NC} Mounted ~/.local/share/opencode (read-write)"
-    else
-        mkdir -p "$HOME/.local/share/opencode"
-        BWRAP_ARGS+=(--bind "$HOME/.local/share/opencode" "$HOME/.local/share/opencode")
-        log_info "${YELLOW}✓${NC} Created and mounted ~/.local/share/opencode (read-write)"
-    fi
+    mount_opencode_config
 fi
 
 # Bind ~/.gitconfig read-only so git identity and settings are available
@@ -1555,7 +2132,17 @@ fi
 # Display configuration summary
 log_info "\n${GREEN}=== AI Coding Agent Sandbox Configuration ===${NC}"
 log_info "Agent: ${YELLOW}$AGENT${NC}"
+if [[ "$PROFILE" = "default" ]]; then
+    log_info "Profile: ${YELLOW}default${NC} (host configuration, from $PROFILE_SOURCE)"
+else
+    log_info "Profile: ${YELLOW}$PROFILE${NC} (from $PROFILE_SOURCE) -> $PROFILE_HOME"
+fi
 log_info "Working Directory: ${YELLOW}$WORKING_DIR${NC}"
+if [[ "$PROTECT_PROJECT_CONFIG" = true ]]; then
+    log_info "Project Config Protection: ${YELLOW}enabled${NC} (.ai-agent-sandbox/ is read-only)"
+else
+    log_info "Project Config Protection: ${YELLOW}disabled${NC}"
+fi
 if [[ "$ENABLE_VENV" = true ]]; then
     log_info "Virtual Environment: ${YELLOW}$VENV_PATH${NC}"
 else
@@ -1566,6 +2153,10 @@ if [[ "$ENABLE_GPG_AGENT" = true ]]; then
 else
     log_info "GPG Agent Forwarding: ${YELLOW}disabled${NC}"
 fi
+log_info "Config Files (${#CONFIG_FILES_LOADED[@]}):"
+for cfile in "${CONFIG_FILES_LOADED[@]}"; do
+    log_info "  ${YELLOW}$cfile${NC}"
+done
 log_info "Whitelist Files (${#WHITELIST_FILES[@]}):"
 for wfile in "${WHITELIST_FILES[@]}"; do
     log_info "  ${YELLOW}$wfile${NC}"
