@@ -82,6 +82,10 @@ This is a bash-based sandboxing solution for running AI coding agents in isolate
 - `whitelist.txt`, `blacklist.txt`, `.env`, `.env.local` in `~/.config/ai-agent-sandbox/` (`DEFAULT_*_FILE`, overridable via `AI_AGENT_SANDBOX_WHITELIST`/`_BLACKLIST`/`_ENV`/`_ENV_LOCAL`) and in `.ai-agent-sandbox/` (`PROJECT_*_FILE`)
 - Decided **per level**: a level with `config.yaml` or `config.local.yaml` (`USER_HAS_YAML`/`PROJECT_HAS_YAML`) ignores its legacy files; a level without one still uses them (`WHITELIST_FILES`/`BLACKLIST_FILES`/`ENV_FILES` now only hold these legacy files; listed as "Deprecated Legacy Files" in the summary)
 - `warn_legacy_files` prints a warning listing them in both cases (always, even with `--quiet`): "ignored" or "support will be dropped in a future release"
+- The legacy section (detection, migration, warnings) runs right after `--list-profiles`, before any side effects
+- **Migration** (`migrate_legacy_config`): `legacy_list_lines`/`legacy_env_lines` convert entries (`yaml_list_item` single-quotes entries that are not safe plain scalars; `.env` values are copied verbatim because `env:` values follow `.env` rules), `yaml_merge_block` (awk) merges them into the top-level block of the existing YAML file (or appends one; `[]`/`{}` are converted, other inline forms abort the migration; existing entries/keys win and are reported). Everything is staged in a `mktemp -d` directory and only written when all files merge; sources are renamed to `*.migrated`
+- User-level: interactive starts (`-t 0 && -t 2`) explain (`explain_legacy_migration`) and ask `[y/N]`; on success the script re-executes itself with `ORIGINAL_ARGS` so the new config is parsed before the command line as usual
+- Project-level: never prompted (files are shared via git, all team members need a new sandbox first); `--migrate-project-conf` (`MIGRATE_PROJECT_CONFIG`) migrates and exits, warning if `config.local.yaml` is not git-ignored
 
 **Bubblewrap Namespace Setup (lines 191-205)**:
 - `--unshare-all` creates isolated namespaces (PID, IPC, UTS, cgroup, etc.) but network is shared
@@ -260,7 +264,7 @@ Add the key to `is_config_list_key` (lists) and to `apply_config_list_item`, or 
 When modifying the script:
 1. Test with a fresh `$HOME` (should auto-generate `config.yaml` with whitelist and blacklist and use it in the same run)
 2. Test with `--whitelist-path`/`--blacklist-path` on a fresh `$HOME` (should NOT auto-generate the corresponding section; both given → no file). `--whitelist`, `--blacklist`, `--env-path` and the `*_files` config keys must fail with an error
-3. Test with legacy files only (used, "will be dropped" warning) and legacy files next to a `config.yaml`/`config.local.yaml` at the same level (ignored, "Ignoring" warning); check user and project level independently and that warnings show with `-q`
+3. Test with legacy files only (used, "will be dropped" warning) and legacy files next to a `config.yaml`/`config.local.yaml` at the same level (ignored, "Ignoring" warning); check user and project level independently and that warnings show with `-q`. In a terminal (e.g. `script -qec`), user-level files prompt for migration: `n` keeps them, `y` writes `config.yaml`, renames to `*.migrated` and restarts; no prompt without a TTY. `--migrate-project-conf` merges into an existing project `config.yaml` (block lists, `[]`, duplicate entries/env keys kept from YAML) and exits; an inline `whitelist: [a]` aborts without changes
 4. Test without project-level files (should work normally, no errors)
 5. Test `whitelist:` entries in user and project config files (verify all paths are merged)
 6. Test `blacklist:` entries in user and project config files (verify all patterns are merged)

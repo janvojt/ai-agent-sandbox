@@ -32,6 +32,7 @@ PROFILE_SOURCE=""
 PROFILES_DIR="${AI_AGENT_SANDBOX_PROFILES_DIR:-$HOME/.local/share/ai-agent-sandbox/profiles}"
 PROFILE_HOME=""
 LIST_PROFILES=false
+MIGRATE_PROJECT_CONFIG=false
 PROTECT_PROJECT_CONFIG=true
 # Deprecated whitelist.txt / blacklist.txt / .env files still in use
 WHITELIST_FILES=()
@@ -87,6 +88,8 @@ OPTIONS:
     --profile, -p NAME      Use a named agent profile (separate login, settings, memory);
                             'default' is the host configuration. New profiles start empty.
     --list-profiles         List available profiles and exit
+    --migrate-project-conf  Migrate legacy .ai-agent-sandbox/ files (whitelist.txt,
+                            blacklist.txt, .env, .env.local) into config.yaml and exit
     --env, -e KEY=VALUE     Set environment variable inside sandbox (can be specified multiple times)
     --whitelist-path PATH   Directly whitelist a path (read-only, can be specified multiple times)
     --whitelist-path-rw PATH Directly whitelist a path (read-write, can be specified multiple times)
@@ -123,7 +126,8 @@ DEPRECATED LEGACY FILES:
     above are deprecated and will no longer be supported in a future release.
     They are ignored at a level (user or project) that has a config.yaml or
     config.local.yaml; otherwise they are still used. A warning is printed in
-    both cases. Move their entries into the whitelist, blacklist and env keys.
+    both cases. Starting in a terminal offers to migrate the user-level files;
+    project-level files are migrated with --migrate-project-conf.
 
 CONFIGURATION FILE FORMAT:
     Config:    YAML (flat subset). Keys: profile, agent, docker, docker_image, venv,
@@ -630,7 +634,8 @@ if [[ -n "${AI_AGENT_SANDBOX_PROFILE:-}" ]]; then
     PROFILE_SOURCE="AI_AGENT_SANDBOX_PROFILE"
 fi
 
-# Parse command line arguments
+# Parse command line arguments (kept for the restart after a config migration)
+ORIGINAL_ARGS=("$@")
 AGENT_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -645,6 +650,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --list-profiles)
             LIST_PROFILES=true
+            shift
+            ;;
+        --migrate-project-conf)
+            MIGRATE_PROJECT_CONFIG=true
             shift
             ;;
         --no-docker)
@@ -746,6 +755,381 @@ if [[ "$LIST_PROFILES" = true ]]; then
     list_profiles
     exit 0
 fi
+
+# --- Legacy configuration files (deprecated) -----------------------------------
+#
+# whitelist.txt, blacklist.txt, .env and .env.local predate config.yaml. Each
+# level (user, project) uses them only when it has no config.yaml or
+# config.local.yaml; either way their presence is reported as deprecated.
+# User-level files are offered for migration on an interactive start;
+# project-level files only with --migrate-project-conf, because they are
+# usually shared through git and every team member would need a sandbox
+# version that reads config.yaml first.
+
+# Print a deprecation warning for the given legacy files. Always shown, even
+# with --quiet, so that the migration is not missed.
+warn_legacy_files() {
+    local level="$1"
+    local yaml_file="$2"
+    local ignored="$3"
+    local hint="$4"
+    shift 4
+    [[ $# -gt 0 ]] || return 0
+
+    local file
+    if [[ "$ignored" = true ]]; then
+        echo -e "${RED}Warning: Ignoring deprecated $level configuration files because a config.yaml/config.local.yaml exists:${NC}" >&2
+    else
+        echo -e "${RED}Warning: Using deprecated $level configuration files:${NC}" >&2
+    fi
+    for file in "$@"; do
+        echo -e "${RED}  $file${NC}" >&2
+    done
+    if [[ "$ignored" = false ]]; then
+        echo -e "${RED}  Support for whitelist.txt, blacklist.txt and .env files will be dropped in a future release.${NC}" >&2
+    fi
+    echo -e "${RED}  Move their entries into $yaml_file (keys: whitelist, blacklist, env), $hint.${NC}" >&2
+}
+
+# Format a whitelist/blacklist entry as a YAML list item, single-quoted when
+# it would not survive as a plain scalar
+yaml_list_item() {
+    local item="$1"
+    if [[ "$item" =~ ^[A-Za-z0-9_./\$~] && "$item" != "~" \
+        && "$item" != null && "$item" != Null && "$item" != NULL \
+        && "$item" != *"#"* && "$item" != *": "* && "$item" != *":" \
+        && "$item" != *"'"* && "$item" != *'"'* ]]; then
+        printf -- '- %s\n' "$item"
+    else
+        printf -- "- '%s'\n" "${item//\'/\'\'}"
+    fi
+}
+
+# Print the entries of a legacy whitelist/blacklist file as YAML list items,
+# read the same way the files are read at startup
+legacy_list_lines() {
+    local file="$1" line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # As at startup, everything after # is a comment
+        line=$(trim_whitespace "${line%%#*}")
+        line="${line%$'\r'}"
+        [[ -n "$line" ]] || continue
+        yaml_list_item "$line"
+    done < "$file"
+}
+
+# Print the entries of a legacy .env file as "KEY: value" lines. The value is
+# copied verbatim: env values in config.yaml follow the same quoting and
+# expansion rules as .env files.
+legacy_env_lines() {
+    local file="$1" line key value lineno=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((lineno++)) || true
+        line=$(trim_whitespace "${line%$'\r'}")
+        [[ -z "$line" || "$line" == "#"* ]] && continue
+        if [[ "$line" == export[[:space:]]* ]]; then
+            line=$(trim_whitespace "${line#export}")
+        fi
+        key=$(trim_whitespace "${line%%=*}")
+        if [[ "$line" != *=* || ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo -e "${YELLOW}  $file:$lineno: not a KEY=VALUE entry (skipped)${NC}" >&2
+            continue
+        fi
+        value=$(trim_whitespace "${line#*=}")
+        [[ -n "$value" ]] || value='""'
+        printf '%s: %s\n' "$key" "$value"
+    done < "$file"
+}
+
+# Merge the lines of $lines_file into the top-level block $key of a YAML file
+# and print the result. mode=list merges "- item" lines, mode=map "KEY: value"
+# lines. A missing block is appended; entries already present are skipped and
+# reported on stderr. Exits with 2 when the key uses the inline form.
+yaml_merge_block() {
+    local file="$1" key="$2" mode="$3" lines_file="$4"
+    awk -v key="$key" -v mode="$mode" -v lines_file="$lines_file" '
+        function entry_id(e) {
+            if (mode == "map") {
+                sub(/[ \t]*:.*/, "", e)
+            } else {
+                sub(/^-[ \t]*/, "", e)
+                sub(/[ \t]+#.*$/, "", e)
+            }
+            return e
+        }
+        BEGIN {
+            n = 0
+            while ((getline l < lines_file) > 0) {
+                new[++n] = l
+            }
+            close(lines_file)
+        }
+        { line[NR] = $0 }
+        END {
+            h = 0
+            for (i = 1; i <= NR; i++) {
+                if (line[i] ~ ("^" key ":([ \t].*)?$")) {
+                    h = i
+                    break
+                }
+            }
+            if (h) {
+                rhs = substr(line[h], length(key) + 2)
+                sub(/^[ \t]+/, "", rhs)
+                if (rhs ~ /^#/) {
+                    rhs = ""
+                }
+                sub(/[ \t]+#.*$/, "", rhs)
+                sub(/[ \t]+$/, "", rhs)
+                if (rhs == "[]" || rhs == "{}") {
+                    line[h] = key ":"
+                } else if (rhs != "") {
+                    exit 2
+                }
+            }
+
+            last = h
+            indent = "  "
+            found_indent = 0
+            if (h) {
+                for (i = h + 1; i <= NR; i++) {
+                    if (line[i] ~ /^[ \t]*$/ || line[i] ~ /^[ \t]*#/) {
+                        continue
+                    }
+                    if (line[i] ~ /^[ \t]/ || (mode == "list" && line[i] ~ /^-/)) {
+                        last = i
+                        if (!found_indent) {
+                            match(line[i], /^[ \t]*/)
+                            indent = substr(line[i], 1, RLENGTH)
+                            found_indent = 1
+                        }
+                        e = line[i]
+                        sub(/^[ \t]*/, "", e)
+                        existing[entry_id(e)] = 1
+                        continue
+                    }
+                    break
+                }
+            }
+
+            m = 0
+            for (j = 1; j <= n; j++) {
+                id = entry_id(new[j])
+                if (id in existing) {
+                    print new[j] > "/dev/stderr"
+                    continue
+                }
+                existing[id] = 1
+                add[++m] = new[j]
+            }
+
+            for (i = 1; i <= NR; i++) {
+                print line[i]
+                if (h && i == last) {
+                    for (j = 1; j <= m; j++) {
+                        print indent add[j]
+                    }
+                }
+            }
+            if (!h && m > 0) {
+                if (NR > 0 && line[NR] !~ /^[ \t]*$/) {
+                    print ""
+                }
+                print key ":"
+                for (j = 1; j <= m; j++) {
+                    print indent add[j]
+                }
+            }
+        }
+    ' "$file"
+}
+
+# Merge one legacy file into a staged config file. Records the source in
+# MIGRATED_SOURCES and the staged file in MIGRATED_TARGETS.
+migrate_legacy_file() {
+    local src="$1" key="$2" mode="$3" staged="$4" target="$5" tmp_dir="$6"
+    local rc=0 skipped
+
+    [[ -f "$src" ]] || return 0
+
+    if [[ "$mode" == list ]]; then
+        legacy_list_lines "$src" > "$tmp_dir/lines" || rc=$?
+    else
+        legacy_env_lines "$src" > "$tmp_dir/lines" || rc=$?
+    fi
+    if [[ $rc -ne 0 ]]; then
+        echo -e "${RED}Error: Could not read $src${NC}" >&2
+        return 1
+    fi
+    yaml_merge_block "$staged" "$key" "$mode" "$tmp_dir/lines" \
+        > "$tmp_dir/merged" 2> "$tmp_dir/skipped" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        if [[ $rc -eq 2 ]]; then
+            echo -e "${RED}Error: '$key' in $target uses the inline form ([...] or {...}); change it to a block list and migrate again${NC}" >&2
+        else
+            echo -e "${RED}Error: Could not merge $src into $target${NC}" >&2
+        fi
+        return 1
+    fi
+    mv "$tmp_dir/merged" "$staged"
+
+    echo -e "${GREEN}✓${NC} $src → $target ($key)" >&2
+    while IFS= read -r skipped; do
+        if [[ "$mode" == map ]]; then
+            skipped="${skipped%%:*}"
+        fi
+        echo -e "${YELLOW}  already in $target, kept the existing entry: $skipped${NC}" >&2
+    done < "$tmp_dir/skipped"
+
+    MIGRATED_SOURCES+=("$src")
+    MIGRATED_TARGETS["$staged"]="$target"
+}
+
+# Migrate the legacy files of one level into its config.yaml (whitelist,
+# blacklist, .env) and config.local.yaml (.env.local). Nothing is written
+# unless every file merges; the old files are then renamed to *.migrated.
+migrate_legacy_config() {
+    local config_file="$1" config_local_file="$2"
+    local whitelist_file="$3" blacklist_file="$4" env_file="$5" env_local_file="$6"
+    local tmp_dir staged target src backup ok=true
+
+    MIGRATED_SOURCES=()
+    declare -gA MIGRATED_TARGETS=()
+
+    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/ai-agent-sandbox-migrate.XXXXXX")
+    for staged in "$tmp_dir/config.yaml" "$tmp_dir/config.local.yaml"; do
+        target="$config_file"
+        [[ "$staged" == */config.local.yaml ]] && target="$config_local_file"
+        if [[ -f "$target" ]]; then
+            cp "$target" "$staged"
+        else
+            echo "# AI Agent Sandbox configuration, see config-example.yaml for all keys" > "$staged"
+        fi
+    done
+
+    migrate_legacy_file "$whitelist_file" whitelist list "$tmp_dir/config.yaml" "$config_file" "$tmp_dir" \
+        && migrate_legacy_file "$blacklist_file" blacklist list "$tmp_dir/config.yaml" "$config_file" "$tmp_dir" \
+        && migrate_legacy_file "$env_file" env map "$tmp_dir/config.yaml" "$config_file" "$tmp_dir" \
+        && migrate_legacy_file "$env_local_file" env map "$tmp_dir/config.local.yaml" "$config_local_file" "$tmp_dir" \
+        || ok=false
+
+    if [[ "$ok" = true ]]; then
+        for staged in "${!MIGRATED_TARGETS[@]}"; do
+            target="${MIGRATED_TARGETS[$staged]}"
+            mkdir -p "$(dirname "$target")"
+            # Overwrite in place to keep the permissions of an existing file
+            cat "$staged" > "$target"
+        done
+        for src in "${MIGRATED_SOURCES[@]}"; do
+            backup="$src.migrated"
+            [[ -e "$backup" ]] && backup="$src.migrated.$(date +%Y%m%d%H%M%S)"
+            mv "$src" "$backup"
+            echo -e "${GREEN}✓${NC} Renamed $src → $backup" >&2
+        done
+    else
+        echo -e "${RED}Migration aborted, no files were changed${NC}" >&2
+    fi
+    rm -rf "$tmp_dir"
+    [[ "$ok" = true ]]
+}
+
+# Explain what the migration does, shared by the prompt and --migrate-project-conf
+explain_legacy_migration() {
+    local config_file="$1" config_local_file="$2" has_yaml="$3"
+    shift 3
+
+    local file
+    echo -e "${RED}Deprecated configuration files found:${NC}" >&2
+    for file in "$@"; do
+        echo "  $file" >&2
+    done
+    cat >&2 << EOMIGRATE
+whitelist.txt, blacklist.txt, .env and .env.local are replaced by config.yaml;
+support for them will be dropped in a future release. The migration moves
+  whitelist.txt → 'whitelist:' in $config_file
+  blacklist.txt → 'blacklist:' in $config_file
+  .env          → 'env:'       in $config_file
+  .env.local    → 'env:'       in $config_local_file
+Existing entries are kept, the old files are renamed to *.migrated.
+EOMIGRATE
+    if [[ "$has_yaml" = true ]]; then
+        echo -e "${RED}Note: these files are currently IGNORED because a config.yaml/config.local.yaml exists.${NC}" >&2
+        echo -e "${RED}Migrating them makes their entries active again.${NC}" >&2
+    fi
+}
+
+USER_LEGACY_FILES=()
+for legacy_file in "$DEFAULT_WHITELIST_FILE" "$DEFAULT_BLACKLIST_FILE" \
+    "$DEFAULT_ENV_FILE" "$DEFAULT_ENV_LOCAL_FILE"; do
+    if [[ -f "$legacy_file" ]]; then
+        USER_LEGACY_FILES+=("$legacy_file")
+    fi
+done
+PROJECT_LEGACY_FILES=()
+for legacy_file in "$PROJECT_WHITELIST_FILE" "$PROJECT_BLACKLIST_FILE" \
+    "$PROJECT_ENV_FILE" "$PROJECT_ENV_LOCAL_FILE"; do
+    if [[ -f "$legacy_file" ]]; then
+        PROJECT_LEGACY_FILES+=("$legacy_file")
+    fi
+done
+
+USER_HAS_YAML=false
+if [[ -f "$DEFAULT_CONFIG_FILE" || -f "$DEFAULT_CONFIG_LOCAL_FILE" ]]; then
+    USER_HAS_YAML=true
+fi
+PROJECT_HAS_YAML=false
+if [[ -f "$PROJECT_CONFIG_FILE" || -f "$PROJECT_CONFIG_LOCAL_FILE" ]]; then
+    PROJECT_HAS_YAML=true
+fi
+
+if [[ "$MIGRATE_PROJECT_CONFIG" = true ]]; then
+    if [[ ${#PROJECT_LEGACY_FILES[@]} -eq 0 ]]; then
+        echo "No legacy configuration files found in $PROJECT_CONFIG_DIR, nothing to migrate" >&2
+        exit 0
+    fi
+    explain_legacy_migration "$PROJECT_CONFIG_FILE" "$PROJECT_CONFIG_LOCAL_FILE" \
+        "$PROJECT_HAS_YAML" "${PROJECT_LEGACY_FILES[@]}"
+    echo >&2
+    migrate_legacy_config "$PROJECT_CONFIG_FILE" "$PROJECT_CONFIG_LOCAL_FILE" \
+        "$PROJECT_WHITELIST_FILE" "$PROJECT_BLACKLIST_FILE" \
+        "$PROJECT_ENV_FILE" "$PROJECT_ENV_LOCAL_FILE" || exit 1
+    echo -e "\n${GREEN}Project configuration migrated.${NC} Review the result, delete the *.migrated files and commit." >&2
+    echo "Team members need a sandbox version that supports config.yaml before they pull this change." >&2
+    if [[ -n "${MIGRATED_TARGETS[*]}" && " ${MIGRATED_TARGETS[*]} " == *" $PROJECT_CONFIG_LOCAL_FILE "* ]] \
+        && git -C "$WORKING_DIR" rev-parse --is-inside-work-tree &>/dev/null \
+        && ! git -C "$WORKING_DIR" check-ignore -q "$PROJECT_CONFIG_LOCAL_FILE"; then
+        echo -e "${YELLOW}Warning: $PROJECT_CONFIG_LOCAL_FILE is not ignored by git; add it to .gitignore, it holds the former .env.local entries${NC}" >&2
+    fi
+    exit 0
+fi
+
+# Offer to migrate the user-level files when someone can answer. After a
+# successful migration the script restarts so the new config.yaml is loaded
+# with the usual precedence (config files are parsed before the command line).
+if [[ ${#USER_LEGACY_FILES[@]} -gt 0 && -t 0 && -t 2 ]]; then
+    explain_legacy_migration "$DEFAULT_CONFIG_FILE" "$DEFAULT_CONFIG_LOCAL_FILE" \
+        "$USER_HAS_YAML" "${USER_LEGACY_FILES[@]}"
+    migrate_answer=""
+    read -r -p "Migrate your user-level configuration now? [y/N] " migrate_answer || migrate_answer=""
+    case "$migrate_answer" in
+        y|Y|yes|Yes|YES)
+            if migrate_legacy_config "$DEFAULT_CONFIG_FILE" "$DEFAULT_CONFIG_LOCAL_FILE" \
+                "$DEFAULT_WHITELIST_FILE" "$DEFAULT_BLACKLIST_FILE" \
+                "$DEFAULT_ENV_FILE" "$DEFAULT_ENV_LOCAL_FILE"; then
+                echo -e "${GREEN}User configuration migrated, restarting with $DEFAULT_CONFIG_FILE${NC}\n" >&2
+                exec "$BASH" "$0" "${ORIGINAL_ARGS[@]}"
+            fi
+            ;;
+        *)
+            echo "Not migrating; you will be asked again on the next start." >&2
+            ;;
+    esac
+fi
+
+warn_legacy_files "user-level" "$DEFAULT_CONFIG_FILE" "$USER_HAS_YAML" \
+    "start the sandbox in a terminal to migrate them automatically" "${USER_LEGACY_FILES[@]}"
+warn_legacy_files "project-level" "$PROJECT_CONFIG_FILE" "$PROJECT_HAS_YAML" \
+    "run with --migrate-project-conf to migrate them" "${PROJECT_LEGACY_FILES[@]}"
 
 if [[ -z "$PROFILE" ]]; then
     PROFILE="default"
@@ -1708,65 +2092,6 @@ elif [[ "$AGENT" = "opencode" ]]; then
         exit 1
     fi
 fi
-
-# --- Legacy configuration files (deprecated) -----------------------------------
-#
-# whitelist.txt, blacklist.txt, .env and .env.local predate config.yaml. Each
-# level (user, project) uses them only when it has no config.yaml or
-# config.local.yaml; either way their presence is reported as deprecated.
-
-# Print a deprecation warning for the given legacy files. Always shown, even
-# with --quiet, so that the migration is not missed.
-warn_legacy_files() {
-    local level="$1"
-    local yaml_file="$2"
-    local ignored="$3"
-    shift 3
-    [[ $# -gt 0 ]] || return 0
-
-    local file
-    if [[ "$ignored" = true ]]; then
-        echo -e "${YELLOW}Warning: Ignoring deprecated $level configuration files because a config.yaml/config.local.yaml exists:${NC}" >&2
-    else
-        echo -e "${YELLOW}Warning: Using deprecated $level configuration files:${NC}" >&2
-    fi
-    for file in "$@"; do
-        echo -e "${YELLOW}  $file${NC}" >&2
-    done
-    if [[ "$ignored" = true ]]; then
-        echo -e "${YELLOW}  Move their entries into $yaml_file (keys: whitelist, blacklist, env) and delete them.${NC}" >&2
-    else
-        echo -e "${YELLOW}  Support for whitelist.txt, blacklist.txt and .env files will be dropped in a future release.${NC}" >&2
-        echo -e "${YELLOW}  Move their entries into $yaml_file (keys: whitelist, blacklist, env), see config-example.yaml.${NC}" >&2
-    fi
-}
-
-USER_LEGACY_FILES=()
-for legacy_file in "$DEFAULT_WHITELIST_FILE" "$DEFAULT_BLACKLIST_FILE" \
-    "$DEFAULT_ENV_FILE" "$DEFAULT_ENV_LOCAL_FILE"; do
-    if [[ -f "$legacy_file" ]]; then
-        USER_LEGACY_FILES+=("$legacy_file")
-    fi
-done
-PROJECT_LEGACY_FILES=()
-for legacy_file in "$PROJECT_WHITELIST_FILE" "$PROJECT_BLACKLIST_FILE" \
-    "$PROJECT_ENV_FILE" "$PROJECT_ENV_LOCAL_FILE"; do
-    if [[ -f "$legacy_file" ]]; then
-        PROJECT_LEGACY_FILES+=("$legacy_file")
-    fi
-done
-
-USER_HAS_YAML=false
-if [[ -f "$DEFAULT_CONFIG_FILE" || -f "$DEFAULT_CONFIG_LOCAL_FILE" ]]; then
-    USER_HAS_YAML=true
-fi
-PROJECT_HAS_YAML=false
-if [[ -f "$PROJECT_CONFIG_FILE" || -f "$PROJECT_CONFIG_LOCAL_FILE" ]]; then
-    PROJECT_HAS_YAML=true
-fi
-
-warn_legacy_files "user-level" "$DEFAULT_CONFIG_FILE" "$USER_HAS_YAML" "${USER_LEGACY_FILES[@]}"
-warn_legacy_files "project-level" "$PROJECT_CONFIG_FILE" "$PROJECT_HAS_YAML" "${PROJECT_LEGACY_FILES[@]}"
 
 # Create a default user-level config.yaml on first run: no user-level
 # configuration of either kind exists and the whitelist or blacklist was not

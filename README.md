@@ -203,7 +203,16 @@ Before `config.yaml` existed, the configuration was split into `whitelist.txt`, 
 - The `--whitelist FILE`, `--blacklist FILE` and `--env-path FILE` options and the `whitelist_files`, `blacklist_files` and `env_files` config keys have been **removed**; using them is an error.
 - The environment variables `AI_AGENT_SANDBOX_WHITELIST`, `AI_AGENT_SANDBOX_BLACKLIST`, `AI_AGENT_SANDBOX_ENV` and `AI_AGENT_SANDBOX_ENV_LOCAL` still set the locations of the user-level legacy files.
 
-To migrate, move the lines of `whitelist.txt` into the `whitelist:` list, the lines of `blacklist.txt` into the `blacklist:` list and the `KEY=VALUE` lines of `.env` into the `env:` mapping (`KEY: VALUE`) of the `config.yaml` at the same level, then delete the old files. Put entries of `.env.local` into `config.local.yaml`. Entry syntax is unchanged; quote entries that start with `*`, `!` or contain `: `, e.g. `- "**/.env"`.
+**Automatic migration.** The migration moves `whitelist.txt` into the `whitelist:` list, `blacklist.txt` into the `blacklist:` list and `.env` into the `env:` mapping of the `config.yaml` at the same level, and `.env.local` into the `env:` mapping of `config.local.yaml`. Entries already present in the YAML file are kept; nothing is written unless every file can be merged. The old files are renamed to `*.migrated`; delete them once you have checked the result.
+
+- **User-level files:** when the sandbox starts in a terminal and finds legacy files in `~/.config/ai-agent-sandbox/`, it explains the situation and asks whether to migrate them. After migrating it restarts with the new configuration. If you decline, or the start is not interactive, only the warning is printed and you are asked again next time.
+- **Project-level files** are never migrated automatically: they are usually tracked in git, and every team member needs a sandbox version that reads `config.yaml` before the old files disappear. Migrate them explicitly, then review and commit:
+  ```bash
+  ./ai-agent-sandbox.sh --migrate-project-conf
+  ```
+  If `.env.local` was migrated, make sure `.ai-agent-sandbox/config.local.yaml` is in `.gitignore` (the command warns if it is not).
+
+To migrate by hand, move the entries as described above; entry syntax is unchanged. Quote entries that start with `*` or `!` or contain `: `, e.g. `- "**/.env"`. A `.env` line `KEY=VALUE` becomes `KEY: VALUE`.
 
 ### Configuration file (config.yaml)
 
