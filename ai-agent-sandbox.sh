@@ -33,6 +33,7 @@ PROFILES_DIR="${AI_AGENT_SANDBOX_PROFILES_DIR:-$HOME/.local/share/ai-agent-sandb
 PROFILE_HOME=""
 LIST_PROFILES=false
 PROTECT_PROJECT_CONFIG=true
+# Deprecated whitelist.txt / blacklist.txt / .env files still in use
 WHITELIST_FILES=()
 BLACKLIST_FILES=()
 ENV_FILES=()
@@ -86,9 +87,6 @@ OPTIONS:
     --profile, -p NAME      Use a named agent profile (separate login, settings, memory);
                             'default' is the host configuration. New profiles start empty.
     --list-profiles         List available profiles and exit
-    --whitelist FILE        Add whitelist file (can be specified multiple times)
-    --blacklist FILE        Add blacklist file (can be specified multiple times)
-    --env-path FILE         Add environment file (can be specified multiple times)
     --env, -e KEY=VALUE     Set environment variable inside sandbox (can be specified multiple times)
     --whitelist-path PATH   Directly whitelist a path (read-only, can be specified multiple times)
     --whitelist-path-rw PATH Directly whitelist a path (read-write, can be specified multiple times)
@@ -109,38 +107,36 @@ OPTIONS:
     --verbose, -v          Show detailed output (default)
     -h, --help             Show this help message
 
-IMPLICIT CONFIGURATION FILES (automatically included if they exist):
-    1. User-level (always):
+CONFIGURATION FILES (automatically included if they exist):
+    1. User-level (created with a default whitelist/blacklist on first run):
        - $DEFAULT_CONFIG_FILE
        - $DEFAULT_CONFIG_LOCAL_FILE
-       - $DEFAULT_WHITELIST_FILE
-       - $DEFAULT_BLACKLIST_FILE
-       - $DEFAULT_ENV_FILE
-       - $DEFAULT_ENV_LOCAL_FILE
     2. Project-level (if present):
        - .ai-agent-sandbox/config.yaml (in working directory)
        - .ai-agent-sandbox/config.local.yaml (in working directory, personal overrides)
-       - .ai-agent-sandbox/whitelist.txt (in working directory)
-       - .ai-agent-sandbox/blacklist.txt (in working directory)
-       - .ai-agent-sandbox/.env (in working directory)
-       - .ai-agent-sandbox/.env.local (in working directory)
     Precedence: user config < user local config < project config
                 < project local config < AI_AGENT_SANDBOX_PROFILE
                 < command-line options
 
+DEPRECATED LEGACY FILES:
+    whitelist.txt, blacklist.txt, .env and .env.local next to the config files
+    above are deprecated and will no longer be supported in a future release.
+    They are ignored at a level (user or project) that has a config.yaml or
+    config.local.yaml; otherwise they are still used. A warning is printed in
+    both cases. Move their entries into the whitelist, blacklist and env keys.
+
 CONFIGURATION FILE FORMAT:
     Config:    YAML (flat subset). Keys: profile, agent, docker, docker_image, venv,
                 gitconfig, gpg_agent, quiet, protect_project_config (user-level only),
-                whitelist, blacklist, whitelist_files, blacklist_files, env_files,
-                agent_args (lists), env (KEY: VALUE mapping)
-    Whitelist: Contains absolute or relative paths/patterns (one per line) that the agent can read
+                whitelist, blacklist, agent_args (lists), env (KEY: VALUE mapping)
+    whitelist: Absolute or relative paths/patterns that the agent can read
                 Relative paths are resolved relative to working directory
                 Default: read-only bind mount
                 Suffix with :rw for read-write bind (e.g., /path/to/dir:rw or data/:rw)
                 Supports glob patterns: /etc/java* or src/** will expand to all matching paths
                 Prefix with ! to override blacklist for a specific path (applied after blacklist)
-    Blacklist: Contains paths relative to working directory that the agent cannot access
-    Env:       Contains KEY=VALUE entries to expose inside the sandbox
+    blacklist: Paths/patterns relative to working directory that the agent cannot access
+    env:       KEY: VALUE entries to expose inside the sandbox
 
 PROFILES:
     Profile data is stored under $PROFILES_DIR/<name>/home
@@ -152,9 +148,6 @@ EXAMPLES:
     $0 --profile work
     $0 --list-profiles
     $0 --agent opencode
-    $0 --whitelist /path/to/custom-whitelist.txt
-    $0 --whitelist file1.txt --whitelist file2.txt
-    $0 --env-path /path/to/.env
     $0 --env API_TOKEN=secret
     $0 --whitelist-path /var/run/docker.sock
     $0 --whitelist-path-rw /shared/data
@@ -207,7 +200,7 @@ flush_config_log() {
 
 is_config_list_key() {
     case "$1" in
-        whitelist|blacklist|whitelist_files|blacklist_files|env_files|agent_args)
+        whitelist|blacklist|agent_args)
             return 0
             ;;
     esac
@@ -279,18 +272,6 @@ parse_yaml_bool() {
     esac
 }
 
-# Expand ~ and $HOME and resolve relative paths against the working directory
-# (the same rule that applies to whitelist files)
-expand_config_path() {
-    local path="$1"
-    path="${path/#\~/$HOME}"
-    path="${path//\$HOME/$HOME}"
-    if [[ "$path" != /* ]]; then
-        path="$WORKING_DIR/$path"
-    fi
-    printf '%s\n' "$path"
-}
-
 apply_config_list_item() {
     local key="$1" item="$2" file="$3"
     case "$key" in
@@ -299,17 +280,6 @@ apply_config_list_item() {
             ;;
         blacklist)
             BLACKLIST_PATHS+=("$item")
-            ;;
-        whitelist_files)
-            WHITELIST_FILES+=("$(expand_config_path "$item")")
-            EXPLICIT_WHITELIST=true
-            ;;
-        blacklist_files)
-            BLACKLIST_FILES+=("$(expand_config_path "$item")")
-            EXPLICIT_BLACKLIST=true
-            ;;
-        env_files)
-            ENV_FILES+=("$(expand_config_path "$item")")
             ;;
         agent_args)
             CONFIG_AGENT_ARGS+=("$item")
@@ -511,6 +481,14 @@ parse_config_file() {
                 esac
             fi
 
+            # Removed keys are fatal: silently dropping blacklist_files would
+            # expose files the user meant to hide
+            case "$key" in
+                whitelist_files|blacklist_files|env_files)
+                    config_error "$file:$lineno: '$key' is no longer supported, move the entries of the referenced files into the '${key%_files}' key"
+                    ;;
+            esac
+
             # A previous key without a value and without a block is null
             if [[ "$state" == pending ]]; then
                 apply_config_scalar "$current_key" "" "$file" true
@@ -656,10 +634,9 @@ fi
 AGENT_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --whitelist)
-            WHITELIST_FILES+=("$2")
-            EXPLICIT_WHITELIST=true
-            shift 2
+        --whitelist|--blacklist|--env-path)
+            echo -e "${RED}Error: $1 is no longer supported, put the entries into the whitelist, blacklist or env key of a config.yaml${NC}" >&2
+            exit 1
             ;;
         --profile|-p)
             PROFILE="$2"
@@ -689,15 +666,6 @@ while [[ $# -gt 0 ]]; do
         --no-protect-project-config)
             PROTECT_PROJECT_CONFIG=false
             shift
-            ;;
-        --blacklist)
-            BLACKLIST_FILES+=("$2")
-            EXPLICIT_BLACKLIST=true
-            shift 2
-            ;;
-        --env-path)
-            ENV_FILES+=("$2")
-            shift 2
             ;;
         --env|-e)
             ENV_VARS+=("$2")
@@ -1741,104 +1709,174 @@ elif [[ "$AGENT" = "opencode" ]]; then
     fi
 fi
 
-# Create default whitelist if it doesn't exist and no explicit whitelist was given
-if [[ ! -f "$DEFAULT_WHITELIST_FILE" ]] && [[ "$EXPLICIT_WHITELIST" = false ]]; then
-    echo -e "${YELLOW}Warning: Whitelist file not found at $DEFAULT_WHITELIST_FILE${NC}" >&2
-    echo -e "${YELLOW}Creating default whitelist...${NC}" >&2
-    mkdir -p "$(dirname "$DEFAULT_WHITELIST_FILE")"
-    cat > "$DEFAULT_WHITELIST_FILE" << 'EOWHITELIST'
-# AI Agent Sandbox Whitelist
-# Add absolute paths (one per line) that the agent should be able to read
-# Lines starting with # are ignored
+# --- Legacy configuration files (deprecated) -----------------------------------
+#
+# whitelist.txt, blacklist.txt, .env and .env.local predate config.yaml. Each
+# level (user, project) uses them only when it has no config.yaml or
+# config.local.yaml; either way their presence is reported as deprecated.
 
-# Essential system directories
-/usr/bin
-/usr/lib
-/usr/lib64
-/usr/share
-/lib
-/lib64
-/bin
-/sbin
+# Print a deprecation warning for the given legacy files. Always shown, even
+# with --quiet, so that the migration is not missed.
+warn_legacy_files() {
+    local level="$1"
+    local yaml_file="$2"
+    local ignored="$3"
+    shift 3
+    [[ $# -gt 0 ]] || return 0
 
-# Common development tools locations
-/usr/local/bin
-/usr/local/lib
+    local file
+    if [[ "$ignored" = true ]]; then
+        echo -e "${YELLOW}Warning: Ignoring deprecated $level configuration files because a config.yaml/config.local.yaml exists:${NC}" >&2
+    else
+        echo -e "${YELLOW}Warning: Using deprecated $level configuration files:${NC}" >&2
+    fi
+    for file in "$@"; do
+        echo -e "${YELLOW}  $file${NC}" >&2
+    done
+    if [[ "$ignored" = true ]]; then
+        echo -e "${YELLOW}  Move their entries into $yaml_file (keys: whitelist, blacklist, env) and delete them.${NC}" >&2
+    else
+        echo -e "${YELLOW}  Support for whitelist.txt, blacklist.txt and .env files will be dropped in a future release.${NC}" >&2
+        echo -e "${YELLOW}  Move their entries into $yaml_file (keys: whitelist, blacklist, env), see config-example.yaml.${NC}" >&2
+    fi
+}
 
-# System configuration that's generally safe
-/etc/alternatives
-/etc/ssl/certs
+USER_LEGACY_FILES=()
+for legacy_file in "$DEFAULT_WHITELIST_FILE" "$DEFAULT_BLACKLIST_FILE" \
+    "$DEFAULT_ENV_FILE" "$DEFAULT_ENV_LOCAL_FILE"; do
+    if [[ -f "$legacy_file" ]]; then
+        USER_LEGACY_FILES+=("$legacy_file")
+    fi
+done
+PROJECT_LEGACY_FILES=()
+for legacy_file in "$PROJECT_WHITELIST_FILE" "$PROJECT_BLACKLIST_FILE" \
+    "$PROJECT_ENV_FILE" "$PROJECT_ENV_LOCAL_FILE"; do
+    if [[ -f "$legacy_file" ]]; then
+        PROJECT_LEGACY_FILES+=("$legacy_file")
+    fi
+done
 
+USER_HAS_YAML=false
+if [[ -f "$DEFAULT_CONFIG_FILE" || -f "$DEFAULT_CONFIG_LOCAL_FILE" ]]; then
+    USER_HAS_YAML=true
+fi
+PROJECT_HAS_YAML=false
+if [[ -f "$PROJECT_CONFIG_FILE" || -f "$PROJECT_CONFIG_LOCAL_FILE" ]]; then
+    PROJECT_HAS_YAML=true
+fi
+
+warn_legacy_files "user-level" "$DEFAULT_CONFIG_FILE" "$USER_HAS_YAML" "${USER_LEGACY_FILES[@]}"
+warn_legacy_files "project-level" "$PROJECT_CONFIG_FILE" "$PROJECT_HAS_YAML" "${PROJECT_LEGACY_FILES[@]}"
+
+# Create a default user-level config.yaml on first run: no user-level
+# configuration of either kind exists and the whitelist or blacklist was not
+# given explicitly. Only the sections that were not given explicitly are written.
+if [[ "$USER_HAS_YAML" = false && ${#USER_LEGACY_FILES[@]} -eq 0 ]] \
+    && [[ "$EXPLICIT_WHITELIST" = false || "$EXPLICIT_BLACKLIST" = false ]]; then
+    echo -e "${YELLOW}Warning: No user-level configuration found, creating default $DEFAULT_CONFIG_FILE${NC}" >&2
+    mkdir -p "$(dirname "$DEFAULT_CONFIG_FILE")"
+    {
+        cat << 'EOHEADER'
+# AI Agent Sandbox configuration
+# See config-example.yaml in the ai-agent-sandbox repository for all keys.
+EOHEADER
+        if [[ "$EXPLICIT_WHITELIST" = false ]]; then
+            cat << 'EOWHITELIST'
+
+# Paths the agent can read (absolute or relative to the working directory).
+# Globs and ** patterns are supported, suffix ":rw" for read-write access,
+# prefix "!" to re-allow a path hidden by the blacklist.
+whitelist:
+  # Essential system directories
+  - /usr/bin
+  - /usr/lib
+  - /usr/lib64
+  - /usr/share
+  - /lib
+  - /lib64
+  - /bin
+  - /sbin
+  # Common development tools locations
+  - /usr/local/bin
+  - /usr/local/lib
+  # System configuration that's generally safe
+  - /etc/alternatives
+  - /etc/ssl/certs
 EOWHITELIST
-    echo -e "${GREEN}Created default whitelist at $DEFAULT_WHITELIST_FILE${NC}" >&2
-    echo -e "${YELLOW}Please review and customize it for your needs${NC}" >&2
-fi
+        fi
+        if [[ "$EXPLICIT_BLACKLIST" = false ]]; then
+            cat << 'EOBLACKLIST'
 
-# Create default blacklist if it doesn't exist and no explicit blacklist was given
-if [[ ! -f "$DEFAULT_BLACKLIST_FILE" ]] && [[ "$EXPLICIT_BLACKLIST" = false ]]; then
-    echo -e "${YELLOW}Warning: Blacklist file not found at $DEFAULT_BLACKLIST_FILE${NC}" >&2
-    echo -e "${YELLOW}Creating default blacklist...${NC}" >&2
-    mkdir -p "$(dirname "$DEFAULT_BLACKLIST_FILE")"
-    cat > "$DEFAULT_BLACKLIST_FILE" << 'EOBLACKLIST'
-# AI Agent Sandbox Blacklist
-# Add paths relative to working directory that the agent should NOT access
-# Lines starting with # are ignored
-
-# Common sensitive files
-**/.env
-
-# SSH and crypto keys
-**/.ssh
-**/*.pem
-**/*.key
-**/id_rsa
-**/id_ed25519
-**/*.p12
-**/*.pfx
-
-# AWS credentials
-**/.aws/credentials
-
-# Docker and Kubernetes secrets
-**/docker-compose.override.yml
-**/.kube/config
-
-# Password managers
-**/*.kdbx
-**/*.agilekeychain
-**/.vault_password
-
+# Paths relative to the working directory that the agent cannot access
+blacklist:
+  # Common sensitive files
+  - "**/.env"
+  # SSH and crypto keys
+  - "**/.ssh"
+  - "**/*.pem"
+  - "**/*.key"
+  - "**/id_rsa"
+  - "**/id_ed25519"
+  - "**/*.p12"
+  - "**/*.pfx"
+  # AWS credentials
+  - "**/.aws/credentials"
+  # Docker and Kubernetes secrets
+  - "**/docker-compose.override.yml"
+  - "**/.kube/config"
+  # Password managers
+  - "**/*.kdbx"
+  - "**/*.agilekeychain"
+  - "**/.vault_password"
 EOBLACKLIST
-    echo -e "${GREEN}Created default blacklist at $DEFAULT_BLACKLIST_FILE${NC}" >&2
+        fi
+    } > "$DEFAULT_CONFIG_FILE"
+    echo -e "${GREEN}Created default configuration at $DEFAULT_CONFIG_FILE${NC}" >&2
     echo -e "${YELLOW}Please review and customize it for your needs${NC}" >&2
+
+    # Config files were parsed before the command line; the new file only holds
+    # list entries, which are merged, so parsing it now keeps flags in charge.
+    # Its entries go first, as if it had been loaded with the other user files.
+    saved_whitelist_entries=("${WHITELIST_ENTRIES[@]}")
+    saved_blacklist_paths=("${BLACKLIST_PATHS[@]}")
+    WHITELIST_ENTRIES=()
+    BLACKLIST_PATHS=()
+    parse_config_file "$DEFAULT_CONFIG_FILE"
+    WHITELIST_ENTRIES+=("${saved_whitelist_entries[@]}")
+    BLACKLIST_PATHS+=("${saved_blacklist_paths[@]}")
+    CONFIG_FILES_LOADED=("$DEFAULT_CONFIG_FILE" "${CONFIG_FILES_LOADED[@]}")
+    flush_config_log
+    USER_HAS_YAML=true
 fi
 
-# Always include default files in the arrays (at the beginning)
-if [[ -f "$DEFAULT_WHITELIST_FILE" ]]; then
-    WHITELIST_FILES=("$DEFAULT_WHITELIST_FILE" "${WHITELIST_FILES[@]}")
+# Legacy user-level files go first, legacy project-level files after them
+if [[ "$USER_HAS_YAML" = false ]]; then
+    if [[ -f "$DEFAULT_WHITELIST_FILE" ]]; then
+        WHITELIST_FILES+=("$DEFAULT_WHITELIST_FILE")
+    fi
+    if [[ -f "$DEFAULT_BLACKLIST_FILE" ]]; then
+        BLACKLIST_FILES+=("$DEFAULT_BLACKLIST_FILE")
+    fi
+    if [[ -f "$DEFAULT_ENV_FILE" ]]; then
+        ENV_FILES+=("$DEFAULT_ENV_FILE")
+    fi
+    if [[ -f "$DEFAULT_ENV_LOCAL_FILE" ]]; then
+        ENV_FILES+=("$DEFAULT_ENV_LOCAL_FILE")
+    fi
 fi
-if [[ -f "$DEFAULT_BLACKLIST_FILE" ]]; then
-    BLACKLIST_FILES=("$DEFAULT_BLACKLIST_FILE" "${BLACKLIST_FILES[@]}")
-fi
-if [[ -f "$DEFAULT_ENV_LOCAL_FILE" ]]; then
-    ENV_FILES=("$DEFAULT_ENV_LOCAL_FILE" "${ENV_FILES[@]}")
-fi
-if [[ -f "$DEFAULT_ENV_FILE" ]]; then
-    ENV_FILES=("$DEFAULT_ENV_FILE" "${ENV_FILES[@]}")
-fi
-
-# Include project-level files if they exist (after default, before explicit)
-if [[ -f "$PROJECT_WHITELIST_FILE" ]]; then
-    WHITELIST_FILES+=("$PROJECT_WHITELIST_FILE")
-fi
-if [[ -f "$PROJECT_BLACKLIST_FILE" ]]; then
-    BLACKLIST_FILES+=("$PROJECT_BLACKLIST_FILE")
-fi
-if [[ -f "$PROJECT_ENV_FILE" ]]; then
-    ENV_FILES+=("$PROJECT_ENV_FILE")
-fi
-if [[ -f "$PROJECT_ENV_LOCAL_FILE" ]]; then
-    ENV_FILES+=("$PROJECT_ENV_LOCAL_FILE")
+if [[ "$PROJECT_HAS_YAML" = false ]]; then
+    if [[ -f "$PROJECT_WHITELIST_FILE" ]]; then
+        WHITELIST_FILES+=("$PROJECT_WHITELIST_FILE")
+    fi
+    if [[ -f "$PROJECT_BLACKLIST_FILE" ]]; then
+        BLACKLIST_FILES+=("$PROJECT_BLACKLIST_FILE")
+    fi
+    if [[ -f "$PROJECT_ENV_FILE" ]]; then
+        ENV_FILES+=("$PROJECT_ENV_FILE")
+    fi
+    if [[ -f "$PROJECT_ENV_LOCAL_FILE" ]]; then
+        ENV_FILES+=("$PROJECT_ENV_LOCAL_FILE")
+    fi
 fi
 
 # Build bubblewrap arguments
@@ -1873,7 +1911,7 @@ mount_gpg_agent
 # Process all whitelist files and add to bubblewrap (after tmpfs so HOME paths work)
 if [[ ${#WHITELIST_FILES[@]} -eq 0 && ${#WHITELIST_ENTRIES[@]} -eq 0 \
     && ${#WHITELIST_PATHS_RO[@]} -eq 0 && ${#WHITELIST_PATHS_RW[@]} -eq 0 ]]; then
-    echo -e "${RED}Error: No whitelist files or entries found${NC}" >&2
+    echo -e "${RED}Error: No whitelist entries found${NC}" >&2
     exit 1
 fi
 
@@ -2161,18 +2199,13 @@ log_info "Config Files (${#CONFIG_FILES_LOADED[@]}):"
 for cfile in "${CONFIG_FILES_LOADED[@]}"; do
     log_info "  ${YELLOW}$cfile${NC}"
 done
-log_info "Whitelist Files (${#WHITELIST_FILES[@]}):"
-for wfile in "${WHITELIST_FILES[@]}"; do
-    log_info "  ${YELLOW}$wfile${NC}"
-done
-log_info "Blacklist Files (${#BLACKLIST_FILES[@]}):"
-for bfile in "${BLACKLIST_FILES[@]}"; do
-    log_info "  ${YELLOW}$bfile${NC}"
-done
-log_info "Environment Files (${#ENV_FILES[@]}):"
-for efile in "${ENV_FILES[@]}"; do
-    log_info "  ${YELLOW}$efile${NC}"
-done
+LEGACY_FILES_IN_USE=("${WHITELIST_FILES[@]}" "${BLACKLIST_FILES[@]}" "${ENV_FILES[@]}")
+if [[ ${#LEGACY_FILES_IN_USE[@]} -gt 0 ]]; then
+    log_info "Deprecated Legacy Files (${#LEGACY_FILES_IN_USE[@]}):"
+    for lfile in "${LEGACY_FILES_IN_USE[@]}"; do
+        log_info "  ${YELLOW}$lfile${NC}"
+    done
+fi
 log_info "Direct Environment Variables: ${YELLOW}${#ENV_VARS[@]}${NC}"
 log_info "${GREEN}=============================================${NC}\n"
 

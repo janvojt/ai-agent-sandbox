@@ -7,7 +7,7 @@ A secure bubblewrap-based sandboxing solution for running AI coding agents with 
 - ✅ **Whitelist-based filesystem access** - Only explicitly allowed paths are readable
 - ✅ **Blacklist protection** - Block sensitive files within working directory
 - ✅ **Full network access** - Both local and internet access enabled
-- ✅ **Configurable environment** - Optional `.env` files and direct variables, no SSH agent access
+- ✅ **Configurable environment** - Variables from `config.yaml` or the command line, no SSH agent access
 - ✅ **Virtualenv support** - Optionally expose the active Python virtual environment
 - ✅ **Working directory isolation** - Full read-write only in current directory
 - ✅ **Named profiles** - Separate agent logins, settings and memory per profile (work, client, private)
@@ -33,21 +33,15 @@ chmod +x ai-agent-sandbox.sh
 sudo mv ai-agent-sandbox.sh /usr/local/bin/ai-agent-sandbox
 ```
 
-3. Create configuration directory:
+3. Run it once. On the first run a default `~/.config/ai-agent-sandbox/config.yaml` with a basic whitelist and blacklist is created. Review and customize it:
+```bash
+nano ~/.config/ai-agent-sandbox/config.yaml
+```
+
+   Alternatively, start from the commented example of every key:
 ```bash
 mkdir -p ~/.config/ai-agent-sandbox
-```
-
-4. Copy and customize the whitelist and blacklist files:
-```bash
-cp whitelist-example.txt ~/.config/ai-agent-sandbox/whitelist.txt
-cp blacklist-example.txt ~/.config/ai-agent-sandbox/blacklist.txt
-```
-
-5. Edit the files to match your needs:
-```bash
-nano ~/.config/ai-agent-sandbox/whitelist.txt
-nano ~/.config/ai-agent-sandbox/blacklist.txt
+cp config-example.yaml ~/.config/ai-agent-sandbox/config.yaml
 ```
 
 ## Usage
@@ -58,21 +52,15 @@ nano ~/.config/ai-agent-sandbox/blacklist.txt
 ```
 
 ### Custom whitelist/blacklist:
+Whitelist and blacklist entries live in the `whitelist:` and `blacklist:` lists of the [config files](#configuration-file-configyaml). For a single run, add paths on the command line:
 ```bash
-# Single custom file (default file is still included)
 ./ai-agent-sandbox.sh \
-  --whitelist /path/to/my-whitelist.txt \
-  --blacklist /path/to/my-blacklist.txt
-
-# Multiple whitelist/blacklist files
-./ai-agent-sandbox.sh \
-  --whitelist ~/shared-whitelist.txt \
-  --whitelist ./project-whitelist.txt \
-  --blacklist ~/shared-blacklist.txt \
-  --blacklist ./project-blacklist.txt
+  --whitelist-path /opt/tools \
+  --whitelist-path-rw ~/.m2/repository \
+  --blacklist-path secrets/
 ```
 
-**Note:** The default whitelist and blacklist files (`~/.config/ai-agent-sandbox/{whitelist,blacklist}.txt`) are always included automatically. Additional files specified via `--whitelist` and `--blacklist` are merged with the defaults.
+Entries from the command line are merged with those from the config files.
 
 ### Environment variables:
 ```bash
@@ -81,12 +69,9 @@ nano ~/.config/ai-agent-sandbox/blacklist.txt
 
 # Short form can be repeated
 ./ai-agent-sandbox.sh -e API_TOKEN=secret -e FEATURE_FLAG=true
-
-# Add one or more dotenv files
-./ai-agent-sandbox.sh --env-path /path/to/.env
 ```
 
-Environment files are optional. If present, `~/.config/ai-agent-sandbox/.env`, `~/.config/ai-agent-sandbox/.env.local`, `.ai-agent-sandbox/.env`, and `.ai-agent-sandbox/.env.local` are included automatically (`.env.local` is loaded after `.env` so it can override values), and additional files from `--env-path` are merged with them. Direct `--env/-e` entries are applied last.
+Permanent variables belong in the `env:` mapping of the config files. Direct `--env/-e` entries are applied after them.
 
 ### Python virtual environments:
 ```bash
@@ -184,10 +169,6 @@ When Docker is enabled, the sandbox also mounts Docker CLI plugin directories fr
 ```bash
 export AI_AGENT_SANDBOX_CONFIG=/path/to/config.yaml
 export AI_AGENT_SANDBOX_CONFIG_LOCAL=/path/to/config.local.yaml
-export AI_AGENT_SANDBOX_WHITELIST=/path/to/whitelist.txt
-export AI_AGENT_SANDBOX_BLACKLIST=/path/to/blacklist.txt
-export AI_AGENT_SANDBOX_ENV=/path/to/.env
-export AI_AGENT_SANDBOX_ENV_LOCAL=/path/to/.env.local
 export AI_AGENT_SANDBOX_PROFILE=work
 export AI_AGENT_SANDBOX_PROFILES_DIR=/path/to/profile-store
 ./ai-agent-sandbox.sh
@@ -197,27 +178,32 @@ export AI_AGENT_SANDBOX_PROFILES_DIR=/path/to/profile-store
 
 ### Multiple Configuration Files
 
-The script supports **multiple config, whitelist, blacklist, and environment files**, which are processed in order:
+All configuration lives in YAML config files, which are processed in order:
 
 1. **User-level files** (always included if they exist):
    - `~/.config/ai-agent-sandbox/config.yaml`
-   - `~/.config/ai-agent-sandbox/config.local.yaml` (loaded after `config.yaml`, overrides its values)
-   - `~/.config/ai-agent-sandbox/whitelist.txt`
-   - `~/.config/ai-agent-sandbox/blacklist.txt`
-   - `~/.config/ai-agent-sandbox/.env`
-   - `~/.config/ai-agent-sandbox/.env.local` (loaded after `.env`, overrides its values)
-   - Whitelist and blacklist files are auto-generated if they don't exist and no explicit files are provided; `config.yaml`, `config.local.yaml`, `.env` and `.env.local` are optional and never auto-generated
+   - `~/.config/ai-agent-sandbox/config.local.yaml` (loaded after `config.yaml`, overrides its values, e.g. machine-specific settings)
+   - If neither exists (and there are no [legacy files](#legacy-configuration-files-deprecated)), `config.yaml` is auto-generated with a default whitelist and blacklist
 
 2. **Project-level files** (automatically included if they exist):
-   - `.ai-agent-sandbox/config.yaml` (in working directory)
+   - `.ai-agent-sandbox/config.yaml` (in working directory, commit to version control)
    - `.ai-agent-sandbox/config.local.yaml` (in working directory, personal overrides, add to `.gitignore`)
-   - `.ai-agent-sandbox/whitelist.txt` (in working directory)
-   - `.ai-agent-sandbox/blacklist.txt` (in working directory)
-   - `.ai-agent-sandbox/.env` (in working directory)
-   - `.ai-agent-sandbox/.env.local` (in working directory, loaded after `.env`, overrides its values)
    - **Never auto-generated** - create manually if needed
 
-3. **Additional files** specified via `--whitelist`, `--blacklist`, and `--env-path` flags
+3. **Command-line options**
+
+The locations of the user-level files can be changed with `AI_AGENT_SANDBOX_CONFIG` and `AI_AGENT_SANDBOX_CONFIG_LOCAL`.
+
+### Legacy configuration files (deprecated)
+
+Before `config.yaml` existed, the configuration was split into `whitelist.txt`, `blacklist.txt`, `.env` and `.env.local` in `~/.config/ai-agent-sandbox/` and `.ai-agent-sandbox/`. These files are **deprecated** and support for them will be dropped in a future release:
+
+- At a level (user or project) that has a `config.yaml` or `config.local.yaml`, the legacy files of that level are **ignored** and a warning lists them.
+- At a level without a YAML config file, the legacy files are still used, with a warning that their support will be dropped.
+- The `--whitelist FILE`, `--blacklist FILE` and `--env-path FILE` options and the `whitelist_files`, `blacklist_files` and `env_files` config keys have been **removed**; using them is an error.
+- The environment variables `AI_AGENT_SANDBOX_WHITELIST`, `AI_AGENT_SANDBOX_BLACKLIST`, `AI_AGENT_SANDBOX_ENV` and `AI_AGENT_SANDBOX_ENV_LOCAL` still set the locations of the user-level legacy files.
+
+To migrate, move the lines of `whitelist.txt` into the `whitelist:` list, the lines of `blacklist.txt` into the `blacklist:` list and the `KEY=VALUE` lines of `.env` into the `env:` mapping (`KEY: VALUE`) of the `config.yaml` at the same level, then delete the old files. Put entries of `.env.local` into `config.local.yaml`. Entry syntax is unchanged; quote entries that start with `*`, `!` or contain `: `, e.g. `- "**/.env"`.
 
 ### Configuration file (config.yaml)
 
@@ -248,14 +234,13 @@ See [`config-example.yaml`](config-example.yaml) for a commented example of ever
 | `gitconfig` | bool | `--gitconfig` / `--no-gitconfig` |
 | `gpg_agent` | bool | `--gpg-agent` / `--no-gpg-agent` |
 | `quiet` | bool | `--quiet` / `--verbose` |
-| `whitelist` | list | whitelist entries with the same syntax as whitelist files (relative paths, globs, `**`, `:rw`, `!`) |
+| `whitelist` | list | see [Whitelist Format](#whitelist-format) (relative paths, globs, `**`, `:rw`, `!`) |
 | `blacklist` | list | `--blacklist-path PATTERN` |
-| `whitelist_files`, `blacklist_files`, `env_files` | list | `--whitelist FILE`, `--blacklist FILE`, `--env-path FILE` |
-| `env` | mapping | `--env KEY=VALUE`; values follow the [environment file rules](#environment-file-format) |
+| `env` | mapping | `--env KEY=VALUE`; values follow the [environment file rules](#environment-variables) |
 | `agent_args` | list | arguments always passed to the agent, before anything given after `--` |
 | `protect_project_config` | bool | `--no-protect-project-config`; only honoured in the user-level file |
 
-**Precedence:** `~/.config/ai-agent-sandbox/config.yaml` < `~/.config/ai-agent-sandbox/config.local.yaml` < `.ai-agent-sandbox/config.yaml` < `.ai-agent-sandbox/config.local.yaml` < `AI_AGENT_SANDBOX_PROFILE` < command-line flags. Scalars from a later source override earlier ones; lists are merged. Relative paths are resolved against the working directory, like in whitelist files.
+**Precedence:** `~/.config/ai-agent-sandbox/config.yaml` < `~/.config/ai-agent-sandbox/config.local.yaml` < `.ai-agent-sandbox/config.yaml` < `.ai-agent-sandbox/config.local.yaml` < `AI_AGENT_SANDBOX_PROFILE` < command-line flags. Scalars from a later source override earlier ones; lists are merged. Relative paths are resolved against the working directory.
 
 **Supported YAML subset.** The file is parsed by the script itself, without `yq`, so only a flat subset of YAML is understood:
 - `key: value` scalars; quoted (`"..."` or `'...'`) or unquoted. Booleans accept `true/false`, `yes/no`, `on/off`; anything else is an error.
@@ -267,26 +252,25 @@ See [`config-example.yaml`](config-example.yaml) for a commented example of ever
 **Project config protection.** Because `.ai-agent-sandbox/` lives inside the read-write working directory, an agent could otherwise edit its own sandbox rules (switch to the host profile, whitelist `~/.ssh`, change `ANTHROPIC_BASE_URL`) to take effect on the next run. The directory is therefore mounted read-only inside the sandbox by default. Disable it with `--no-protect-project-config` or `protect_project_config: false` in the user-level config; the setting is deliberately ignored in project files. If the directory does not exist yet, the agent can still create it, so review a new `.ai-agent-sandbox/` before your next run. The resolved profile and its source are printed in the startup summary.
 
 All files are merged together, allowing you to:
-- Maintain a base configuration in user-level files
-- Add project-specific rules in `.ai-agent-sandbox/` directory (can be committed to version control)
-- Override with additional files via command-line flags
+- Maintain a base configuration in the user-level file
+- Add project-specific rules in `.ai-agent-sandbox/config.yaml` (can be committed to version control)
+- Override with command-line flags
 - Share configurations across teams and projects
 
-### Environment File Format
+### Environment Variables
 
-Environment files use dotenv-style `KEY=VALUE` entries:
+The `env:` mapping sets variables inside the sandbox:
 
-```bash
-# Comments and blank lines are ignored
-API_TOKEN=secret
-FEATURE_FLAG=true
-QUOTED_VALUE="value with spaces"
-export TOOL_HOME=/opt/tooling
-
-# Values may reference other variables and use ~ for $HOME
-PATH="~/.local/share/mise/installs/node/25/bin:$PATH"
-BASE=~/apps
-TOOL_BIN="$BASE/bin"
+```yaml
+env:
+  API_TOKEN: secret
+  FEATURE_FLAG: "true"
+  QUOTED_VALUE: "value with spaces"
+  # Values may reference other variables and use ~ for $HOME
+  PATH: "~/.local/share/mise/installs/node/25/bin:$PATH"
+  BASE: ~/apps
+  TOOL_BIN: "$BASE/bin"
+  LITERAL: 'no $expansion here'
 ```
 
 **Important:**
@@ -304,30 +288,29 @@ TOOL_BIN="$BASE/bin"
 
 ### Whitelist Format
 
-The whitelist file contains **absolute paths or glob patterns** (one per line) that the agent can read:
+The `whitelist:` list contains **paths or glob patterns** that the agent can read:
 
-```
-# System binaries (read-only by default)
-/usr/bin
-/usr/lib
-
-# Java tools (for Java developers) - using glob patterns
-/usr/lib/jvm
-/etc/java*
-/etc/maven
-
-# Maven cache with read-write access
-~/.m2/repository:rw
-
-# Custom paths with read-write for specific directory
-/opt/company/shared-cache:rw
-
-# Glob pattern with read-write
-/opt/build-*:rw
+```yaml
+whitelist:
+  # System binaries (read-only by default)
+  - /usr/bin
+  - /usr/lib
+  # Java tools (for Java developers) - using glob patterns
+  - /usr/lib/jvm
+  - /etc/java*
+  - /etc/maven
+  # Maven cache with read-write access
+  - ~/.m2/repository:rw
+  # Custom paths with read-write for specific directory
+  - /opt/company/shared-cache:rw
+  # Glob pattern with read-write
+  - /opt/build-*:rw
+  # Re-allow a blacklisted file
+  - "!secrets/dev.key"
 ```
 
 **Important:**
-- Paths must be absolute (start with `/`)
+- Paths are absolute (start with `/`, `~` or `$HOME`) or relative to the working directory
 - **Read-write access**: Suffix a path with `:rw` to mount it read-write (e.g., `/path/to/dir:rw`)
   - Default: all paths are mounted read-only (safer)
   - Use `:rw` only for paths where the agent needs write access (caches, build outputs, etc.)
@@ -338,28 +321,26 @@ The whitelist file contains **absolute paths or glob patterns** (one per line) t
 - **Pattern support**:
   - Simple glob: `*`, `?`, `[]` (e.g., `/etc/java*` matches `/etc/java-11`, `/etc/java-17`)
   - **Ant-style recursive**: `**` for recursive directory matching (e.g., `/usr/**/lib64` matches any `lib64` directory under `/usr`)
-- Lines starting with `#` are ignored
 - Environment variables like `$HOME` are expanded
-- When using multiple whitelist files, all paths from all files are allowed
+- Entries from all config files are merged
 
 ### Blacklist Format
 
-The blacklist file contains **relative paths** from the working directory that the agent cannot access:
+The `blacklist:` list contains **relative paths** from the working directory that the agent cannot access:
 
-```
-# Environment files
-**/.env
-**/.env.*
-
-# SSH keys
-**/*.pem
-**/*.key
-**/id_rsa
-**/id_ed25519
-
-# Cloud credentials
-**/.aws
-**/.gcp
+```yaml
+blacklist:
+  # Environment files
+  - "**/.env"
+  - "**/.env.*"
+  # SSH keys
+  - "**/*.pem"
+  - "**/*.key"
+  - "**/id_rsa"
+  - "**/id_ed25519"
+  # Cloud credentials
+  - "**/.aws"
+  - "**/.gcp"
 ```
 
 **Important:**
@@ -368,8 +349,7 @@ The blacklist file contains **relative paths** from the working directory that t
   - Simple glob: `*`, `?` (e.g., `*.env` matches `.env.local`, `.env.prod`)
   - **Ant-style recursive**: `**` for recursive matching (e.g., `**/wallet.dat` matches `wallet.dat` anywhere in the working directory tree)
 - Trailing `/` is accepted and normalized (for example, `secret-data/` behaves like `secret-data`)
-- Lines starting with `#` are ignored
-- When using multiple blacklist files, all patterns from all files are blocked
+- Patterns from all config files are merged
 
 ### Symlink behavior
 
@@ -380,19 +360,17 @@ The blacklist file contains **relative paths** from the working directory that t
 - If the resolved blacklist target is outside the working directory (or cannot be resolved), the entry is skipped.
 
 **Examples of ant-style patterns:**
-```
-# Block wallet.dat anywhere in the project
-**/wallet.dat
-
-# Block all .env files recursively
-**/.env
-
-# Block all private key files anywhere
-**/*.pem
-**/*.key
-
-# Block test secrets in any test directory
-**/test/**/secrets.json
+```yaml
+blacklist:
+  # Block wallet.dat anywhere in the project
+  - "**/wallet.dat"
+  # Block all .env files recursively
+  - "**/.env"
+  # Block all private key files anywhere
+  - "**/*.pem"
+  - "**/*.key"
+  # Block test secrets in any test directory
+  - "**/test/**/secrets.json"
 ```
 
 ## Security Considerations
@@ -455,7 +433,7 @@ Install bubblewrap using your package manager (see Requirements section).
 Install the selected agent. Claude Code and OpenCode are currently supported.
 
 ### The agent can't access necessary system libraries
-Add the required paths to your whitelist file. Common additions:
+Add the required paths to the `whitelist:` list in your `config.yaml`. Common additions:
 - `/usr/lib/x86_64-linux-gnu` (Debian/Ubuntu)
 - `/usr/lib64` (RedHat/Fedora)
 - `/opt/custom-tools`
@@ -475,73 +453,64 @@ If you genuinely need the agent to access a file that's blacklisted:
 
 You can maintain layered configurations at different levels:
 
-```bash
-# Layer 1: User-level (~/.config/ai-agent-sandbox/whitelist.txt)
-/usr/bin
-/usr/lib
-/usr/share
-
-# Layer 2: Project-level (.ai-agent-sandbox/whitelist.txt in your project)
-/opt/custom-compiler
-/home/user/project-specific-libs
-
-# Layer 3: Additional files via command line
-ai-agent-sandbox.sh --whitelist ./team-shared-whitelist.txt
+```yaml
+# Layer 1: User-level (~/.config/ai-agent-sandbox/config.yaml)
+whitelist:
+  - /usr/bin
+  - /usr/lib
+  - /usr/share
 ```
 
-**Using project-level files:**
-```bash
-# Create project-level configuration (can be committed to git)
-mkdir -p .ai-agent-sandbox
-cat > .ai-agent-sandbox/whitelist.txt << EOF
-/opt/project-tools
-/usr/lib/project-dependencies
-EOF
-
-cat > .ai-agent-sandbox/blacklist.txt << EOF
-.env.local
-secrets/
-*.key
-EOF
-
-# Now these files are automatically used when running in this directory
-ai-agent-sandbox.sh
+```yaml
+# Layer 2: Project-level (.ai-agent-sandbox/config.yaml in your project, committed to git)
+whitelist:
+  - /opt/project-tools
+  - /usr/lib/project-dependencies
+blacklist:
+  - .env.local
+  - secrets/
+  - "*.key"
 ```
 
-This approach allows you to:
-- Keep common system paths in user-level files
+```yaml
+# Layer 3: Personal overrides (.ai-agent-sandbox/config.local.yaml, in .gitignore)
+profile: customer-x
+env:
+  API_TOKEN: secret
+```
+
+The project files are used automatically when running in that directory. This approach allows you to:
+- Keep common system paths in the user-level file
 - Add project-specific rules in `.ai-agent-sandbox/` (version controlled)
 - Share configurations across team members
-- Override with additional files when needed
+- Override with command-line flags when needed
 
 ### Java developer setup:
-```bash
-# whitelist.txt
-# Java tools
-/etc/java*
-/etc/maven
-~/.m2/repository:rw  # Maven cache (read-write so the agent can download dependencies)
-
-# blacklist.txt
-.env
-application-secrets.yml
-keystore.jks
+```yaml
+whitelist:
+  # Java tools
+  - /etc/java*
+  - /etc/maven
+  - ~/.m2/repository:rw  # Maven cache (read-write so the agent can download dependencies)
+blacklist:
+  - .env
+  - application-secrets.yml
+  - keystore.jks
 ```
 
 ### DevOps/Ansible/Docker setup:
-```bash
-# whitelist.txt
-# DevOps tools
-/var/run/docker.sock
-/usr/libexec/docker
-
-# blacklist.txt
-.env
-*vault*.yml
-ansible-vault.key
-inventory/production
-.ssh
-*.pem
+```yaml
+whitelist:
+  # DevOps tools
+  - /usr/libexec/docker
+docker: true
+blacklist:
+  - .env
+  - "*vault*.yml"
+  - ansible-vault.key
+  - inventory/production
+  - .ssh
+  - "*.pem"
 ```
 
 ## Contributing

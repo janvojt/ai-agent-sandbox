@@ -10,6 +10,10 @@
 #             < AI_AGENT_SANDBOX_PROFILE environment variable < command-line flags
 # Scalars override earlier values; lists are merged.
 #
+# This file replaces the deprecated whitelist.txt, blacklist.txt, .env and
+# .env.local files: they are ignored next to a config.yaml/config.local.yaml
+# and support for them will be dropped in a future release.
+#
 # Only a flat subset of YAML is supported: "key: value" scalars, block lists
 # ("- item" lines), inline lists ("[a, b]", items may not contain commas) and,
 # for "env", one level of "KEY: value" entries. Comments start with "#".
@@ -30,25 +34,115 @@ profile: work
 # gpg_agent: true       # --gpg-agent / --no-gpg-agent
 # quiet: true           # --quiet / --verbose
 
-# Extra whitelist entries, same syntax as whitelist files (absolute or
-# relative paths, globs, ** patterns, ":rw" suffix, "!" blacklist override)
+# Paths the agent can read: absolute paths (start with /, ~ or $HOME) or
+# paths relative to the working directory.
+#   - globs: *, ?, [] (e.g. /etc/java*)
+#   - ant-style ** matches any number of directories (e.g. /usr/**/lib64, src/**)
+#   - ":rw" suffix mounts read-write (default is read-only)
+#   - "!" prefix re-allows a path hidden by the blacklist
+# Quote entries that start with *, ! or contain ": ".
 whitelist:
+  # Essential system directories for executables
+  - /usr/bin
+  - /usr/lib
+  - /usr/lib64
+  - /usr/share
+  - /lib
+  - /lib64
+  - /bin
+  - /sbin
+  # Common development tools
+  - /usr/local/bin
+  - /usr/local/lib
+  - /usr/local/share
+  # Programming language runtimes and tools
+  - /usr/lib/jvm
+  - /usr/lib/node_modules
+  - /opt/maven
+  - /opt/gradle
+  # System configuration (generally safe)
+  - /etc/alternatives
+  - /etc/ssl/certs
+  - /etc/ca-certificates
+  # Python packages (system-wide)
+  - /usr/lib/python3*
+  # Caches the agent may write to
   - ~/.m2/repository:rw
-  - /opt/company-tools
+  # Relative paths (resolved against the working directory)
+  # - data/                # read access to data/
+  # - src/**/*.json        # all .json files under src/
+  # - build/:rw            # read-write access to build/
+  # Re-allow a single file that the blacklist below would hide
   - "!secrets/dev.key"
 
-# Extra blacklist patterns, relative to the working directory
+# Paths hidden from the agent, relative to the working directory. Supports
+# globs (*, ?) and ant-style ** (e.g. "**/wallet.dat" matches anywhere).
 blacklist:
+  # Environment files with secrets
+  - "**/.env"
+  - "**/.env.*"
+  - "**/*.env"
+  - .envrc
+  # Configuration files with secrets
+  - "**/secrets.yaml"
+  - "**/secrets.yml"
+  - "**/secrets.json"
+  - config/secrets.*
+  - application-secrets.*
   - secrets/
+  # SSH and crypto keys
+  - "**/.ssh"
   - "**/*.pem"
+  - "**/*.key"
+  - "**/*_rsa"
+  - "**/*_ed25519"
+  - "**/*.p12"
+  - "**/*.pfx"
+  - "**/*.keystore"
+  # Cloud credentials (AWS, GCP, Azure)
+  - "**/.aws"
+  - "**/.gcp"
+  - .config/gcloud
+  - "**/*-key.json"
+  - "**/service-account*.json"
+  - "**/.azure"
+  # Kubernetes and Docker configs
+  - "**/.kube"
+  - "**/kubeconfig"
+  - "**/kubeconfig.*"
+  - .docker/config.json
+  # Database credentials
+  - config/database.yml
+  - database.ini
+  - .pgpass
+  # Ansible vaults
+  - "**/*vault*.yml"
+  - ansible-vault.*
+  # GPG keys
+  - .gnupg
+  - "**/*.asc"
+  - "**/*.gpg"
+  # Password managers
+  - "**/*.kdbx"
+  - "**/*.agilekeychain"
+  - .password-store
+  # Terraform state (may contain secrets)
+  - "**/terraform.tfstate"
+  - "**/terraform.tfstate.backup"
+  - "**/.terraform"
+  # Git, npm and yarn credentials
+  - .git-credentials
+  - .netrc
+  - .npmrc
+  - .yarnrc
+  # IDE configs that may contain sensitive data
+  - .idea/dataSources.xml
+  - .vscode/settings.json
+  # Crypto wallets
+  - "**/wallet.dat"
 
-# Additional whitelist / blacklist / environment files
-# whitelist_files: [~/shared/whitelist.txt]
-# blacklist_files: [~/shared/blacklist.txt]
-# env_files: [./ci/.env]
-
-# Environment variables inside the sandbox. Values follow .env rules:
-# double quotes expand $VAR and ~, single quotes are literal.
+# Environment variables inside the sandbox. Double quotes and unquoted values
+# expand $VAR and ~, single quotes are literal.
 env:
   NODE_OPTIONS: "--max-old-space-size=4096"
   TOOL_HOME: "~/tools"
