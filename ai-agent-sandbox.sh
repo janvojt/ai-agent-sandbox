@@ -54,6 +54,7 @@ AGENT="claudecode"
 ENABLE_DOCKER=false
 ENABLE_VENV=false
 MOUNT_GITCONFIG=true
+SHARE_SKILLS=true
 ENABLE_GPG_AGENT=false
 GPG_HOST_EXTRA_SOCKET=""
 GPG_SANDBOX_HOME=""
@@ -100,6 +101,8 @@ OPTIONS:
     --no-venv               Do not include the virtual environment (overrides config files)
     --gitconfig             Mount ~/.gitconfig read-only into the sandbox (default)
     --no-gitconfig          Do not mount ~/.gitconfig into the sandbox
+    --shared-skills         Share the host's skills with every profile (default)
+    --no-shared-skills      Profiles only see their own skills
     --gpg-agent             Forward the host gpg-agent for GPG commit signing (public keys only)
     --no-gpg-agent          Do not forward the gpg-agent (overrides config files)
     --no-protect-project-config
@@ -131,7 +134,8 @@ DEPRECATED LEGACY FILES:
 
 CONFIGURATION FILE FORMAT:
     Config:    YAML (flat subset). Keys: profile, agent, docker, docker_image, venv,
-                gitconfig, gpg_agent, quiet, protect_project_config (user-level only),
+                gitconfig, shared_skills, gpg_agent, quiet,
+                protect_project_config (user-level only),
                 whitelist, blacklist, agent_args (lists), env (KEY: VALUE mapping)
     whitelist: Absolute or relative paths/patterns that the agent can read
                 Relative paths are resolved relative to working directory
@@ -146,6 +150,8 @@ PROFILES:
     Profile data is stored under $PROFILES_DIR/<name>/home
     and mirrors the home directory layout (e.g. .claude/, .claude.json). The agent
     binary stays shared; only configuration, credentials and memory are per profile.
+    Skills from the host's ~/.claude/skills are visible in every profile; skills
+    created inside a profile are stored in that profile (--no-shared-skills disables).
 
 EXAMPLES:
     $0
@@ -315,7 +321,7 @@ apply_config_scalar() {
         docker_image)
             [[ "$is_null" = true ]] || SOCKET_PROXY_IMAGE="$value"
             ;;
-        docker|venv|gpg_agent|gitconfig|quiet|protect_project_config)
+        docker|venv|gpg_agent|gitconfig|shared_skills|quiet|protect_project_config)
             [[ "$is_null" = true ]] && return 0
             bool=$(parse_yaml_bool "$value" "$key" "$file") || exit 1
             case "$key" in
@@ -323,6 +329,7 @@ apply_config_scalar() {
                 venv) ENABLE_VENV="$bool" ;;
                 gpg_agent) ENABLE_GPG_AGENT="$bool" ;;
                 gitconfig) MOUNT_GITCONFIG="$bool" ;;
+                shared_skills) SHARE_SKILLS="$bool" ;;
                 quiet) QUIET="$bool" ;;
                 protect_project_config)
                     # The project itself must not be able to switch off the
@@ -625,6 +632,44 @@ bind_profile_file() {
     BWRAP_ARGS+=(--bind "$src" "$HOME/$rel")
 }
 
+# Check whether the installed bubblewrap can mount overlay filesystems
+bwrap_supports_overlay() {
+    "$BWRAP_BIN" --help 2>&1 | grep -q -- '--overlay-src'
+}
+
+# Share a host directory with every profile: mount ~/<rel> as an overlay with
+# the host's directory as the read-only lower layer and the profile's own
+# directory as the writable upper layer. The profile sees the host's entries
+# plus its own; whatever it adds, changes or deletes stays in the profile and
+# the host directory is never modified. Must be called after the profile bind
+# that contains <rel>. The overlay workdir lives next to the profile home (same
+# filesystem as the upper layer) and is not visible inside the sandbox.
+# Usage: overlay_shared_profile_dir <rel> <work-name>
+overlay_shared_profile_dir() {
+    local rel="$1"
+    local work_name="$2"
+    local lower upper work
+
+    [[ "$PROFILE" != "default" ]] || return 0
+    [[ "$SHARE_SKILLS" = true ]] || return 0
+    [[ -d "$HOME/$rel" ]] || return 0
+
+    if ! bwrap_supports_overlay; then
+        log_info "${YELLOW}⚠${NC} Not sharing host ~/$rel with profile '$PROFILE' (bubblewrap lacks overlay support)"
+        return 0
+    fi
+
+    # The host directory may itself be a symlink (e.g. into a dotfiles repository)
+    lower=$(readlink -f "$HOME/$rel")
+    upper="$PROFILE_HOME/$rel"
+    work="$PROFILES_DIR/$PROFILE/overlay-work/$work_name"
+    mkdir -p "$upper" "$work"
+
+    BWRAP_ARGS+=(--overlay-src "$lower")
+    BWRAP_ARGS+=(--overlay "$upper" "$work" "$HOME/$rel")
+    log_info "${GREEN}✓${NC} Mounted ~/$rel (host skills shared, profile skills on top)"
+}
+
 load_config_files
 
 # The environment variable beats config files on purpose: a repository must not
@@ -705,6 +750,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-gitconfig)
             MOUNT_GITCONFIG=false
+            shift
+            ;;
+        --shared-skills)
+            SHARE_SKILLS=true
+            shift
+            ;;
+        --no-shared-skills)
+            SHARE_SKILLS=false
             shift
             ;;
         --gpg-agent)
@@ -1920,7 +1973,7 @@ is_path_bound() {
 
 # Warn about earlier bind mounts whose destination is at or under <dest>: they
 # become invisible once <dest> is mounted over them (e.g. a whitelisted
-# ~/.claude/skills hidden by the profile's ~/.claude mount)
+# ~/.claude/agents hidden by the profile's ~/.claude mount)
 warn_shadowed_binds() {
     local dest="$1"
     local i=0
@@ -1978,6 +2031,7 @@ mount_claude_config() {
     # ~/.claude.json holds onboarding state, account and per-project trust.
     # A fresh profile starts with an empty directory and an empty JSON object.
     bind_profile_dir ".claude"
+    overlay_shared_profile_dir ".claude/skills" "claude-skills"
     bind_profile_file ".claude.json" "{}"
     if [[ -f "$PROFILE_HOME/.claude.json.backup" ]]; then
         BWRAP_ARGS+=(--bind "$PROFILE_HOME/.claude.json.backup" "$HOME/.claude.json.backup")
@@ -2000,6 +2054,7 @@ mount_opencode_config() {
     bind_profile_file ".opencode.json"
     # OpenCode follows the XDG Base Directory Specification
     bind_profile_dir ".config/opencode"
+    overlay_shared_profile_dir ".config/opencode/skills" "opencode-skills"
     bind_profile_dir ".cache/opencode"
     bind_profile_dir ".local/state/opencode"
     bind_profile_dir ".local/share/opencode"
@@ -2362,7 +2417,7 @@ if [[ "$AGENT" = "claudecode" ]]; then
         # stays visible and effectively read-only on the host. Note: concurrent
         # sandboxes share the upper/work dirs, which overlayfs may refuse.
         BWRAP_ARGS+=(--bind "$CLAUDE_NATIVE_DIR" "$CLAUDE_NATIVE_DIR")
-        if [[ -d "$HOME/.local/bin" ]] && "$BWRAP_BIN" --help 2>&1 | grep -q -- '--overlay-src'; then
+        if [[ -d "$HOME/.local/bin" ]] && bwrap_supports_overlay; then
             BWRAP_ARGS+=(--overlay-src "$HOME/.local/bin")
             BWRAP_ARGS+=(--overlay "$CLAUDE_SANDBOX_BIN_DIR" "$CLAUDE_SANDBOX_WORK_DIR" "$HOME/.local/bin")
             log_info "${GREEN}✓${NC} Mounted native Claude versions (read-write) and ~/.local/bin overlay (updates persist)"

@@ -31,6 +31,7 @@ profile: work
 # docker_image: ghcr.io/wollomatic/socket-proxy:1
 # venv: true            # --venv / --no-venv
 # gitconfig: false      # --gitconfig / --no-gitconfig
+# shared_skills: false  # --shared-skills / --no-shared-skills (host skills in every profile)
 # gpg_agent: true       # --gpg-agent / --no-gpg-agent
 # quiet: true           # --quiet / --verbose
 

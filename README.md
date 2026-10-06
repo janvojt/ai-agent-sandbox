@@ -133,7 +133,8 @@ AI_AGENT_SANDBOX_PROFILE=customer-x ./ai-agent-sandbox.sh
 - Profile data lives in `~/.local/share/ai-agent-sandbox/profiles/<name>/home/` (override the store with `AI_AGENT_SANDBOX_PROFILES_DIR`). The directory mirrors your home directory, so `profiles/<name>/home/.claude` is mounted at `~/.claude` inside the sandbox. OpenCode uses the same mechanism for `~/.config/opencode`, `~/.local/share/opencode`, `~/.local/state/opencode`, `~/.cache/opencode` and `~/.opencode.json`.
 - The agent binary and its updates stay shared between profiles; only configuration, credentials and memory are per profile.
 - Profile names may contain letters, digits, `.`, `_` and `-`.
-- To seed a new profile from your host settings without the login, copy what you want by hand, for example `cp -a ~/.claude/settings.json ~/.claude/skills ~/.local/share/ai-agent-sandbox/profiles/<name>/home/.claude/`.
+- Skills are shared: everything in your host `~/.claude/skills` is visible in every profile, and a profile can add its own skills on top. Skills created inside a profile are stored in `profiles/<name>/home/.claude/skills` and are only visible there. A profile skill with the same name as a host skill takes precedence. Editing or deleting a shared skill inside a profile only affects that profile; the host directory is never modified. Changes made on the host are picked up the next time the sandbox starts. OpenCode's `~/.config/opencode/skills` is shared the same way. Use `--no-shared-skills` (or `shared_skills: false`) to give profiles only their own skills.
+- To seed a new profile from your host settings without the login, copy what you want by hand, for example `cp -a ~/.claude/settings.json ~/.local/share/ai-agent-sandbox/profiles/<name>/home/.claude/`. Skills do not need to be copied; a copy made earlier takes precedence over the host version until you delete it from the profile.
 - The profile store is hidden inside the sandbox even when a whitelist entry covers it (for example `~/.local/share`), so one profile can never read another profile's credentials.
 
 Usually you do not pass `--profile` by hand: pin it per project in `.ai-agent-sandbox/config.yaml` (see [Configuration file](#configuration-file-configyaml)).
@@ -241,6 +242,7 @@ See [`config-example.yaml`](config-example.yaml) for a commented example of ever
 | `docker_image` | string | `--docker-image IMAGE` |
 | `venv` | bool | `--venv` / `--no-venv` |
 | `gitconfig` | bool | `--gitconfig` / `--no-gitconfig` |
+| `shared_skills` | bool | `--shared-skills` / `--no-shared-skills` (default: shared) |
 | `gpg_agent` | bool | `--gpg-agent` / `--no-gpg-agent` |
 | `quiet` | bool | `--quiet` / `--verbose` |
 | `whitelist` | list | see [Whitelist Format](#whitelist-format) (relative paths, globs, `**`, `:rw`, `!`) |
