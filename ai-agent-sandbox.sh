@@ -152,6 +152,7 @@ PROFILES:
     binary stays shared; only configuration, credentials and memory are per profile.
     Skills from the host's ~/.claude/skills are visible in every profile; skills
     created inside a profile are stored in that profile (--no-shared-skills disables).
+    OpenCode gets ~/.config/opencode/skills, ~/.claude/skills and ~/.agents/skills.
 
 EXAMPLES:
     $0
@@ -2041,6 +2042,31 @@ mount_claude_config() {
     BWRAP_ARGS+=(--unsetenv CLAUDE_CONFIG_DIR)
 }
 
+# Mount a skills directory that OpenCode reads besides its own (~/.claude/skills,
+# ~/.agents/skills). The default profile gets the host directory when it exists;
+# a named profile gets its own directory, with the host's skills shared
+# underneath (see overlay_shared_profile_dir).
+# Usage: mount_opencode_external_skills <rel> <work-name>
+mount_opencode_external_skills() {
+    local rel="$1"
+    local work_name="$2"
+
+    if [[ "$PROFILE" == "default" ]]; then
+        [[ -d "$HOME/$rel" ]] || return 0
+        if is_path_bound "$HOME/$rel"; then
+            log_info "${GREEN}✓${NC} ~/$rel already visible via existing mount"
+        else
+            BWRAP_ARGS+=(--bind "$HOME/$rel" "$HOME/$rel")
+            log_info "${GREEN}✓${NC} Mounted ~/$rel (read-write)"
+        fi
+        return 0
+    fi
+
+    warn_shadowed_binds "$HOME/$rel"
+    bind_profile_dir "$rel"
+    overlay_shared_profile_dir "$rel" "$work_name"
+}
+
 # Bind OpenCode configuration and state from the active profile. The
 # installation directory ~/.opencode (contains the binary) stays shared.
 mount_opencode_config() {
@@ -2055,6 +2081,9 @@ mount_opencode_config() {
     # OpenCode follows the XDG Base Directory Specification
     bind_profile_dir ".config/opencode"
     overlay_shared_profile_dir ".config/opencode/skills" "opencode-skills"
+    # OpenCode also loads Claude-compatible and agent-neutral skills
+    mount_opencode_external_skills ".claude/skills" "claude-skills"
+    mount_opencode_external_skills ".agents/skills" "agents-skills"
     bind_profile_dir ".cache/opencode"
     bind_profile_dir ".local/state/opencode"
     bind_profile_dir ".local/share/opencode"
