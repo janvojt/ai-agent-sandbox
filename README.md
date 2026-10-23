@@ -150,6 +150,15 @@ Native Claude Code updates are persistent across sandbox runs. The sandbox mount
 ./ai-agent-sandbox.sh -- update
 ```
 
+With `--agent opencode` the arguments go to the `opencode` binary in the same way. The sandbox detects the installed OpenCode major version (`opencode --version` on the host) and adds its own defaults:
+
+- **OpenCode 2** starts every command with `--standalone` and the interactive TUI and `run` with `--auto`. OpenCode 2 normally connects to one shared background server per user, which executes the agent's tools; from inside the sandbox that server would run on the host, so `--standalone` keeps the server inside the sandbox as a private child process. `--auto` replaces the OpenCode 1 permission environment variable. Flags you pass yourself (`--server`, `--standalone`, `--auto`) are left alone, and `--server` prints a warning because the tools then run wherever that server runs.
+- **OpenCode 1** runs with `--agent build` and `OPENCODE_PERMISSION={"*":"allow"}` as before.
+
+```bash
+./ai-agent-sandbox.sh --agent opencode -- run -m deepseek/deepseek-chat "Explain this repository"
+```
+
 ### Docker support (Testcontainers)
 ```bash
 # Enable Docker access via filtered socket proxy (long or short flag)
@@ -394,6 +403,7 @@ blacklist:
 4. ✅ **Home directory access** - Only minimal agent-specific config is exposed
 5. ✅ **Credential separation** - With profiles, a project only sees the login, settings and memory of its own profile; the profile store itself is never visible inside the sandbox
 6. ✅ **Self-modifying sandbox rules** - `.ai-agent-sandbox/` is mounted read-only so the agent cannot change the profile, whitelist or environment it runs with next time
+7. ✅ **OpenCode 2 background server** - OpenCode 2 is started with `--standalone`, so the server that executes its tools runs inside the sandbox instead of the shared per-user service on the host
 
 ### Limitations and Considerations
 
@@ -442,6 +452,9 @@ Install bubblewrap using your package manager (see Requirements section).
 
 ### "agent is not installed"
 Install the selected agent. Claude Code and OpenCode are currently supported.
+
+### OpenCode reports "Unrecognized flag" for an argument
+OpenCode 2 changed its command line: `--agent` and `--model` only exist on `run` and `mini`, `--port` and `--attach` are gone. The `Agent Command:` line in the startup summary shows the exact command the sandbox runs, including the defaults it adds for the detected major version.
 
 ### The agent can't access necessary system libraries
 Add the required paths to the `whitelist:` list in your `config.yaml`. Common additions:

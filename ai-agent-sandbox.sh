@@ -166,7 +166,7 @@ EXAMPLES:
     $0 --venv
     $0 --gpg-agent
     $0 -- --model claude-sonnet-4-5
-    $0 -a opencode -- --model deepseek-chat
+    $0 -a opencode -- run -m deepseek/deepseek-chat "Explain this repository"
 
 EOF
     exit 1
@@ -2088,9 +2088,11 @@ mount_opencode_config() {
     bind_profile_dir ".local/state/opencode"
     bind_profile_dir ".local/share/opencode"
 
-    # XDG_* overrides inherited from the host would bypass the profile mounts
+    # XDG_* and OpenCode path overrides inherited from the host would bypass
+    # the profile mounts
     BWRAP_ARGS+=(--unsetenv XDG_CONFIG_HOME --unsetenv XDG_CACHE_HOME)
     BWRAP_ARGS+=(--unsetenv XDG_STATE_HOME --unsetenv XDG_DATA_HOME)
+    BWRAP_ARGS+=(--unsetenv OPENCODE_CONFIG_DIR --unsetenv OPENCODE_DB)
 }
 
 prepare_claude_native_install() {
@@ -2175,6 +2177,28 @@ elif [[ "$AGENT" = "opencode" ]]; then
         echo "Install it from: https://opencode.dev" >&2
         exit 1
     fi
+fi
+
+# OpenCode 1 and 2 have different command lines (see build_opencode_launch_args),
+# so the major version is read from the installed binary before the sandbox
+# starts. Unknown or unreadable versions are treated as the current major (2).
+OPENCODE_MAJOR_VERSION=""
+detect_opencode_version() {
+    local output=""
+    if command -v timeout >/dev/null 2>&1; then
+        output=$(timeout 15 "$AGENT_BIN" --version 2>/dev/null) || output=""
+    else
+        output=$("$AGENT_BIN" --version 2>/dev/null) || output=""
+    fi
+    if [[ "$output" =~ ([0-9]+)\.[0-9]+ ]]; then
+        OPENCODE_MAJOR_VERSION="${BASH_REMATCH[1]}"
+    else
+        OPENCODE_MAJOR_VERSION=2
+        log_info "${YELLOW}⚠${NC} Could not detect the OpenCode version from '$AGENT_BIN --version', assuming OpenCode 2"
+    fi
+}
+if [[ "$AGENT" = "opencode" ]] && [[ -x "$AGENT_BIN" ]]; then
+    detect_opencode_version
 fi
 
 # Create a default user-level config.yaml on first run: no user-level
@@ -2548,8 +2572,9 @@ if [[ "$AGENT" = "claudecode" ]]; then
     if [[ -n "${CLAUDE_CODE_ENTRYPOINT:-}" ]]; then
         sandbox_setenv CLAUDE_CODE_ENTRYPOINT "$CLAUDE_CODE_ENTRYPOINT"
     fi
-elif [[ "$AGENT" = "opencode" ]]; then
-    # Force YOLO-style permissions inside sandboxed OpenCode runs.
+elif [[ "$AGENT" = "opencode" ]] && [[ -n "$OPENCODE_MAJOR_VERSION" && "$OPENCODE_MAJOR_VERSION" -lt 2 ]]; then
+    # Force YOLO-style permissions inside sandboxed OpenCode 1 runs. OpenCode 2
+    # ignores this variable; it gets --auto instead (build_opencode_launch_args).
     sandbox_setenv OPENCODE_PERMISSION '{"*":"allow"}'
 fi
 
@@ -2580,9 +2605,247 @@ if [[ ${#ENV_VARS[@]} -gt 0 ]]; then
     done
 fi
 
+# --- OpenCode 1 command line ---------------------------------------------------
+
+opencode1_option_takes_value() {
+    case "$1" in
+        --agent|--attach|--command|--dir|--file|--hostname|--log-level|--mdns-domain|--method|--model|--password|--port|--prompt|--session|--title|--username|--variant|-f|-m|-p|-s|-u)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+opencode1_command_accepts_default_agent() {
+    case "$1" in
+        ""|run)
+            return 0
+            ;;
+        acp|agent|attach|auth|completion|db|debug|export|github|import|mcp|models|plugin|plug|pr|providers|serve|session|stats|uninstall|upgrade|web)
+            return 1
+            ;;
+    esac
+
+    # Non-command positionals are treated as the default command's project path.
+    return 0
+}
+
+opencode1_should_add_default_agent() {
+    local arg
+    local consume_next=false
+    local explicit_agent=false
+
+    for arg in "${AGENT_ARGS[@]}"; do
+        if [[ "$consume_next" = true ]]; then
+            consume_next=false
+            continue
+        fi
+
+        case "$arg" in
+            --)
+                break
+                ;;
+            --agent|--agent=*)
+                explicit_agent=true
+                if [[ "$arg" != *=* ]]; then
+                    consume_next=true
+                fi
+                continue
+                ;;
+            --*=*)
+                continue
+                ;;
+            --*)
+                if opencode1_option_takes_value "$arg"; then
+                    consume_next=true
+                fi
+                continue
+                ;;
+            -f|-m|-p|-s|-u)
+                consume_next=true
+                continue
+                ;;
+            -*)
+                continue
+                ;;
+            *)
+                if [[ "$explicit_agent" = true ]]; then
+                    return 1
+                fi
+                opencode1_command_accepts_default_agent "$arg"
+                return
+                ;;
+        esac
+    done
+
+    [[ "$explicit_agent" = false ]]
+}
+
+# --- OpenCode 2 command line ---------------------------------------------------
+#
+# OpenCode 2 connects every command to one shared background server per user,
+# discovered through ~/.local/state/opencode/service.json and reached over the
+# loopback interface. The server owns tool execution, so from inside the sandbox
+# (shared network namespace, state directory bound from the profile) the agent
+# would run its commands outside the sandbox. --standalone makes the client
+# spawn a private server as its own child instead, which keeps everything
+# inside. Permissions are a flag now (--auto) rather than OPENCODE_PERMISSION.
+
+opencode2_option_takes_value() {
+    case "$1" in
+        --server|--session|--prompt|--model|--agent|--format|--file|--title|--replay-limit|--log-level|--completions|-s|-m|-f)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+# Fills AGENT_LAUNCH_ARGS from AGENT_ARGS, inserting --standalone after the
+# (sub)command for every command that accepts it and --auto for the two
+# commands with permission flags (the TUI and run). Flags the user passed
+# themselves are respected.
+build_opencode2_launch_args() {
+    local -a positionals=()
+    local -a positional_index=()
+    local consume_next=false
+    local has_server_flag=false
+    local has_permission_flag=false
+    local explicit_server=false
+    local i arg
+
+    for ((i = 0; i < ${#AGENT_ARGS[@]}; i++)); do
+        arg="${AGENT_ARGS[i]}"
+        if [[ "$consume_next" = true ]]; then
+            consume_next=false
+            continue
+        fi
+
+        case "$arg" in
+            --)
+                break
+                ;;
+            --standalone)
+                has_server_flag=true
+                ;;
+            --server|--server=*)
+                has_server_flag=true
+                explicit_server=true
+                if [[ "$arg" == "--server" ]]; then
+                    consume_next=true
+                fi
+                ;;
+            --auto|--yolo|--dangerously-skip-permissions)
+                has_permission_flag=true
+                ;;
+            --*=*)
+                ;;
+            -*)
+                if opencode2_option_takes_value "$arg"; then
+                    consume_next=true
+                fi
+                ;;
+            *)
+                positionals+=("$arg")
+                positional_index+=("$i")
+                ;;
+        esac
+    done
+
+    local command="${positionals[0]:-}"
+    local subcommand="${positionals[1]:-}"
+    local insert_at=0
+    local add_server=false
+    local add_permission=false
+
+    case "$command" in
+        "")
+            # Interactive TUI
+            add_server=true
+            add_permission=true
+            ;;
+        run)
+            add_server=true
+            add_permission=true
+            insert_at=$((positional_index[0] + 1))
+            ;;
+        api|models|stats|mini|reload)
+            add_server=true
+            insert_at=$((positional_index[0] + 1))
+            ;;
+        session)
+            case "$subcommand" in
+                list|delete|export|import)
+                    add_server=true
+                    insert_at=$((positional_index[1] + 1))
+                    ;;
+            esac
+            ;;
+        auth)
+            case "$subcommand" in
+                list|login|logout|export|import|switch)
+                    add_server=true
+                    insert_at=$((positional_index[1] + 1))
+                    ;;
+            esac
+            ;;
+        upgrade|update|uninstall|acp|debug|mcp|plugin|pair|serve|service)
+            # No --standalone/--auto flags on these commands
+            ;;
+        *)
+            # Any other positional is the TUI's project directory argument
+            add_server=true
+            add_permission=true
+            ;;
+    esac
+
+    if [[ "$has_server_flag" = true ]]; then
+        add_server=false
+    fi
+    if [[ "$has_permission_flag" = true ]]; then
+        add_permission=false
+    fi
+    if [[ "$explicit_server" = true ]]; then
+        log_info "${YELLOW}⚠${NC} --server given: OpenCode will execute tools on that server, outside the sandbox"
+    fi
+
+    AGENT_LAUNCH_ARGS=("${AGENT_ARGS[@]:0:insert_at}")
+    if [[ "$add_server" = true ]]; then
+        AGENT_LAUNCH_ARGS+=(--standalone)
+    fi
+    if [[ "$add_permission" = true ]]; then
+        AGENT_LAUNCH_ARGS+=(--auto)
+    fi
+    AGENT_LAUNCH_ARGS+=("${AGENT_ARGS[@]:insert_at}")
+}
+
+# Build the agent command line (sandbox defaults merged with user args)
+AGENT_LAUNCH_ARGS=()
+if [[ "$AGENT" = "claudecode" ]]; then
+    AGENT_LAUNCH_ARGS=(--dangerously-skip-permissions "${AGENT_ARGS[@]}")
+elif [[ "$AGENT" = "opencode" ]]; then
+    if [[ -n "$OPENCODE_MAJOR_VERSION" && "$OPENCODE_MAJOR_VERSION" -lt 2 ]]; then
+        if opencode1_should_add_default_agent; then
+            AGENT_LAUNCH_ARGS=(--agent build "${AGENT_ARGS[@]}")
+        else
+            AGENT_LAUNCH_ARGS=("${AGENT_ARGS[@]}")
+        fi
+    else
+        build_opencode2_launch_args
+    fi
+fi
+
 # Display configuration summary
 log_info "\n${GREEN}=== AI Coding Agent Sandbox Configuration ===${NC}"
-log_info "Agent: ${YELLOW}$AGENT${NC}"
+if [[ "$AGENT" = "opencode" && -n "$OPENCODE_MAJOR_VERSION" ]]; then
+    log_info "Agent: ${YELLOW}$AGENT${NC} (major version $OPENCODE_MAJOR_VERSION)"
+else
+    log_info "Agent: ${YELLOW}$AGENT${NC}"
+fi
+if [[ "$DRY_RUN" = false ]]; then
+    log_info "Agent Command: ${YELLOW}$(basename "$AGENT_BIN")${AGENT_LAUNCH_ARGS[*]:+ ${AGENT_LAUNCH_ARGS[*]}}${NC}"
+fi
 if [[ "$PROFILE" = "default" ]]; then
     log_info "Profile: ${YELLOW}default${NC} (host configuration, from $PROFILE_SOURCE)"
 else
@@ -2623,96 +2886,13 @@ if [[ "$ENABLE_DOCKER" = true ]]; then
     start_socket_proxy
 fi
 
-opencode_option_takes_value() {
-    case "$1" in
-        --agent|--attach|--command|--dir|--file|--hostname|--log-level|--mdns-domain|--method|--model|--password|--port|--prompt|--session|--title|--username|--variant|-f|-m|-p|-s|-u)
-            return 0
-            ;;
-    esac
-
-    return 1
-}
-
-opencode_command_accepts_default_agent() {
-    case "$1" in
-        ""|run)
-            return 0
-            ;;
-        acp|agent|attach|auth|completion|db|debug|export|github|import|mcp|models|plugin|plug|pr|providers|serve|session|stats|uninstall|upgrade|web)
-            return 1
-            ;;
-    esac
-
-    # Non-command positionals are treated as the default command's project path.
-    return 0
-}
-
-opencode_should_add_default_agent() {
-    local arg
-    local consume_next=false
-    local explicit_agent=false
-
-    for arg in "${AGENT_ARGS[@]}"; do
-        if [[ "$consume_next" = true ]]; then
-            consume_next=false
-            continue
-        fi
-
-        case "$arg" in
-            --)
-                break
-                ;;
-            --agent|--agent=*)
-                explicit_agent=true
-                if [[ "$arg" != *=* ]]; then
-                    consume_next=true
-                fi
-                continue
-                ;;
-            --*=*)
-                continue
-                ;;
-            --*)
-                if opencode_option_takes_value "$arg"; then
-                    consume_next=true
-                fi
-                continue
-                ;;
-            -f|-m|-p|-s|-u)
-                consume_next=true
-                continue
-                ;;
-            -*)
-                continue
-                ;;
-            *)
-                if [[ "$explicit_agent" = true ]]; then
-                    return 1
-                fi
-                opencode_command_accepts_default_agent "$arg"
-                return
-                ;;
-        esac
-    done
-
-    [[ "$explicit_agent" = false ]]
-}
-
-# Build default agent args (prepended before user args)
-DEFAULT_AGENT_ARGS=()
-if [[ "$AGENT" = "claudecode" ]]; then
-    DEFAULT_AGENT_ARGS+=(--dangerously-skip-permissions)
-elif [[ "$AGENT" = "opencode" ]] && opencode_should_add_default_agent; then
-    DEFAULT_AGENT_ARGS+=(--agent build)
-fi
-
 # Execute agent or bash (for dry-run) in sandbox
 sandbox_status=0
 if [[ "$DRY_RUN" = true ]]; then
     log_info "${YELLOW}=== DRY RUN MODE: Starting bash shell in sandbox ===${NC}\n"
     "$BWRAP_BIN" "${BWRAP_ARGS[@]}" -- /bin/bash || sandbox_status=$?
 else
-    "$BWRAP_BIN" "${BWRAP_ARGS[@]}" -- "$AGENT_BIN" "${DEFAULT_AGENT_ARGS[@]}" "${AGENT_ARGS[@]}" || sandbox_status=$?
+    "$BWRAP_BIN" "${BWRAP_ARGS[@]}" -- "$AGENT_BIN" "${AGENT_LAUNCH_ARGS[@]}" || sandbox_status=$?
 fi
 
 exit "$sandbox_status"
