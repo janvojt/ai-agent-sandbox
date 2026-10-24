@@ -1857,7 +1857,9 @@ setup_isolated_network() {
         --tcp-ports auto --udp-ports auto
         --tcp-ns "$host_ports" --udp-ns none
     )
-    pasta_args+=(--userns "/proc/self/fd/$SANDBOX_USERNS_FD" --netns "/proc/$SANDBOX_CHILD_PID/ns/net")
+    # pasta closes every inherited fd before it opens the namespace paths, so the
+    # user namespace fd has to be addressed through this shell's /proc entry
+    pasta_args+=(--userns "/proc/$BASHPID/fd/$SANDBOX_USERNS_FD" --netns "/proc/$SANDBOX_CHILD_PID/ns/net")
     if ! "$PASTA_BIN" "${pasta_args[@]}"; then
         echo -e "${RED}Error: pasta could not set up the sandbox network${NC}" >&2
         return 1
