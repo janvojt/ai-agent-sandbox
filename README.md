@@ -94,7 +94,9 @@ By default, `~/.gitconfig` is mounted read-only into the sandbox (if it exists) 
 
 ### Git worktrees:
 
-A git worktree (`git worktree add ../feature`) or a checkout with a separate git dir has a `.git` *file* that points into the main repository, which usually lies outside the working directory. The sandbox follows that link and mounts the main repository's `.git` directory (and the worktree's own gitdir, when it is elsewhere) read-write at its own path, so `git status`, `git commit` and friends work inside the worktree. Nothing happens for a normal checkout. The mounted directories are listed in the startup summary as `Linked Git Directories`. This exposes exactly what a normal checkout already exposes through its own `.git` (hooks, config), nothing more.
+A git worktree (`git worktree add ../feature`) has a `.git` *file* that points into the main repository, which usually lies outside the working directory. The sandbox follows that link and mounts the main repository's `.git` directory read-write at its own path, so `git status`, `git commit` and friends work inside the worktree. Nothing happens for a normal checkout. The mounted directory is listed in the startup summary as `Linked Git Directories`. This exposes exactly what a normal checkout already exposes through its own `.git` (hooks, config), nothing more.
+
+The `.git` file is writable by the agent, so it is not trusted on its own: the link is followed only when the target is a `<repo>/.git/worktrees/<name>` directory whose `gitdir` back-link (written by git) points at this working tree's `.git` file and whose `commondir` matches. An agent that rewrites `.git` or `commondir` to name some other directory gets a warning on the next start, not a mount. Checkouts with a separate git dir (`--separate-git-dir`) and submodules have no such back-link and are not followed; add their git dir with `--whitelist-path-rw` or the `whitelist:` key of your user config instead. If a worktree was moved, `git worktree repair` fixes the back-link.
 
 ### GPG commit signing:
 

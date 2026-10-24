@@ -2077,6 +2077,7 @@ protect_project_config_dir() {
 # and refs. Bind those directories read-write at their own paths, otherwise
 # every git command inside the sandbox fails. This exposes nothing a normal
 # checkout does not already expose through its own .git (hooks, config).
+# Only verified worktree layouts are followed, see mount_git_linked_dirs.
 GIT_LINKED_DIRS=()
 
 # Usage: resolve_git_link_path <base-dir> <path>; relative paths resolve against base-dir
@@ -2094,7 +2095,14 @@ path_is_within() {
 mount_git_linked_dirs() {
     local git_file="$WORKING_DIR/.git"
     [[ -f "$git_file" ]] || return 0
-    local line gitdir common_dir dir
+    # The .git file is writable by the agent, so nothing read from it (or from a
+    # directory it names) may decide what gets mounted on its own. The link is
+    # followed only when the target has the layout git writes for a worktree of
+    # THIS working tree: <common>/worktrees/<name> whose gitdir back-link points
+    # at $WORKING_DIR/.git. An agent cannot forge that back-link in a directory
+    # it has no access to. The common dir is derived from the path, never from
+    # the editable commondir file.
+    local line gitdir common_dir back_link
     IFS= read -r line < "$git_file" || true
     if [[ "$line" != gitdir:* ]]; then
         log_info "${YELLOW}Warning: $git_file is not a gitdir link; git may not work inside the sandbox${NC}"
@@ -2102,30 +2110,45 @@ mount_git_linked_dirs() {
     fi
     gitdir=$(resolve_git_link_path "$WORKING_DIR" "$(trim_whitespace "${line#gitdir:}")")
     if [[ ! -d "$gitdir" ]]; then
-        log_info "${YELLOW}Warning: gitdir $gitdir referenced by $git_file does not exist (skipping)${NC}"
+        log_info "${YELLOW}Warning: gitdir $gitdir referenced by $git_file does not exist; not following the .git link${NC}"
         return 0
     fi
-    common_dir="$gitdir"
-    if [[ -f "$gitdir/commondir" ]]; then
-        IFS= read -r line < "$gitdir/commondir" || true
-        common_dir=$(resolve_git_link_path "$gitdir" "$(trim_whitespace "$line")")
-        if [[ ! -d "$common_dir" ]]; then
-            log_info "${YELLOW}Warning: git common dir $common_dir referenced by $gitdir/commondir does not exist (skipping)${NC}"
-            return 0
-        fi
+    if [[ "$(basename "$(dirname "$gitdir")")" != worktrees ]]; then
+        log_info "${YELLOW}Warning: $gitdir is not a git worktree directory (<repo>/.git/worktrees/<name>); not following the .git link.${NC}"
+        log_info "${YELLOW}         Separate git dirs and submodules are not followed automatically; add the git dir with --whitelist-path-rw or the whitelist: key of your user config instead${NC}"
+        return 0
     fi
-    # A working directory inside its own repository's .git is left alone.
+    common_dir=$(dirname "$(dirname "$gitdir")")
+    if [[ ! -f "$gitdir/gitdir" ]]; then
+        log_info "${YELLOW}Warning: $gitdir/gitdir is missing; not following the .git link (run 'git worktree repair')${NC}"
+        return 0
+    fi
+    IFS= read -r line < "$gitdir/gitdir" || true
+    back_link=$(resolve_git_link_path "$gitdir" "$(trim_whitespace "$line")")
+    if [[ "$back_link" != "$(realpath -m -- "$git_file")" ]]; then
+        log_info "${YELLOW}Warning: $gitdir belongs to the worktree $back_link, not to $git_file; not following the .git link (run 'git worktree repair' if the worktree was moved)${NC}"
+        return 0
+    fi
+    if [[ ! -f "$gitdir/commondir" ]]; then
+        log_info "${YELLOW}Warning: $gitdir/commondir is missing; not following the .git link${NC}"
+        return 0
+    fi
+    IFS= read -r line < "$gitdir/commondir" || true
+    if [[ "$(resolve_git_link_path "$gitdir" "$(trim_whitespace "$line")")" != "$common_dir" ]]; then
+        log_info "${YELLOW}Warning: $gitdir/commondir does not point at $common_dir; not following the .git link${NC}"
+        return 0
+    fi
+    if [[ ! -f "$common_dir/HEAD" || ! -d "$common_dir/objects" ]]; then
+        log_info "${YELLOW}Warning: $common_dir is not a git directory; not following the .git link${NC}"
+        return 0
+    fi
+    # A working directory inside its own repository's .git is left alone, and a
+    # common dir inside the working directory is already mounted.
     path_is_within "$WORKING_DIR" "$common_dir" && return 0
-    local -a dirs=("$common_dir")
-    # A worktree gitdir normally lives in <commondir>/worktrees/<name>; bind it
-    # separately only when it is elsewhere (no commondir means both are the same).
-    path_is_within "$gitdir" "$common_dir" || dirs+=("$gitdir")
-    for dir in "${dirs[@]}"; do
-        path_is_within "$dir" "$WORKING_DIR" && continue
-        BWRAP_ARGS+=(--bind "$dir" "$dir")
-        GIT_LINKED_DIRS+=("$dir")
-        log_info "${GREEN}✓${NC} Mounted linked git directory read-write: $dir"
-    done
+    path_is_within "$common_dir" "$WORKING_DIR" && return 0
+    BWRAP_ARGS+=(--bind "$common_dir" "$common_dir")
+    GIT_LINKED_DIRS+=("$common_dir")
+    log_info "${GREEN}✓${NC} Mounted linked git directory read-write: $common_dir"
 }
 
 # Bind Claude Code configuration and state from the active profile
