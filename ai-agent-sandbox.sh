@@ -58,6 +58,38 @@ SHARE_SKILLS=true
 ENABLE_GPG_AGENT=false
 GPG_HOST_EXTRA_SOCKET=""
 GPG_SANDBOX_HOME=""
+# Network isolation (see resolve_network_mode): isolated (own network namespace
+# with user-mode networking, host loopback and private ranges blocked), host
+# (shared host network) or none (no network at all)
+NETWORK_MODE=""
+NETWORK_MODE_SOURCE="default"
+NETWORK_MODE_DEFAULT="isolated"
+NETWORK_HOST_PORTS=()
+NETWORK_ALLOW_HOSTS=()
+NETWORK_TMP_DIR=""
+NETWORK_INFO_FD=""
+NETWORK_BLOCK_FD=""
+PASTA_BIN=""
+NSENTER_BIN=""
+IP_BIN=""
+# Addressing of the isolated namespace: a /30 of link-local space nobody routes,
+# so the namespace never sits on one of the blocked subnets (the host's own IPv4
+# subnet included). pasta proxies connections through host sockets, so the
+# address inside is never visible to peers.
+NETWORK_IFNAME="sandbox0"
+NETWORK_NS_ADDR4="169.254.2.1/30"
+NETWORK_GW4="169.254.2.2"
+NETWORK_DNS4="169.254.2.3"
+# The IPv6 DNS address is in the documentation prefix (never routed), so it
+# needs no exception from the blocked ranges; pasta intercepts port 53 traffic
+NETWORK_DNS6="2001:db8:a1a9::53"
+NETWORK_DNS_FORWARD_ARGS=()
+SANDBOX_CHILD_PID=""
+NETWORK_BLOCKED_V4=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10)
+NETWORK_BLOCKED_V6=(fc00::/7 fe80::/10)
+# Route metrics: an allow route must beat a block route of the same prefix
+NETWORK_ALLOW_METRIC=10
+NETWORK_BLOCK_METRIC=100
 SOCKET_PROXY_IMAGE="${AI_AGENT_SANDBOX_DOCKER_PROXY:-ghcr.io/wollomatic/socket-proxy:1}"
 PROXY_CONTAINER_NAME=""
 PROXY_SOCKET_PATH=""
@@ -108,6 +140,13 @@ OPTIONS:
     --no-protect-project-config
                             Mount .ai-agent-sandbox/ read-write instead of read-only
     --docker-image IMAGE    Socket proxy image (default: ghcr.io/wollomatic/socket-proxy:1)
+    --network MODE          Network access: isolated (default: internet only, host
+                            loopback and private networks blocked), host (share the
+                            host network) or none (no network)
+    --host-port PORT        Make a host loopback TCP port (or range a-b) reachable
+                            at localhost inside the sandbox (isolated mode, repeatable)
+    --allow-host ADDR       Allow an IP, CIDR range or hostname that would otherwise be
+                            blocked as a private network (isolated mode, repeatable)
     --dry-run              Start bash shell instead of agent (for testing)
     --quiet, -q            Suppress informational output (faster startup)
     --verbose, -v          Show detailed output (default)
@@ -133,10 +172,11 @@ DEPRECATED LEGACY FILES:
     project-level files are migrated with --migrate-project-conf.
 
 CONFIGURATION FILE FORMAT:
-    Config:    YAML (flat subset). Keys: profile, agent, docker, docker_image, venv,
+    Config:    YAML (flat subset). Keys: profile, agent, network, docker, docker_image, venv,
                 gitconfig, shared_skills, gpg_agent, quiet,
                 protect_project_config (user-level only),
-                whitelist, blacklist, agent_args (lists), env (KEY: VALUE mapping)
+                whitelist, blacklist, host_ports, allow_hosts, agent_args (lists),
+                env (KEY: VALUE mapping)
     whitelist: Absolute or relative paths/patterns that the agent can read
                 Relative paths are resolved relative to working directory
                 Default: read-only bind mount
@@ -154,9 +194,20 @@ PROFILES:
     created inside a profile are stored in that profile (--no-shared-skills disables).
     OpenCode gets ~/.config/opencode/skills, ~/.claude/skills and ~/.agents/skills.
 
+NETWORK:
+    By default the sandbox gets its own network namespace with user-mode
+    networking (pasta, package passt): the internet is reachable, the host's
+    loopback services and private networks (10/8, 172.16/12, 192.168/16,
+    169.254/16, 100.64/10, fc00::/7, fe80::/10, the host's own subnets) are not.
+    Servers started inside are published on the host like before. Use
+    --host-port / host_ports for host services (T3 Code: --host-port 3773, a
+    database published by Docker: --host-port 5432) and --allow-host /
+    allow_hosts for machines on the LAN. --network host restores full access.
+    Environment variable AI_AGENT_SANDBOX_NETWORK sets the mode too.
+
 ORCHESTRATORS:
     T3 Code and similar tools can use a two-line wrapper script as the agent
-    binary:  exec $0 --quiet -- "\$@"
+    binary:  exec $0 --quiet --host-port 3773 -- "\$@"
     The orchestrator stays on the host, the agents it launches run sandboxed.
     Git worktrees are supported (the linked .git directory is mounted) and a
     --permission-mode passed by the caller is respected.
@@ -172,6 +223,8 @@ EXAMPLES:
     $0 --blacklist-path .env --blacklist-path secrets/
     $0 --venv
     $0 --gpg-agent
+    $0 --network host
+    $0 --host-port 5432 --allow-host 192.168.1.50
     $0 -- --model claude-sonnet-4-5
     $0 -a opencode -- run -m deepseek/deepseek-chat "Explain this repository"
 
@@ -191,6 +244,36 @@ trim_whitespace() {
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
     printf '%s\n' "$value"
+}
+
+validate_network_mode() {
+    case "$1" in
+        isolated|host|none) return 0 ;;
+    esac
+    return 1
+}
+
+# A TCP port or an inclusive range first-last, as pasta accepts it
+validate_host_port() {
+    local spec="$1" first last
+    [[ "$spec" =~ ^([0-9]{1,5})(-([0-9]{1,5}))?$ ]] || return 1
+    first=${BASH_REMATCH[1]}
+    last=${BASH_REMATCH[3]:-$first}
+    (( first >= 1 && first <= 65535 && last >= first && last <= 65535 ))
+}
+
+# Removes duplicates from the named array (config files and flags are merged)
+dedupe_array() {
+    local -n _da_ref="$1"
+    local -A seen=()
+    local -a out=()
+    local item
+    for item in "${_da_ref[@]}"; do
+        [[ -n "${seen[$item]:-}" ]] && continue
+        seen[$item]=1
+        out+=("$item")
+    done
+    _da_ref=("${out[@]}")
 }
 
 # --- Configuration file (config.yaml) support ---------------------------------
@@ -218,7 +301,7 @@ flush_config_log() {
 
 is_config_list_key() {
     case "$1" in
-        whitelist|blacklist|agent_args)
+        whitelist|blacklist|host_ports|allow_hosts|agent_args)
             return 0
             ;;
     esac
@@ -302,6 +385,13 @@ apply_config_list_item() {
         agent_args)
             CONFIG_AGENT_ARGS+=("$item")
             ;;
+        host_ports)
+            validate_host_port "$item" || config_error "Invalid host_ports entry in $file: '$item' (expected a TCP port or range a-b)"
+            NETWORK_HOST_PORTS+=("$item")
+            ;;
+        allow_hosts)
+            NETWORK_ALLOW_HOSTS+=("$item")
+            ;;
         *)
             config_warn "Key '$key' in $file does not accept a list (ignored)"
             ;;
@@ -328,6 +418,16 @@ apply_config_scalar() {
             ;;
         docker_image)
             [[ "$is_null" = true ]] || SOCKET_PROXY_IMAGE="$value"
+            ;;
+        network)
+            if [[ "$is_null" = true ]]; then
+                NETWORK_MODE=""
+                NETWORK_MODE_SOURCE="default"
+            else
+                validate_network_mode "$value" || config_error "Invalid value for 'network' in $file: '$value' (expected isolated, host or none)"
+                NETWORK_MODE="$value"
+                NETWORK_MODE_SOURCE="$file"
+            fi
             ;;
         docker|venv|gpg_agent|gitconfig|shared_skills|quiet|protect_project_config)
             [[ "$is_null" = true ]] && return 0
@@ -687,6 +787,12 @@ if [[ -n "${AI_AGENT_SANDBOX_PROFILE:-}" ]]; then
     PROFILE_SOURCE="AI_AGENT_SANDBOX_PROFILE"
 fi
 
+if [[ -n "${AI_AGENT_SANDBOX_NETWORK:-}" ]]; then
+    validate_network_mode "$AI_AGENT_SANDBOX_NETWORK" || { echo -e "${RED}Error: invalid AI_AGENT_SANDBOX_NETWORK '$AI_AGENT_SANDBOX_NETWORK' (expected isolated, host or none)${NC}" >&2; exit 1; }
+    NETWORK_MODE="$AI_AGENT_SANDBOX_NETWORK"
+    NETWORK_MODE_SOURCE="AI_AGENT_SANDBOX_NETWORK"
+fi
+
 # Parse command line arguments (kept for the restart after a config migration)
 ORIGINAL_ARGS=("$@")
 AGENT_ARGS=()
@@ -774,6 +880,21 @@ while [[ $# -gt 0 ]]; do
             ;;
         --docker-image)
             SOCKET_PROXY_IMAGE="$2"
+            shift 2
+            ;;
+        --network)
+            validate_network_mode "$2" || { echo -e "${RED}Error: invalid --network mode '$2' (expected isolated, host or none)${NC}" >&2; exit 1; }
+            NETWORK_MODE="$2"
+            NETWORK_MODE_SOURCE="--network"
+            shift 2
+            ;;
+        --host-port)
+            validate_host_port "$2" || { echo -e "${RED}Error: invalid --host-port '$2' (expected a TCP port or range a-b)${NC}" >&2; exit 1; }
+            NETWORK_HOST_PORTS+=("$2")
+            shift 2
+            ;;
+        --allow-host)
+            NETWORK_ALLOW_HOSTS+=("$2")
             shift 2
             ;;
         --agent|-a)
@@ -1527,6 +1648,210 @@ cleanup_socket_proxy() {
     fi
 }
 
+
+# --- Network isolation ---------------------------------------------------------
+#
+# In isolated mode bwrap keeps the new network namespace from --unshare-all and
+# pasta (package passt) attaches user-mode networking to it: outbound
+# connections are proxied through host sockets, ports bound inside are
+# published on the host (-t auto), nothing else gets in. The host's loopback is
+# not mapped (--no-map-gw) and only the TCP ports listed in NETWORK_HOST_PORTS
+# are forwarded into the namespace (-T). Private address ranges and the host's
+# own subnets are blocked with unreachable routes installed from the host
+# (nsenter into bwrap's user namespace); the sandboxed process has an empty
+# capability bounding set, so it cannot change them. Everything runs before the
+# agent starts: bwrap blocks on --block-fd until the setup is done.
+
+# Decides the effective mode and checks the tools it needs. Fatal when the user
+# asked for isolation explicitly; a silent default falls back to the host
+# network with a warning so an upgrade does not break existing setups.
+resolve_network_mode() {
+    local missing=()
+    if [[ -z "$NETWORK_MODE" ]]; then
+        NETWORK_MODE="$NETWORK_MODE_DEFAULT"
+        NETWORK_MODE_SOURCE="default"
+    fi
+    dedupe_array NETWORK_HOST_PORTS
+    dedupe_array NETWORK_ALLOW_HOSTS
+    [[ "$NETWORK_MODE" = isolated ]] || return 0
+
+    PASTA_BIN=$(command -v pasta 2>/dev/null || true)
+    NSENTER_BIN=$(command -v nsenter 2>/dev/null || true)
+    IP_BIN=$(command -v ip 2>/dev/null || true)
+    [[ -n "$PASTA_BIN" ]] || missing+=("pasta (package passt)")
+    [[ -n "$NSENTER_BIN" ]] || missing+=("nsenter (package util-linux)")
+    [[ -n "$IP_BIN" ]] || missing+=("ip (package iproute2)")
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+
+    if [[ "$NETWORK_MODE_SOURCE" = default ]]; then
+        NETWORK_MODE="host"
+        NETWORK_MODE_SOURCE="fallback"
+        echo -e "${YELLOW}⚠ Network isolation needs ${missing[*]}; falling back to the host network. Install the tools or set 'network: host' to silence this warning${NC}" >&2
+    else
+        echo -e "${RED}Error: network isolation (from $NETWORK_MODE_SOURCE) needs ${missing[*]}${NC}" >&2
+        echo "Install them (Debian/Ubuntu: sudo apt install passt; Fedora: sudo dnf install passt) or run with --network host" >&2
+        exit 1
+    fi
+}
+
+# Host nameservers of one address family from /etc/resolv.conf (4 or 6)
+host_nameservers() {
+    local family="$1" line
+    [[ -f /etc/resolv.conf ]] || return 0
+    while read -r line; do
+        [[ "$line" =~ ^[[:space:]]*nameserver[[:space:]]+([^[:space:]#]+) ]] || continue
+        case "$family" in
+            4) [[ "${BASH_REMATCH[1]}" == *.* && "${BASH_REMATCH[1]}" != *:* ]] && echo "${BASH_REMATCH[1]}" ;;
+            6) [[ "${BASH_REMATCH[1]}" == *:* ]] && echo "${BASH_REMATCH[1]}" ;;
+        esac
+    done < /etc/resolv.conf
+}
+
+# Creates the temporary directory (FIFOs for bwrap, generated resolv.conf) and
+# appends the resolv.conf bind. Inside the namespace the host's nameservers are
+# unreachable (a resolver on 127.0.0.53 would be the sandbox's own loopback),
+# so DNS goes to addresses pasta forwards to the host's first resolver.
+prepare_isolated_network() {
+    local line
+    NETWORK_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ai-agent-sandbox-net.XXXXXX")"
+    NETWORK_DNS_FORWARD_ARGS=()
+    {
+        if [[ -f /etc/resolv.conf ]]; then
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                [[ "$line" =~ ^[[:space:]]*nameserver([[:space:]]|$) ]] && continue
+                printf '%s\n' "$line"
+            done < /etc/resolv.conf
+        fi
+        if [[ -n "$(host_nameservers 4)" ]]; then
+            printf 'nameserver %s\n' "$NETWORK_DNS4"
+            NETWORK_DNS_FORWARD_ARGS+=(--dns-forward "$NETWORK_DNS4")
+        fi
+        if [[ -n "$(host_nameservers 6)" ]]; then
+            printf 'nameserver %s\n' "$NETWORK_DNS6"
+            NETWORK_DNS_FORWARD_ARGS+=(--dns-forward "$NETWORK_DNS6")
+        fi
+    } > "$NETWORK_TMP_DIR/resolv.conf"
+    if [[ ${#NETWORK_DNS_FORWARD_ARGS[@]} -eq 0 ]]; then
+        log_info "${YELLOW}⚠${NC} No nameserver in /etc/resolv.conf, DNS will not work inside the sandbox"
+    fi
+    BWRAP_ARGS+=(--ro-bind "$NETWORK_TMP_DIR/resolv.conf" /etc/resolv.conf)
+}
+
+# Runs a command inside the sandbox's network namespace with the capabilities
+# of its user namespace (the owner of the user namespace has them all)
+ns_exec() {
+    "$NSENTER_BIN" --preserve-credentials -U -n -t "$SANDBOX_CHILD_PID" -- "$@"
+}
+
+# Usage: ns_route <4|6> <args...>; `replace` tolerates duplicates (a host
+# subnet that is also a blocked range)
+ns_route() {
+    local family="$1"
+    shift
+    ns_exec "$IP_BIN" "-$family" route replace "$@" 2>&1 || return 1
+}
+
+# Subnets directly attached to the host, which pasta would otherwise let the
+# namespace reach: IPv4 on-link routes and IPv6 prefixes without a gateway.
+# Very short prefixes (a VPN's 0.0.0.0/1 dev tun0) are not LANs and stay open.
+host_onlink_subnets() {
+    local family="$1" prefix rest min_len=8
+    [[ "$family" = 6 ]] && min_len=16
+    "$IP_BIN" "-$family" route show 2>/dev/null | while read -r prefix rest; do
+        [[ "$prefix" == */* ]] || continue
+        [[ " $rest " == *" via "* ]] && continue
+        (( ${prefix##*/} >= min_len )) || continue
+        case "$prefix" in
+            fe80::/64|::1/128|127.*) continue ;;
+        esac
+        echo "$prefix"
+    done
+}
+
+# Resolved addresses (with optional /prefix) of one allow_hosts entry
+resolve_allow_host() {
+    local entry="$1"
+    if [[ "$entry" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ || "$entry" =~ ^[0-9A-Fa-f:]*:[0-9A-Fa-f:.]*(/[0-9]{1,3})?$ ]]; then
+        echo "$entry"
+        return 0
+    fi
+    getent ahosts "$entry" 2>/dev/null | awk '{print $1}' | sort -u
+}
+
+# Attaches pasta to the namespace of bwrap's child and installs the routes.
+# Requires SANDBOX_CHILD_PID; returns non-zero when the sandbox must not start.
+setup_isolated_network() {
+    local -a pasta_args=() blocked4=() blocked6=()
+    local -a addrs=()
+    local host_ports="none" subnet gw6="" entry addr line failed=false
+
+    if [[ ${#NETWORK_HOST_PORTS[@]} -gt 0 ]]; then
+        host_ports=$(IFS=,; echo "${NETWORK_HOST_PORTS[*]}")
+    fi
+    pasta_args=(
+        --quiet --config-net --no-map-gw
+        --ns-ifname "$NETWORK_IFNAME"
+        --address "$NETWORK_NS_ADDR4" --gateway "$NETWORK_GW4"
+        "${NETWORK_DNS_FORWARD_ARGS[@]}"
+        --tcp-ports auto --udp-ports auto
+        --tcp-ns "$host_ports" --udp-ns none
+    )
+    if ! "$PASTA_BIN" "${pasta_args[@]}" "$SANDBOX_CHILD_PID"; then
+        echo -e "${RED}Error: pasta could not set up the sandbox network${NC}" >&2
+        return 1
+    fi
+
+    # Blocked ranges: the private ranges plus every subnet the host is on
+    mapfile -t blocked4 < <(printf '%s\n' "${NETWORK_BLOCKED_V4[@]}"; host_onlink_subnets 4)
+    mapfile -t blocked6 < <(printf '%s\n' "${NETWORK_BLOCKED_V6[@]}"; host_onlink_subnets 6)
+    for subnet in "${blocked4[@]}"; do
+        ns_route 4 unreachable "$subnet" metric "$NETWORK_BLOCK_METRIC" >/dev/null || failed=true
+    done
+    for subnet in "${blocked6[@]}"; do
+        ns_route 6 unreachable "$subnet" metric "$NETWORK_BLOCK_METRIC" >/dev/null || failed=true
+    done
+    if [[ "$failed" = true ]]; then
+        echo -e "${RED}Error: could not install the network block routes in the sandbox${NC}" >&2
+        return 1
+    fi
+
+    # pasta copies the host's IPv6 gateway; keep it reachable when it sits in a
+    # blocked prefix (a link-local gateway is covered by the on-link fe80::/64)
+    line=$(ns_exec "$IP_BIN" -6 route show default 2>/dev/null | head -n 1 || true)
+    if [[ "$line" =~ \ via\ ([^\ ]+) ]]; then
+        gw6="${BASH_REMATCH[1]}"
+        [[ "$gw6" == fe80:* ]] || ns_route 6 "$gw6/128" dev "$NETWORK_IFNAME" metric "$NETWORK_ALLOW_METRIC" >/dev/null || true
+    fi
+
+    for entry in "${NETWORK_ALLOW_HOSTS[@]}"; do
+        mapfile -t addrs < <(resolve_allow_host "$entry")
+        if [[ ${#addrs[@]} -eq 0 ]]; then
+            echo -e "${YELLOW}⚠ Cannot resolve allowed host '$entry', skipping${NC}" >&2
+            continue
+        fi
+        for addr in "${addrs[@]}"; do
+            if [[ "$addr" == *:* ]]; then
+                if [[ -z "$gw6" ]]; then
+                    echo -e "${YELLOW}⚠ No IPv6 gateway in the sandbox, cannot allow $addr ($entry)${NC}" >&2
+                    continue
+                fi
+                ns_route 6 "$addr" via "$gw6" dev "$NETWORK_IFNAME" metric "$NETWORK_ALLOW_METRIC" >/dev/null \
+                    || echo -e "${YELLOW}⚠ Could not allow $addr ($entry)${NC}" >&2
+            else
+                ns_route 4 "$addr" via "$NETWORK_GW4" dev "$NETWORK_IFNAME" metric "$NETWORK_ALLOW_METRIC" >/dev/null \
+                    || echo -e "${YELLOW}⚠ Could not allow $addr ($entry)${NC}" >&2
+            fi
+        done
+    done
+    return 0
+}
+
+cleanup_network() {
+    if [[ -n "${NETWORK_TMP_DIR:-}" ]] && [[ -d "$NETWORK_TMP_DIR" ]]; then
+        rm -rf "$NETWORK_TMP_DIR" 2>/dev/null || true
+    fi
+}
+
 cleanup_gpg_agent() {
     if [[ -n "${GPG_SANDBOX_HOME:-}" ]] && [[ -d "$GPG_SANDBOX_HOME" ]]; then
         rm -rf "$GPG_SANDBOX_HOME" 2>/dev/null || true
@@ -1536,6 +1861,7 @@ cleanup_gpg_agent() {
 cleanup_sandbox() {
     cleanup_socket_proxy
     cleanup_gpg_agent
+    cleanup_network
 }
 
 # Shells conventionally report signal termination as 128 + signal number.
@@ -1569,13 +1895,45 @@ trap ':' INT
 
 # Usage: run_in_sandbox <command> [args...]; returns the command's exit status
 run_in_sandbox() {
-    local status=0
+    local status=0 line
+    local -a bwrap_extra=()
+    if [[ "$NETWORK_MODE" = isolated ]]; then
+        # bwrap reports the child pid on --info-fd and holds the command until
+        # --block-fd becomes readable: pasta and the routes go in between
+        mkfifo "$NETWORK_TMP_DIR/info" "$NETWORK_TMP_DIR/block"
+        exec {NETWORK_INFO_FD}<>"$NETWORK_TMP_DIR/info" {NETWORK_BLOCK_FD}<>"$NETWORK_TMP_DIR/block"
+        bwrap_extra=(--info-fd "$NETWORK_INFO_FD" --block-fd "$NETWORK_BLOCK_FD")
+    fi
     # Explicit stdin redirect: a background job in a non-interactive shell
     # would otherwise read from /dev/null (agents driven over stdin need it).
     # Job control stays off so bwrap remains in our process group, which
     # orchestrators signal as a whole.
-    "$BWRAP_BIN" "${BWRAP_ARGS[@]}" -- "$@" <&0 &
+    "$BWRAP_BIN" "${BWRAP_ARGS[@]}" "${bwrap_extra[@]}" -- "$@" <&0 &
     SANDBOX_PID=$!
+    if [[ "$NETWORK_MODE" = isolated ]]; then
+        SANDBOX_CHILD_PID=""
+        while read -r -t 15 -u "$NETWORK_INFO_FD" line; do
+            if [[ "$line" =~ \"child-pid\":[[:space:]]*([0-9]+) ]]; then
+                SANDBOX_CHILD_PID="${BASH_REMATCH[1]}"
+                break
+            fi
+        done
+        if [[ -z "$SANDBOX_CHILD_PID" ]] || ! setup_isolated_network; then
+            [[ -n "$SANDBOX_CHILD_PID" ]] || echo -e "${RED}Error: bwrap did not report the sandbox pid${NC}" >&2
+            # bwrap ignores SIGTERM while its child still waits on --block-fd,
+            # so the blocked child is killed directly and bwrap follows
+            kill -s TERM "$SANDBOX_PID" 2>/dev/null || true
+            if [[ -n "$SANDBOX_CHILD_PID" ]]; then
+                kill -s KILL "$SANDBOX_CHILD_PID" 2>/dev/null || true
+            fi
+            wait "$SANDBOX_PID" 2>/dev/null || true
+            SANDBOX_PID=""
+            exec {NETWORK_INFO_FD}>&- {NETWORK_BLOCK_FD}>&-
+            return 1
+        fi
+        echo go >&"$NETWORK_BLOCK_FD"
+        exec {NETWORK_INFO_FD}>&- {NETWORK_BLOCK_FD}>&-
+    fi
     while :; do
         status=0
         wait "$SANDBOX_PID" || status=$?
@@ -2285,6 +2643,8 @@ if [[ -z "$BWRAP_BIN" ]]; then
     exit 1
 fi
 
+resolve_network_mode
+
 # Detect agent binary based on selection
 AGENT_BIN=""
 if [[ "$AGENT" = "claudecode" ]]; then
@@ -2657,16 +3017,24 @@ sandbox_setenv HOME "$HOME"
 sandbox_setenv PWD "$WORKING_DIR"
 BWRAP_ARGS+=(--chdir "$WORKING_DIR")
 
-# Network configuration - allow all network access
-log_info "\n${GREEN}Network: Full access enabled (local and internet)${NC}"
-
-# Share the network namespace to allow all network access
-BWRAP_ARGS+=(--share-net)
-
-# Use system DNS configuration
-if [[ -f /etc/resolv.conf ]]; then
-    BWRAP_ARGS+=(--ro-bind /etc/resolv.conf /etc/resolv.conf)
-fi
+# Network configuration
+case "$NETWORK_MODE" in
+    host)
+        log_info "\n${GREEN}Network: host network shared (full local and internet access)${NC}"
+        BWRAP_ARGS+=(--share-net)
+        # Use system DNS configuration
+        if [[ -f /etc/resolv.conf ]]; then
+            BWRAP_ARGS+=(--ro-bind /etc/resolv.conf /etc/resolv.conf)
+        fi
+        ;;
+    isolated)
+        log_info "\n${GREEN}Network: isolated (internet via pasta, host loopback and private networks blocked)${NC}"
+        prepare_isolated_network
+        ;;
+    none)
+        log_info "\n${GREEN}Network: none (no network access)${NC}"
+        ;;
+esac
 
 # Bind /etc/hosts for name resolution
 if [[ -f /etc/hosts ]]; then
@@ -3005,6 +3373,26 @@ else
     log_info "Profile: ${YELLOW}$PROFILE${NC} (from $PROFILE_SOURCE) -> $PROFILE_HOME"
 fi
 log_info "Working Directory: ${YELLOW}$WORKING_DIR${NC}"
+case "$NETWORK_MODE" in
+    isolated)
+        NETWORK_SUMMARY="isolated"
+        [[ ${#NETWORK_HOST_PORTS[@]} -gt 0 ]] && NETWORK_SUMMARY+=", host ports: ${NETWORK_HOST_PORTS[*]}"
+        [[ ${#NETWORK_ALLOW_HOSTS[@]} -gt 0 ]] && NETWORK_SUMMARY+=", allowed hosts: ${NETWORK_ALLOW_HOSTS[*]}"
+        log_info "Network: ${YELLOW}$NETWORK_SUMMARY${NC} (from $NETWORK_MODE_SOURCE)"
+        if [[ "$ENABLE_DOCKER" = true ]]; then
+            log_info "  ${YELLOW}⚠${NC} Ports published by containers are on the host loopback: list them in host_ports or use --network host"
+        fi
+        ;;
+    host)
+        log_info "Network: ${YELLOW}host${NC} (full access, from $NETWORK_MODE_SOURCE)"
+        if [[ ${#NETWORK_HOST_PORTS[@]} -gt 0 || ${#NETWORK_ALLOW_HOSTS[@]} -gt 0 ]]; then
+            log_info "  ${YELLOW}⚠${NC} host_ports/allow_hosts only apply to network: isolated"
+        fi
+        ;;
+    none)
+        log_info "Network: ${YELLOW}none${NC} (from $NETWORK_MODE_SOURCE)"
+        ;;
+esac
 if [[ ${#GIT_LINKED_DIRS[@]} -gt 0 ]]; then
     log_info "Linked Git Directories: ${YELLOW}${GIT_LINKED_DIRS[*]}${NC}"
 fi

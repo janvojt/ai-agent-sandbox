@@ -26,6 +26,28 @@ profile: work
 # Agent to run: claudecode (default) or opencode
 # agent: claudecode
 
+# Network access: isolated (default), host or none. "isolated" gives the agent
+# its own network namespace with internet access through pasta (package passt);
+# the host's loopback services and private networks (10/8, 172.16/12,
+# 192.168/16, 169.254/16, 100.64/10, fc00::/7, fe80::/10 and the host's own
+# subnets) are blocked. Servers started inside are still published on the host.
+# "host" shares the host network (previous behaviour). Equivalent flag:
+# --network, environment variable: AI_AGENT_SANDBOX_NETWORK.
+# network: isolated
+
+# Host loopback TCP ports (or ranges a-b) reachable at localhost inside the
+# sandbox in isolated mode, e.g. T3 Code's server or a database published by
+# Docker. Equivalent flag: --host-port
+# host_ports: [3773, 5432]
+
+# Machines that would otherwise be blocked as private networks: IP addresses,
+# CIDR ranges or hostnames (resolved when the sandbox starts).
+# Equivalent flag: --allow-host
+# allow_hosts:
+#   - 192.168.1.50
+#   - 10.0.0.0/24
+#   - nas.local
+
 # Feature toggles (same as the corresponding command-line flags)
 # docker: true          # --enable-docker / --no-docker
 # docker_image: ghcr.io/wollomatic/socket-proxy:1

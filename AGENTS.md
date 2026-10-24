@@ -4,7 +4,7 @@ This file provides guidance to AI coding agents when working with code in this r
 
 ## Project Overview
 
-This is a bash-based sandboxing solution for running AI coding agents in isolated environments using **bubblewrap**. The script (`ai-agent-sandbox.sh`) provides filesystem isolation via whitelist/blacklist. Full network access (both local and internet) is enabled.
+This is a bash-based sandboxing solution for running AI coding agents in isolated environments using **bubblewrap**. The script (`ai-agent-sandbox.sh`) provides filesystem isolation via whitelist/blacklist and, by default, network isolation (internet through user-mode networking, host loopback and private networks blocked).
 
 ## Architecture
 
@@ -27,10 +27,16 @@ This is a bash-based sandboxing solution for running AI coding agents in isolate
 - Unlike overlay filesystems, this doesn't copy files - just hides matching paths
 - **Whitelist overrides**: Entries prefixed with `!` are applied after blacklist mounts to re-allow specific paths
 
-**Network Configuration (lines 288-302)**:
-- Full network access enabled by default
-- Uses `--share-net` to share host network namespace
-- Binds system `/etc/resolv.conf` and `/etc/hosts` for DNS resolution
+**Network modes (`--network`, `AI_AGENT_SANDBOX_NETWORK`, config key `network`; default `isolated`)**:
+- `host`: `--share-net` plus the host's `/etc/resolv.conf` (the behaviour before network isolation existed). `none`: nothing added, the sandbox only has its loopback (Claude Code cannot run, useful for offline test runs)
+- `isolated`: the network namespace from `--unshare-all` is kept and `pasta` (package `passt`, the user-mode networking Podman uses) is attached to it. `resolve_network_mode` runs right after the bwrap check: without `pasta`, `nsenter` or `ip` an implicit default falls back to `host` with a warning (`NETWORK_MODE_SOURCE=fallback`), an explicit request is fatal. Loosening the mode is allowed from every source, project files included, because blocking the internet is pointless (the agent talks to its LLM provider anyway) and the summary line `Network:` names the source
+- `run_in_sandbox` starts bwrap with `--info-fd`/`--block-fd` on two FIFOs in `NETWORK_TMP_DIR`: bwrap reports `child-pid`, the script runs `setup_isolated_network`, then writes to the block fd so the agent only starts once the network is configured; a failed setup kills bwrap and returns 1
+- `setup_isolated_network` runs `pasta --config-net --no-map-gw -a 169.254.2.1/30 -g 169.254.2.2 --dns-forward … -t auto -u auto -T <host_ports|none> -U none <pid>`: pasta joins bwrap's user namespace, so no privileges are needed; it backgrounds itself and exits with the namespace. The namespace gets its own link-local /30 (`NETWORK_NS_ADDR4`) instead of a copy of the host's IPv4 address, so it never sits inside a blocked subnet (pasta proxies through host sockets, the inner address is invisible to peers). IPv6 addressing is left to pasta (only enabled when the host has IPv6). `-t auto` publishes ports bound inside on the host (dev servers keep working); `-T` forwards the listed host loopback TCP ports to `localhost` inside. **`-T`/`-U` default to `auto` in pasta, which would expose every host port: they must always be passed**
+- Blocking is route-based, installed from the host with `nsenter --preserve-credentials -U -n -t <pid> ip route replace unreachable … metric 100` (`ns_route`): `NETWORK_BLOCKED_V4`/`_V6` plus every on-link subnet of the host (`host_onlink_subnets`, covers LANs with public addresses). The sandboxed process has an empty capability bounding set, so it cannot alter routes. `allow_hosts` entries (IPs, CIDRs, hostnames resolved with `getent ahosts` at start) become more specific routes `via` the gateway with metric 10, which beats a block route of the same prefix. A non-link-local IPv6 gateway copied from the host gets a /128 route so a blocked on-link prefix cannot cut off the default route
+- DNS: `prepare_isolated_network` writes a `resolv.conf` into `NETWORK_TMP_DIR` with the host's `nameserver` lines replaced by `NETWORK_DNS4` (`169.254.2.3`, in the sandbox /30) and, if the host has an IPv6 resolver, `NETWORK_DNS6` (`2001:db8:a1a9::53`, documentation prefix, so it needs no exception from the blocked ranges); pasta `--dns-forward` maps them to the host's first resolver, which also works for a `127.0.0.53` stub resolver
+- Not a filter: anything pasta can connect to from the host that is not covered by a blocked prefix (internet, LAN hosts with public addresses on other subnets) is reachable. Docker: containers' published ports are on the host loopback (`host_ports`), bridge addresses (`172.17.x`) are blocked; the summary warns when Docker is enabled in isolated mode. `cleanup_network` removes `NETWORK_TMP_DIR` from the EXIT trap
+- Testing from inside a sandbox is impossible (the bounding set is empty, so `nsenter -U` yields no capabilities); test on the host
+
 
 **Docker Socket Proxy Integration**:
 - Optional `--enable-docker` (or `-d`) starts a per-run socket proxy container
@@ -111,7 +117,7 @@ This is a bash-based sandboxing solution for running AI coding agents in isolate
 - Project-level: never prompted (files are shared via git, all team members need a new sandbox first); `--migrate-project-conf` (`MIGRATE_PROJECT_CONFIG`) migrates and exits, warning if `config.local.yaml` is not git-ignored
 
 **Bubblewrap Namespace Setup (lines 191-205)**:
-- `--unshare-all` creates isolated namespaces (PID, IPC, UTS, cgroup, etc.) but network is shared
+- `--unshare-all` creates isolated namespaces (PID, IPC, UTS, cgroup, network, etc.); the network namespace is kept in `isolated` mode and given back with `--share-net` in `host` mode
 - `--die-with-parent` ensures sandbox terminates if parent dies
 - **Process lifetime and signals (`run_in_sandbox`)**: bwrap is started as a background job (`<&0 &`, the explicit stdin redirect is required because a background job in a non-interactive shell would otherwise read `/dev/null`) and the script `wait`s for it in a loop (re-waiting while `wait` returns >128 and the pid is alive, i.e. a trap interrupted it). Bash defers traps while a foreground child runs, so the previous foreground `bwrap` ignored a `SIGTERM` to the script until the agent exited by itself. `forward_signal_and_exit` (TERM/HUP traps) sends the signal to the outer `bwrap`, which terminates on it and takes the PID namespace down via `--die-with-parent`, then exits with 143/129 so the EXIT trap (`cleanup_sandbox`) still runs. `trap ':' INT` keeps bash alive on Ctrl+C while children keep the default disposition (bwrap itself ignores `SIGINT`). Job control must stay off: `set -m` would move bwrap into its own process group, and orchestrators such as T3 Code signal the whole group
 - Minimal read-only mounts: `/proc`, `/dev`, `/sys`
@@ -120,7 +126,7 @@ This is a bash-based sandboxing solution for running AI coding agents in isolate
 
 **Orchestrators (T3 Code)**:
 - T3 Code (`pingdotgg/t3code`) is a host-side control plane, not an agent: its Node server (port 3773, state in `~/.t3`, worktrees in `~/.t3/worktrees/<repo>/<branch>`, attachments in `~/.t3/userdata/attachments`) launches Claude Code through the Claude Agent SDK (`stream-json` over stdin/stdout, its own MCP server over HTTP on the T3 port, stderr discarded) inside a `systemd-run --user --scope` unit and a detached process group that it kills as a whole. Git, checkpoints, the terminal and transcript reading (`~/.claude/projects/**`) happen on the host
-- Integration is therefore "orchestrator on the host, agents in the sandbox" through T3's per-instance **Binary path** setting pointing at a wrapper (`exec ai-agent-sandbox.sh --quiet -- "$@"`), see README. The pieces that make this work: logging to stderr only, inheriting the SDK's environment (no `--clearenv`), no TTY prompts without a TTY, `WORKING_DIR="$(pwd)"` = the worktree, `AI_AGENT_SANDBOX_PROFILE` from the instance environment, the three items above (permission flag, linked git dirs, signal forwarding) and a whitelisted attachments directory (`--add-dir` must exist inside)
+- Integration is therefore "orchestrator on the host, agents in the sandbox" through T3's per-instance **Binary path** setting pointing at a wrapper (`exec ai-agent-sandbox.sh --quiet --host-port 3773 -- "$@"`; T3's MCP server lives on the host loopback, which the default `isolated` network mode hides), see README. The pieces that make this work: logging to stderr only, inheriting the SDK's environment (no `--clearenv`), no TTY prompts without a TTY, `WORKING_DIR="$(pwd)"` = the worktree, `AI_AGENT_SANDBOX_PROFILE` from the instance environment, the three items above (permission flag, linked git dirs, signal forwarding) and a whitelisted attachments directory (`--add-dir` must exist inside)
 - Running the T3 server itself inside bwrap is deliberately not supported: it needs the systemd user bus, `node-pty`, every project directory and host access to the transcripts, and the model never runs in that process
 
 **Claude Code Configuration Binding (lines 264-285)**:
@@ -167,9 +173,9 @@ shellcheck ai-agent-sandbox.sh
 
 ### Security Considerations
 
-**Network Access**:
-- Full network access is enabled (both local and internet)
-- The sandbox shares the host network namespace via `--share-net`
+**Network Access** (see "Network modes" above):
+- Default `isolated`: internet only, host loopback and private networks blocked; `host_ports`/`allow_hosts` open specific services
+- `--network host` shares the host network namespace via `--share-net`
 - System DNS configuration is used for name resolution
 
 **Pattern Matching Implementation** (find_matches function, lines 147-183):
@@ -265,8 +271,8 @@ BWRAP_ARGS+=(--ro-bind /your/path /your/path)
 
 ### Network Configuration
 
-Network setup is at lines 288-302:
-- Uses `--share-net` to share host network namespace
+Network setup is the `case "$NETWORK_MODE"` block after the `--chdir` argument plus the functions in the "Network isolation" section (`resolve_network_mode`, `prepare_isolated_network`, `setup_isolated_network`):
+- `host` mode uses `--share-net` to share the host network namespace
 - Binds `/etc/resolv.conf` for DNS resolution
 - Binds `/etc/hosts` for hostname resolution
 
@@ -324,6 +330,7 @@ When modifying the script:
 30. Permission flags: `./ai-agent-sandbox.sh -- --version` prints `Agent Command: claude --dangerously-skip-permissions --version`; with `-- --permission-mode default --version`, `-- --permission-mode=plan --version` or `-- --dangerously-skip-permissions --version` the flag is not added twice/not forced
 31. Git worktrees: in a `git worktree add` checkout, `--dry-run` logs `Mounted linked git directory` once, lists the main repository's `.git` under `Linked Git Directories`, and `git log`, `git status` and `git commit --allow-empty` succeed inside (the commit is visible on the host). A normal checkout logs nothing. Negative cases (each logs `not following the .git link` and the target is not visible inside): `.git` rewritten to `gitdir: <some other host directory>` (also via a symlink inside the working directory), `<repo>/.git/worktrees/<name>/commondir` rewritten to another directory, `.git` pointing at another repository's `.git/worktrees/<x>` or at this repository's gitdir from a different directory, and a `--separate-git-dir` clone (which works again with `--whitelist-path-rw <gitdir>`)
 32. Signals: `echo 'sleep 30' | ./ai-agent-sandbox.sh --dry-run -q &` then `kill -TERM $!` ends the sandbox within a second with status 143 (`kill -HUP` → 129), no `bwrap` processes remain; `echo 'exit 42' | … --dry-run -q` exits 42; `printf 'read -r x; echo "GOT:$x"\nline\n' | … --dry-run -q` prints `GOT:line` (stdin reaches the sandbox); interactive Ctrl+C inside Claude Code behaves as before
+33. Network: on a host with `passt`, `--dry-run` shows `Network: isolated (from default)` and inside `curl https://github.com` works, `curl http://<host LAN ip>/`, `curl http://192.168.1.1/` and `curl http://127.0.0.1:3773/` fail immediately with "Network is unreachable"/"Connection refused", `ip route` lists the `unreachable` entries and `ip route add` fails with "Operation not permitted". `python3 -m http.server 8123` inside is reachable from the host at `localhost:8123`. `--host-port 3773` makes T3's server (or any `nc -l 127.0.0.1 3773` on the host) reachable at `localhost:3773` inside; `--allow-host <LAN ip>` makes exactly that machine reachable. `--network host` restores the old behaviour, `--network none` leaves only `lo`. `network: host` in a project `config.yaml` is honoured and shown in the summary. Without `pasta` installed the default logs a fallback warning and uses the host network, `--network isolated` exits 1. `--host-port 70000` and `network: full` are fatal. No `ai-agent-sandbox-net.*` directory and no `pasta` process remain after exit
 
 ## Files in Repository
 

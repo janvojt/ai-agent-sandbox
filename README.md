@@ -6,7 +6,7 @@ A secure bubblewrap-based sandboxing solution for running AI coding agents with 
 
 - ✅ **Whitelist-based filesystem access** - Only explicitly allowed paths are readable
 - ✅ **Blacklist protection** - Block sensitive files within working directory
-- ✅ **Full network access** - Both local and internet access enabled
+- ✅ **Network isolation** - Internet access through user-mode networking, while the host's loopback services and private networks stay hidden (`--network host` for full access)
 - ✅ **Configurable environment** - Variables from `config.yaml` or the command line, no SSH agent access
 - ✅ **Virtualenv support** - Optionally expose the active Python virtual environment
 - ✅ **Working directory isolation** - Full read-write only in current directory
@@ -19,6 +19,10 @@ A secure bubblewrap-based sandboxing solution for running AI coding agents with 
   - Debian/Ubuntu: `sudo apt install bubblewrap`
   - Fedora: `sudo dnf install bubblewrap`
   - Arch: `sudo pacman -S bubblewrap`
+- **passt** (provides `pasta`, optional but used by the default network mode) - Install with:
+  - Debian/Ubuntu: `sudo apt install passt`
+  - Fedora: `sudo dnf install passt`
+  - Arch: `sudo pacman -S passt`
 - **An AI coding agent** - Claude Code or OpenCode are currently supported
 
 ## Installation
@@ -83,6 +87,33 @@ source .venv/bin/activate
 ```
 
 `--venv` detects the active Python virtual environment from `VIRTUAL_ENV`, mounts the venv read-only, sets `VIRTUAL_ENV` inside the sandbox, and prepends `$VIRTUAL_ENV/bin` to `PATH`. If no active venv is detected, the option is ignored.
+
+### Network isolation:
+
+By default the sandbox runs in its own network namespace. [pasta](https://passt.top/) attaches user-mode networking to it, so the agent reaches the internet transparently (no proxy settings, every tool works), while:
+
+- the host's loopback is **not** reachable: a database, Docker port or control plane listening on `localhost` on the host is invisible unless you forward it;
+- private networks are **blocked**: `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `100.64/10`, `fc00::/7`, `fe80::/10` and every subnet the host itself is attached to (also when it has public addresses);
+- ports the agent binds inside (dev servers, test fixtures) are published on the host as before, so your browser still reaches `localhost:3000`;
+- Unix sockets (Docker proxy, GPG agent) are unaffected.
+
+```bash
+# T3 Code's MCP server, a database published by Docker: reachable at localhost inside
+./ai-agent-sandbox.sh --host-port 3773 --host-port 5432
+
+# A machine on the LAN (IP, CIDR range or hostname resolved at start)
+./ai-agent-sandbox.sh --allow-host 192.168.1.50 --allow-host 10.0.0.0/24 --allow-host nas.local
+
+# Full host network as before, or no network at all (offline test runs)
+./ai-agent-sandbox.sh --network host
+./ai-agent-sandbox.sh --network none
+```
+
+The same settings exist as config keys (`network`, `host_ports`, `allow_hosts`) in user and project files and as the environment variable `AI_AGENT_SANDBOX_NETWORK`. A project may switch itself to `network: host`; the startup summary shows where the mode came from.
+
+Requirements: `pasta` (package `passt`), `nsenter` (util-linux) and `ip` (iproute2) on the host. Without them the default mode falls back to the host network with a warning; an explicitly requested `isolated` mode fails instead.
+
+Limits: LAN machines with public IP addresses on subnets the host is not directly attached to are indistinguishable from the internet. Blocking the internet itself is pointless, the agent talks to its LLM provider anyway. With `--enable-docker`, containers' published ports live on the host loopback, so list them in `host_ports` (or use `--network host`); the `172.17.x` bridge addresses are blocked.
 
 ### Git configuration:
 
@@ -199,12 +230,13 @@ export AI_AGENT_SANDBOX_PROFILES_DIR=/path/to/profile-store
 ```sh
 #!/bin/sh
 # ~/.local/bin/claude-sandboxed  (chmod +x; do not give it a .js/.ts extension, T3 would run those with node)
-exec /path/to/ai-agent-sandbox.sh --quiet -- "$@"
+exec /path/to/ai-agent-sandbox.sh --quiet --host-port 3773 -- "$@"
 ```
 
 Then, in T3 Code:
 
 1. **Settings → Providers → your Claude instance → Binary path**: the wrapper, e.g. `~/.local/bin/claude-sandboxed`. T3 passes its own flags (`--permission-mode`, `--add-dir`, `--resume`, ...) after `--`; the sandbox leaves them untouched.
+   `--host-port 3773` keeps T3's MCP server (its tools for the agent) reachable from the isolated sandbox network; use the port of your T3 server if you changed it.
 2. Whitelist T3's attachments directory, which T3 hands to Claude with `--add-dir` for images pasted into a thread: add `~/.t3/userdata/attachments` to the `whitelist:` of your user-level `config.yaml` (use your `T3CODE_HOME` if you changed it).
 3. To run T3 threads under a sandbox [profile](#profiles), add the environment variable `AI_AGENT_SANDBOX_PROFILE=<name>` to the provider instance (**Settings → Providers → instance → Environment variables**) and set the instance's **CLAUDE_CONFIG_DIR path** to `~/.local/share/ai-agent-sandbox/profiles/<name>/home/.claude`, so that T3's host-side readers (thread history, usage limits) look at the same directory the sandbox mounts as `~/.claude`. The sandbox ignores `CLAUDE_CONFIG_DIR` itself and uses the profile.
 
@@ -280,6 +312,9 @@ See [`config-example.yaml`](config-example.yaml) for a commented example of ever
 |---|---|---|
 | `profile` | string | `--profile NAME` (`default` = host configuration) |
 | `agent` | string | `--agent claudecode\|opencode` |
+| `network` | string | `--network isolated\|host\|none` (default: `isolated`, see [Network isolation](#network-isolation)) |
+| `host_ports` | list | `--host-port PORT` (host loopback TCP ports or ranges `a-b` reachable at localhost inside) |
+| `allow_hosts` | list | `--allow-host ADDR` (IPs, CIDR ranges or hostnames exempt from the private-network block) |
 | `docker` | bool | `--enable-docker` / `--no-docker` |
 | `docker_image` | string | `--docker-image IMAGE` |
 | `venv` | bool | `--venv` / `--no-venv` |
@@ -437,10 +472,11 @@ blacklist:
 5. ✅ **Credential separation** - With profiles, a project only sees the login, settings and memory of its own profile; the profile store itself is never visible inside the sandbox
 6. ✅ **Self-modifying sandbox rules** - `.ai-agent-sandbox/` is mounted read-only so the agent cannot change the profile, whitelist or environment it runs with next time
 7. ✅ **OpenCode 2 background server** - OpenCode 2 is started with `--standalone`, so the server that executes its tools runs inside the sandbox instead of the shared per-user service on the host
+8. ✅ **Host services and LAN** - In the default `isolated` network mode the host's loopback and private networks are unreachable, so a prompt-injected agent cannot probe local databases, dashboards, routers or other machines; only the ports and hosts you list are exposed
 
 ### Limitations and Considerations
 
-1. ⚠️ **Full network access** - The sandbox has complete network access (both local and internet). If you need network isolation, you'll need to modify the script to use `--unshare-net` with `slirp4netns`.
+1. ⚠️ **Internet access** - The agent reaches the internet (and therefore its LLM provider) in both `isolated` and `host` mode. `--network host` also gives it the host loopback and the LAN; `--network none` cuts everything but is only useful for offline runs.
 
 2. ⚠️ **Blacklist uses tmpfs mounts** - Files matching blacklist patterns are hidden via tmpfs. This means:
    - Glob patterns are expanded at sandbox start time
@@ -472,11 +508,6 @@ systemd-run --scope -p CPUQuota=200% -p MemoryMax=4G ./ai-agent-sandbox.sh
 auditctl -w /path/to/project -p rwa
 ```
 
-4. **Network isolation**:
-```bash
-# Modify the script to use --unshare-net with slirp4netns
-# for selective internet access while blocking local networks
-```
 
 ## Troubleshooting
 
@@ -576,7 +607,7 @@ Suggestions for improvements:
 1. More sophisticated overlay filesystem handling
 2. Integration with security audit tools
 3. Preset profiles for common development stacks
-4. Optional network isolation modes
+4. Domain-level egress filtering (currently deliberately out of scope)
 
 ## Security Disclosure
 
