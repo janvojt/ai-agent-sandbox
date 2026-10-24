@@ -71,6 +71,9 @@ NETWORK_INFO_FD=""
 NETWORK_BLOCK_FD=""
 PASTA_BIN=""
 NSENTER_BIN=""
+UNSHARE_BIN=""
+SANDBOX_USERNS_FD=""
+SANDBOX_USERNS2_FD=""
 IP_BIN=""
 # Addressing of the isolated namespace: a /30 of link-local space nobody routes,
 # so the namespace never sits on one of the blocked subnets (the host's own IPv4
@@ -1651,16 +1654,25 @@ cleanup_socket_proxy() {
 
 # --- Network isolation ---------------------------------------------------------
 #
-# In isolated mode bwrap keeps the new network namespace from --unshare-all and
-# pasta (package passt) attaches user-mode networking to it: outbound
-# connections are proxied through host sockets, ports bound inside are
-# published on the host (-t auto), nothing else gets in. The host's loopback is
-# not mapped (--no-map-gw) and only the TCP ports listed in NETWORK_HOST_PORTS
-# are forwarded into the namespace (-T). Private address ranges and the host's
-# own subnets are blocked with unreachable routes installed from the host
-# (nsenter into bwrap's user namespace); the sandboxed process has an empty
-# capability bounding set, so it cannot change them. Everything runs before the
-# agent starts: bwrap blocks on --block-fd until the setup is done.
+# In isolated mode bwrap keeps a new network namespace and pasta (package passt)
+# attaches user-mode networking to it: outbound connections are proxied through
+# host sockets, ports bound inside are published on the host (-t auto), nothing
+# else gets in. The host's loopback is not mapped (--no-map-gw) and only the TCP
+# ports listed in NETWORK_HOST_PORTS are forwarded into the namespace (-T).
+# Private address ranges and the host's own subnets are blocked with
+# unreachable routes installed from the host before the agent starts (bwrap
+# blocks on --block-fd until the setup is done).
+#
+# Changing routes needs CAP_NET_ADMIN in the user namespace that owns the
+# network namespace. bwrap's own --unshare-user puts the sandboxed process (and
+# everything reachable via /proc/<pid>/ns/user) into a nested user namespace
+# below that owner, so nothing could be entered from the host. The sandbox
+# therefore uses two user namespaces created by the script (create_user_namespace,
+# kept alive by fds): bwrap --userns joins the first one, which then owns the
+# network namespace and can be entered from the host via /proc/self/fd/<fd>
+# (joining a user namespace one created grants all capabilities in it), and
+# --userns2 moves the sandboxed process into the second, nested one, where it
+# has no capabilities over the network namespace and cannot alter the routes.
 
 # Decides the effective mode and checks the tools it needs. Fatal when the user
 # asked for isolation explicitly; a silent default falls back to the host
@@ -1678,8 +1690,18 @@ resolve_network_mode() {
     PASTA_BIN=$(command -v pasta 2>/dev/null || true)
     NSENTER_BIN=$(command -v nsenter 2>/dev/null || true)
     IP_BIN=$(command -v ip 2>/dev/null || true)
+    UNSHARE_BIN=$(command -v unshare 2>/dev/null || true)
+    if [[ -z "$UNSHARE_BIN" ]]; then
+        missing+=("unshare (package util-linux)")
+    elif ! "$UNSHARE_BIN" --help 2>&1 | grep -q -- --map-user; then
+        missing+=("unshare with --map-user (util-linux >= 2.38)")
+    fi
     [[ -n "$PASTA_BIN" ]] || missing+=("pasta (package passt)")
-    [[ -n "$NSENTER_BIN" ]] || missing+=("nsenter (package util-linux)")
+    if [[ -z "$NSENTER_BIN" ]]; then
+        missing+=("nsenter (package util-linux)")
+    elif ! "$NSENTER_BIN" --help 2>&1 | grep -q -- --keep-caps; then
+        missing+=("nsenter with --keep-caps (util-linux >= 2.37)")
+    fi
     [[ -n "$IP_BIN" ]] || missing+=("ip (package iproute2)")
     [[ ${#missing[@]} -eq 0 ]] && return 0
 
@@ -1737,18 +1759,57 @@ prepare_isolated_network() {
     BWRAP_ARGS+=(--ro-bind "$NETWORK_TMP_DIR/resolv.conf" /etc/resolv.conf)
 }
 
+# Creates a user namespace mapping our uid and gid to themselves and stores an
+# fd to it in the variable named by $1; with a parent fd in $2 the namespace is
+# nested in that one (its maps must be written from inside the parent, which
+# unshare does when run through nsenter). The fd alone keeps the namespace
+# alive, the helper process is only needed until the fd is open.
+create_user_namespace() {
+    local out_ref="$1" parent_fd="${2:-}" holder reference fd i
+    local -a cmd=()
+    if [[ -n "$parent_fd" ]]; then
+        cmd=("$NSENTER_BIN" --preserve-credentials --user="/proc/self/fd/$parent_fd" --)
+        reference=$(readlink "/proc/self/fd/$parent_fd")
+    else
+        reference=$(readlink /proc/self/ns/user)
+    fi
+    "${cmd[@]}" "$UNSHARE_BIN" --user --map-user="$(id -u)" --map-group="$(id -g)" -- sleep 60 &
+    holder=$!
+    # unshare execs sleep once the namespace exists and the maps are written
+    for ((i = 0; i < 100; i++)); do
+        if [[ "$(readlink "/proc/$holder/ns/user" 2>/dev/null)" != "$reference" ]] \
+            && [[ -s "/proc/$holder/gid_map" ]] 2>/dev/null; then
+            break
+        fi
+        sleep 0.05
+    done
+    if ! exec {fd}<"/proc/$holder/ns/user"; then
+        kill "$holder" 2>/dev/null || true
+        return 1
+    fi
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    printf -v "$out_ref" '%s' "$fd"
+}
+
 # Runs a command inside the sandbox's network namespace with the capabilities
-# of its user namespace (the owner of the user namespace has them all)
+# of the user namespace that owns it (ours, see above). --keep-caps (util-linux
+# >= 2.37) carries them over the exec as ambient capabilities; a non-root uid
+# would otherwise lose them when running ip.
 ns_exec() {
-    "$NSENTER_BIN" --preserve-credentials -U -n -t "$SANDBOX_CHILD_PID" -- "$@"
+    "$NSENTER_BIN" --preserve-credentials --keep-caps \
+        --user="/proc/self/fd/$SANDBOX_USERNS_FD" --net="/proc/$SANDBOX_CHILD_PID/ns/net" -- "$@"
 }
 
 # Usage: ns_route <4|6> <args...>; `replace` tolerates duplicates (a host
-# subnet that is also a blocked range)
+# subnet that is also a blocked range). Errors are reported with the command.
 ns_route() {
-    local family="$1"
+    local family="$1" output
     shift
-    ns_exec "$IP_BIN" "-$family" route replace "$@" 2>&1 || return 1
+    if ! output=$(ns_exec "$IP_BIN" "-$family" route replace "$@" 2>&1); then
+        echo -e "${YELLOW}⚠ ip -$family route replace $*: ${output:-failed}${NC}" >&2
+        return 1
+    fi
 }
 
 # Subnets directly attached to the host, which pasta would otherwise let the
@@ -1778,7 +1839,7 @@ resolve_allow_host() {
     getent ahosts "$entry" 2>/dev/null | awk '{print $1}' | sort -u
 }
 
-# Attaches pasta to the namespace of bwrap's child and installs the routes.
+# Attaches pasta to the network namespace of bwrap's child and installs the routes.
 # Requires SANDBOX_CHILD_PID; returns non-zero when the sandbox must not start.
 setup_isolated_network() {
     local -a pasta_args=() blocked4=() blocked6=()
@@ -1796,7 +1857,8 @@ setup_isolated_network() {
         --tcp-ports auto --udp-ports auto
         --tcp-ns "$host_ports" --udp-ns none
     )
-    if ! "$PASTA_BIN" "${pasta_args[@]}" "$SANDBOX_CHILD_PID"; then
+    pasta_args+=(--userns "/proc/self/fd/$SANDBOX_USERNS_FD" --netns "/proc/$SANDBOX_CHILD_PID/ns/net")
+    if ! "$PASTA_BIN" "${pasta_args[@]}"; then
         echo -e "${RED}Error: pasta could not set up the sandbox network${NC}" >&2
         return 1
     fi
@@ -1805,10 +1867,10 @@ setup_isolated_network() {
     mapfile -t blocked4 < <(printf '%s\n' "${NETWORK_BLOCKED_V4[@]}"; host_onlink_subnets 4)
     mapfile -t blocked6 < <(printf '%s\n' "${NETWORK_BLOCKED_V6[@]}"; host_onlink_subnets 6)
     for subnet in "${blocked4[@]}"; do
-        ns_route 4 unreachable "$subnet" metric "$NETWORK_BLOCK_METRIC" >/dev/null || failed=true
+        ns_route 4 unreachable "$subnet" metric "$NETWORK_BLOCK_METRIC" || failed=true
     done
     for subnet in "${blocked6[@]}"; do
-        ns_route 6 unreachable "$subnet" metric "$NETWORK_BLOCK_METRIC" >/dev/null || failed=true
+        ns_route 6 unreachable "$subnet" metric "$NETWORK_BLOCK_METRIC" || failed=true
     done
     if [[ "$failed" = true ]]; then
         echo -e "${RED}Error: could not install the network block routes in the sandbox${NC}" >&2
@@ -1820,7 +1882,7 @@ setup_isolated_network() {
     line=$(ns_exec "$IP_BIN" -6 route show default 2>/dev/null | head -n 1 || true)
     if [[ "$line" =~ \ via\ ([^\ ]+) ]]; then
         gw6="${BASH_REMATCH[1]}"
-        [[ "$gw6" == fe80:* ]] || ns_route 6 "$gw6/128" dev "$NETWORK_IFNAME" metric "$NETWORK_ALLOW_METRIC" >/dev/null || true
+        [[ "$gw6" == fe80:* ]] || ns_route 6 "$gw6/128" dev "$NETWORK_IFNAME" metric "$NETWORK_ALLOW_METRIC" || true
     fi
 
     for entry in "${NETWORK_ALLOW_HOSTS[@]}"; do
@@ -1835,10 +1897,10 @@ setup_isolated_network() {
                     echo -e "${YELLOW}⚠ No IPv6 gateway in the sandbox, cannot allow $addr ($entry)${NC}" >&2
                     continue
                 fi
-                ns_route 6 "$addr" via "$gw6" dev "$NETWORK_IFNAME" metric "$NETWORK_ALLOW_METRIC" >/dev/null \
+                ns_route 6 "$addr" via "$gw6" dev "$NETWORK_IFNAME" metric "$NETWORK_ALLOW_METRIC" \
                     || echo -e "${YELLOW}⚠ Could not allow $addr ($entry)${NC}" >&2
             else
-                ns_route 4 "$addr" via "$NETWORK_GW4" dev "$NETWORK_IFNAME" metric "$NETWORK_ALLOW_METRIC" >/dev/null \
+                ns_route 4 "$addr" via "$NETWORK_GW4" dev "$NETWORK_IFNAME" metric "$NETWORK_ALLOW_METRIC" \
                     || echo -e "${YELLOW}⚠ Could not allow $addr ($entry)${NC}" >&2
             fi
         done
@@ -1898,11 +1960,29 @@ run_in_sandbox() {
     local status=0 line
     local -a bwrap_extra=()
     if [[ "$NETWORK_MODE" = isolated ]]; then
+        # Two user namespaces of our own (see "Network isolation"): --userns can
+        # not be combined with --unshare-user, so --unshare-all is spelled out
+        if ! create_user_namespace SANDBOX_USERNS_FD \
+            || ! create_user_namespace SANDBOX_USERNS2_FD "$SANDBOX_USERNS_FD"; then
+            echo -e "${RED}Error: could not create the user namespaces for the sandbox network${NC}" >&2
+            return 1
+        fi
+        local -a unshared_args=()
+        local arg
+        for arg in "${BWRAP_ARGS[@]}"; do
+            if [[ "$arg" = --unshare-all ]]; then
+                unshared_args+=(--unshare-ipc --unshare-pid --unshare-net --unshare-uts --unshare-cgroup-try)
+            else
+                unshared_args+=("$arg")
+            fi
+        done
+        BWRAP_ARGS=("${unshared_args[@]}")
         # bwrap reports the child pid on --info-fd and holds the command until
         # --block-fd becomes readable: pasta and the routes go in between
         mkfifo "$NETWORK_TMP_DIR/info" "$NETWORK_TMP_DIR/block"
         exec {NETWORK_INFO_FD}<>"$NETWORK_TMP_DIR/info" {NETWORK_BLOCK_FD}<>"$NETWORK_TMP_DIR/block"
-        bwrap_extra=(--info-fd "$NETWORK_INFO_FD" --block-fd "$NETWORK_BLOCK_FD")
+        bwrap_extra=(--userns "$SANDBOX_USERNS_FD" --userns2 "$SANDBOX_USERNS2_FD"
+            --info-fd "$NETWORK_INFO_FD" --block-fd "$NETWORK_BLOCK_FD")
     fi
     # Explicit stdin redirect: a background job in a non-interactive shell
     # would otherwise read from /dev/null (agents driven over stdin need it).
@@ -1928,11 +2008,11 @@ run_in_sandbox() {
             fi
             wait "$SANDBOX_PID" 2>/dev/null || true
             SANDBOX_PID=""
-            exec {NETWORK_INFO_FD}>&- {NETWORK_BLOCK_FD}>&-
+            exec {NETWORK_INFO_FD}>&- {NETWORK_BLOCK_FD}>&- {SANDBOX_USERNS_FD}>&- {SANDBOX_USERNS2_FD}>&-
             return 1
         fi
         echo go >&"$NETWORK_BLOCK_FD"
-        exec {NETWORK_INFO_FD}>&- {NETWORK_BLOCK_FD}>&-
+        exec {NETWORK_INFO_FD}>&- {NETWORK_BLOCK_FD}>&- {SANDBOX_USERNS_FD}>&- {SANDBOX_USERNS2_FD}>&-
     fi
     while :; do
         status=0

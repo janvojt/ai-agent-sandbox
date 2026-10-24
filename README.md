@@ -111,7 +111,7 @@ By default the sandbox runs in its own network namespace. [pasta](https://passt.
 
 The same settings exist as config keys (`network`, `host_ports`, `allow_hosts`) in user and project files and as the environment variable `AI_AGENT_SANDBOX_NETWORK`. A project may switch itself to `network: host`; the startup summary shows where the mode came from.
 
-Requirements: `pasta` (package `passt`), `nsenter` (util-linux) and `ip` (iproute2) on the host. Without them the default mode falls back to the host network with a warning; an explicitly requested `isolated` mode fails instead.
+Requirements: `pasta` (package `passt`), `nsenter --keep-caps` and `unshare --map-user` (util-linux 2.38 or newer) and `ip` (iproute2) on the host. Without them the default mode falls back to the host network with a warning; an explicitly requested `isolated` mode fails instead.
 
 Limits: LAN machines with public IP addresses on subnets the host is not directly attached to are indistinguishable from the internet. Blocking the internet itself is pointless, the agent talks to its LLM provider anyway. With `--enable-docker`, containers' published ports live on the host loopback, so list them in `host_ports` (or use `--network host`); the `172.17.x` bridge addresses are blocked.
 
