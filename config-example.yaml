@@ -69,6 +69,8 @@ whitelist:
   - /usr/lib/python3*
   # Caches the agent may write to
   - ~/.m2/repository:rw
+  # T3 Code hands pasted images to the agent from here (see README, "Using with T3 Code")
+  # - ~/.t3/userdata/attachments
   # Relative paths (resolved against the working directory)
   # - data/                # read access to data/
   # - src/**/*.json        # all .json files under src/

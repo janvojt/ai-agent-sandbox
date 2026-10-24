@@ -92,6 +92,10 @@ By default, `~/.gitconfig` is mounted read-only into the sandbox (if it exists) 
 ./ai-agent-sandbox.sh --no-gitconfig
 ```
 
+### Git worktrees:
+
+A git worktree (`git worktree add ../feature`) or a checkout with a separate git dir has a `.git` *file* that points into the main repository, which usually lies outside the working directory. The sandbox follows that link and mounts the main repository's `.git` directory (and the worktree's own gitdir, when it is elsewhere) read-write at its own path, so `git status`, `git commit` and friends work inside the worktree. Nothing happens for a normal checkout. The mounted directories are listed in the startup summary as `Linked Git Directories`. This exposes exactly what a normal checkout already exposes through its own `.git` (hooks, config), nothing more.
+
 ### GPG commit signing:
 
 To sign commits inside the sandbox without exposing your private keys, forward the host `gpg-agent`:
@@ -144,6 +148,8 @@ Usually you do not pass `--profile` by hand: pin it per project in `.ai-agent-sa
 ./ai-agent-sandbox.sh -- --model claude-sonnet-4-5
 ```
 
+Claude Code runs with `--dangerously-skip-permissions` by default: the sandbox is the safety net, so the agent does not have to ask. If you pass a permission flag yourself (`--permission-mode <mode>`, `--dangerously-skip-permissions` or `--allow-dangerously-skip-permissions`), the default is not added and your choice applies. Orchestrators such as T3 Code rely on this to keep their supervised modes supervised.
+
 Native Claude Code updates are persistent across sandbox runs. The sandbox mounts Claude's version store read-write and uses a dedicated persistent launcher directory, rather than exposing every executable in `~/.local/bin` to writes.
 
 ```bash
@@ -183,6 +189,31 @@ export AI_AGENT_SANDBOX_PROFILE=work
 export AI_AGENT_SANDBOX_PROFILES_DIR=/path/to/profile-store
 ./ai-agent-sandbox.sh
 ```
+
+### Using with T3 Code and other orchestrators
+
+[T3 Code](https://github.com/pingdotgg/t3code) is a local control plane that drives the agent CLIs you already have installed: its server runs on your machine, owns git, worktrees and the integrated terminal, and starts Claude Code as a subprocess that talks to it over stdin/stdout. The sandbox fits in between: the T3 server keeps running on the host, and every agent it launches runs inside bubblewrap. No T3 changes are needed, only a wrapper that T3 uses as the Claude binary:
+
+```sh
+#!/bin/sh
+# ~/.local/bin/claude-sandboxed  (chmod +x; do not give it a .js/.ts extension, T3 would run those with node)
+exec /path/to/ai-agent-sandbox.sh --quiet -- "$@"
+```
+
+Then, in T3 Code:
+
+1. **Settings → Providers → your Claude instance → Binary path**: the wrapper, e.g. `~/.local/bin/claude-sandboxed`. T3 passes its own flags (`--permission-mode`, `--add-dir`, `--resume`, ...) after `--`; the sandbox leaves them untouched.
+2. Whitelist T3's attachments directory, which T3 hands to Claude with `--add-dir` for images pasted into a thread: add `~/.t3/userdata/attachments` to the `whitelist:` of your user-level `config.yaml` (use your `T3CODE_HOME` if you changed it).
+3. To run T3 threads under a sandbox [profile](#profiles), add the environment variable `AI_AGENT_SANDBOX_PROFILE=<name>` to the provider instance (**Settings → Providers → instance → Environment variables**) and set the instance's **CLAUDE_CONFIG_DIR path** to `~/.local/share/ai-agent-sandbox/profiles/<name>/home/.claude`, so that T3's host-side readers (thread history, usage limits) look at the same directory the sandbox mounts as `~/.claude`. The sandbox ignores `CLAUDE_CONFIG_DIR` itself and uses the profile.
+
+Good to know:
+
+- T3 creates worktrees under `~/.t3/worktrees/<repo>/<branch>`; the sandbox follows the worktree's `.git` link (see [Git worktrees](#git-worktrees)), so git keeps working for the agent.
+- T3 discards the agent's stderr, where the sandbox logs. While setting things up, append `2>>"$HOME/.local/state/ai-agent-sandbox/t3.log"` to the `exec` line and drop `--quiet` to see what the sandbox does. T3 also runs its periodic health probe and `--version` check through the wrapper (no API calls, the working directory may be `~/.t3/userdata`).
+- The project configuration in `.ai-agent-sandbox/` of the worktree applies as usual.
+- T3's own integrated terminal, git operations and project setup scripts run on the host, outside the sandbox, by design: they are driven by you, not by the model.
+- A stop from T3 (or any `SIGTERM` to the wrapper) terminates the sandbox immediately.
+- OpenCode 1 works the same way (`--agent opencode`, T3 runs `opencode serve` per thread in the project directory). OpenCode 2 runs one server for all directories, which a per-directory sandbox cannot confine. Codex is not supported by the sandbox yet.
 
 ## Configuration
 

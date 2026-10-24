@@ -154,6 +154,13 @@ PROFILES:
     created inside a profile are stored in that profile (--no-shared-skills disables).
     OpenCode gets ~/.config/opencode/skills, ~/.claude/skills and ~/.agents/skills.
 
+ORCHESTRATORS:
+    T3 Code and similar tools can use a two-line wrapper script as the agent
+    binary:  exec $0 --quiet -- "\$@"
+    The orchestrator stays on the host, the agents it launches run sandboxed.
+    Git worktrees are supported (the linked .git directory is mounted) and a
+    --permission-mode passed by the caller is respected.
+
 EXAMPLES:
     $0
     $0 --profile work
@@ -1537,9 +1544,50 @@ SIGTERM_SIGNAL=15
 SIGHUP_EXIT_STATUS=$((128 + SIGHUP_SIGNAL))
 SIGTERM_EXIT_STATUS=$((128 + SIGTERM_SIGNAL))
 
+# bwrap runs as a background job that the script waits for (see run_in_sandbox):
+# bash defers traps while a foreground child runs, so a SIGTERM from an
+# orchestrator (T3 Code, a supervisor) would otherwise be ignored until the agent
+# exits by itself. The signal is forwarded to bwrap, which terminates the
+# sandbox, then the EXIT trap cleans up.
+SANDBOX_PID=""
+
+# Usage: forward_signal_and_exit <signal> <exit-status>
+forward_signal_and_exit() {
+    if [[ -n "$SANDBOX_PID" ]]; then
+        kill -s "$1" "$SANDBOX_PID" 2>/dev/null || true
+    fi
+    exit "$2"
+}
+
 trap cleanup_sandbox EXIT
-trap 'exit "$SIGHUP_EXIT_STATUS"' HUP
-trap 'exit "$SIGTERM_EXIT_STATUS"' TERM
+trap 'forward_signal_and_exit HUP "$SIGHUP_EXIT_STATUS"' HUP
+trap 'forward_signal_and_exit TERM "$SIGTERM_EXIT_STATUS"' TERM
+# Ctrl+C belongs to the agent: a trapped (not ignored) signal keeps the default
+# disposition in the children, and bash just returns to waiting. bwrap itself
+# ignores SIGINT, so the sandbox survives it like a foreground child would.
+trap ':' INT
+
+# Usage: run_in_sandbox <command> [args...]; returns the command's exit status
+run_in_sandbox() {
+    local status=0
+    # Explicit stdin redirect: a background job in a non-interactive shell
+    # would otherwise read from /dev/null (agents driven over stdin need it).
+    # Job control stays off so bwrap remains in our process group, which
+    # orchestrators signal as a whole.
+    "$BWRAP_BIN" "${BWRAP_ARGS[@]}" -- "$@" <&0 &
+    SANDBOX_PID=$!
+    while :; do
+        status=0
+        wait "$SANDBOX_PID" || status=$?
+        # wait returns >128 when a trap interrupted it; keep waiting while bwrap lives
+        if (( status > 128 )) && kill -0 "$SANDBOX_PID" 2>/dev/null; then
+            continue
+        fi
+        break
+    done
+    SANDBOX_PID=""
+    return "$status"
+}
 
 # Strip inline comments and trim whitespace from a line
 # Usage: result=$(strip_inline_comment "$line")
@@ -2022,6 +2070,64 @@ protect_project_config_dir() {
     log_info "${GREEN}✓${NC} Mounted .ai-agent-sandbox/ read-only (sandbox configuration protected)"
 }
 
+# Git worktrees and submodule checkouts have a ".git" file instead of a
+# directory. It points at a gitdir inside the main repository, usually outside
+# the working directory (git worktree add ../x, T3 Code's ~/.t3/worktrees/...),
+# and a worktree gitdir in turn names the shared "commondir" that holds objects
+# and refs. Bind those directories read-write at their own paths, otherwise
+# every git command inside the sandbox fails. This exposes nothing a normal
+# checkout does not already expose through its own .git (hooks, config).
+GIT_LINKED_DIRS=()
+
+# Usage: resolve_git_link_path <base-dir> <path>; relative paths resolve against base-dir
+resolve_git_link_path() {
+    local target="$2"
+    [[ "$target" = /* ]] || target="$1/$target"
+    realpath -m -- "$target"
+}
+
+# Usage: path_is_within <path> <dir>
+path_is_within() {
+    [[ "$1" = "$2" || "$1" = "$2"/* ]]
+}
+
+mount_git_linked_dirs() {
+    local git_file="$WORKING_DIR/.git"
+    [[ -f "$git_file" ]] || return 0
+    local line gitdir common_dir dir
+    IFS= read -r line < "$git_file" || true
+    if [[ "$line" != gitdir:* ]]; then
+        log_info "${YELLOW}Warning: $git_file is not a gitdir link; git may not work inside the sandbox${NC}"
+        return 0
+    fi
+    gitdir=$(resolve_git_link_path "$WORKING_DIR" "$(trim_whitespace "${line#gitdir:}")")
+    if [[ ! -d "$gitdir" ]]; then
+        log_info "${YELLOW}Warning: gitdir $gitdir referenced by $git_file does not exist (skipping)${NC}"
+        return 0
+    fi
+    common_dir="$gitdir"
+    if [[ -f "$gitdir/commondir" ]]; then
+        IFS= read -r line < "$gitdir/commondir" || true
+        common_dir=$(resolve_git_link_path "$gitdir" "$(trim_whitespace "$line")")
+        if [[ ! -d "$common_dir" ]]; then
+            log_info "${YELLOW}Warning: git common dir $common_dir referenced by $gitdir/commondir does not exist (skipping)${NC}"
+            return 0
+        fi
+    fi
+    # A working directory inside its own repository's .git is left alone.
+    path_is_within "$WORKING_DIR" "$common_dir" && return 0
+    local -a dirs=("$common_dir")
+    # A worktree gitdir normally lives in <commondir>/worktrees/<name>; bind it
+    # separately only when it is elsewhere (no commondir means both are the same).
+    path_is_within "$gitdir" "$common_dir" || dirs+=("$gitdir")
+    for dir in "${dirs[@]}"; do
+        path_is_within "$dir" "$WORKING_DIR" && continue
+        BWRAP_ARGS+=(--bind "$dir" "$dir")
+        GIT_LINKED_DIRS+=("$dir")
+        log_info "${GREEN}✓${NC} Mounted linked git directory read-write: $dir"
+    done
+}
+
 # Bind Claude Code configuration and state from the active profile
 mount_claude_config() {
     prepare_profile_home
@@ -2336,6 +2442,7 @@ BLACKLIST_SEARCH_ROOTS+=("$WORKING_DIR")
 # Bind working directory (after tmpfs home, so it's visible)
 BWRAP_ARGS+=(--bind "$WORKING_DIR" "$WORKING_DIR")
 protect_project_config_dir
+mount_git_linked_dirs
 
 # Forward gpg-agent before whitelist processing: bwrap does not change the mode
 # of directories that already exist, and gpg requires /run/user/<uid> to be 0700
@@ -2605,6 +2712,25 @@ if [[ ${#ENV_VARS[@]} -gt 0 ]]; then
     done
 fi
 
+# --- Claude Code command line --------------------------------------------------
+#
+# The sandbox is the safety net, so Claude Code normally runs with
+# --dangerously-skip-permissions. An orchestrator such as T3 Code chooses the
+# permission mode itself (--permission-mode <mode>, plus
+# --dangerously-skip-permissions for its "Full access" mode); forcing the flag
+# would silently turn its supervised modes into full access.
+claude_should_add_skip_permissions() {
+    local arg
+    for arg in "${AGENT_ARGS[@]}"; do
+        case "$arg" in
+            --permission-mode|--permission-mode=*|--dangerously-skip-permissions|--allow-dangerously-skip-permissions)
+                return 1
+                ;;
+        esac
+    done
+    return 0
+}
+
 # --- OpenCode 1 command line ---------------------------------------------------
 
 opencode1_option_takes_value() {
@@ -2823,7 +2949,11 @@ build_opencode2_launch_args() {
 # Build the agent command line (sandbox defaults merged with user args)
 AGENT_LAUNCH_ARGS=()
 if [[ "$AGENT" = "claudecode" ]]; then
-    AGENT_LAUNCH_ARGS=(--dangerously-skip-permissions "${AGENT_ARGS[@]}")
+    if claude_should_add_skip_permissions; then
+        AGENT_LAUNCH_ARGS=(--dangerously-skip-permissions "${AGENT_ARGS[@]}")
+    else
+        AGENT_LAUNCH_ARGS=("${AGENT_ARGS[@]}")
+    fi
 elif [[ "$AGENT" = "opencode" ]]; then
     if [[ -n "$OPENCODE_MAJOR_VERSION" && "$OPENCODE_MAJOR_VERSION" -lt 2 ]]; then
         if opencode1_should_add_default_agent; then
@@ -2852,6 +2982,9 @@ else
     log_info "Profile: ${YELLOW}$PROFILE${NC} (from $PROFILE_SOURCE) -> $PROFILE_HOME"
 fi
 log_info "Working Directory: ${YELLOW}$WORKING_DIR${NC}"
+if [[ ${#GIT_LINKED_DIRS[@]} -gt 0 ]]; then
+    log_info "Linked Git Directories: ${YELLOW}${GIT_LINKED_DIRS[*]}${NC}"
+fi
 if [[ "$PROTECT_PROJECT_CONFIG" = true ]]; then
     log_info "Project Config Protection: ${YELLOW}enabled${NC} (.ai-agent-sandbox/ is read-only)"
 else
@@ -2890,9 +3023,9 @@ fi
 sandbox_status=0
 if [[ "$DRY_RUN" = true ]]; then
     log_info "${YELLOW}=== DRY RUN MODE: Starting bash shell in sandbox ===${NC}\n"
-    "$BWRAP_BIN" "${BWRAP_ARGS[@]}" -- /bin/bash || sandbox_status=$?
+    run_in_sandbox /bin/bash || sandbox_status=$?
 else
-    "$BWRAP_BIN" "${BWRAP_ARGS[@]}" -- "$AGENT_BIN" "${AGENT_LAUNCH_ARGS[@]}" || sandbox_status=$?
+    run_in_sandbox "$AGENT_BIN" "${AGENT_LAUNCH_ARGS[@]}" || sandbox_status=$?
 fi
 
 exit "$sandbox_status"
