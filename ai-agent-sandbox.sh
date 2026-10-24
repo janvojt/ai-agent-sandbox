@@ -1765,20 +1765,25 @@ prepare_isolated_network() {
 # unshare does when run through nsenter). The fd alone keeps the namespace
 # alive, the helper process is only needed until the fd is open.
 create_user_namespace() {
-    local out_ref="$1" parent_fd="${2:-}" holder reference fd i
+    local out_ref="$1" parent_fd="${2:-}" holder own parent current fd i
     local -a cmd=()
+    own=$(readlink /proc/self/ns/user)
+    parent="$own"
     if [[ -n "$parent_fd" ]]; then
         cmd=("$NSENTER_BIN" --preserve-credentials --user="/proc/self/fd/$parent_fd" --)
-        reference=$(readlink "/proc/self/fd/$parent_fd")
-    else
-        reference=$(readlink /proc/self/ns/user)
+        parent=$(readlink "/proc/self/fd/$parent_fd")
     fi
     "${cmd[@]}" "$UNSHARE_BIN" --user --map-user="$(id -u)" --map-group="$(id -g)" -- sleep 60 &
     holder=$!
-    # unshare execs sleep once the namespace exists and the maps are written
+    # The holder starts in our namespace, moves to the parent (nsenter) and
+    # ends up in the new one, where unshare writes both maps before it execs
+    # sleep. It must not be killed before that. procfs files report size 0,
+    # so the maps have to be read, not stat'ed.
     for ((i = 0; i < 100; i++)); do
-        if [[ "$(readlink "/proc/$holder/ns/user" 2>/dev/null)" != "$reference" ]] \
-            && [[ -s "/proc/$holder/gid_map" ]] 2>/dev/null; then
+        current=$(readlink "/proc/$holder/ns/user" 2>/dev/null)
+        if [[ -n "$current" && "$current" != "$own" && "$current" != "$parent" ]] \
+            && [[ -n "$(cat "/proc/$holder/uid_map" 2>/dev/null)" ]] \
+            && [[ -n "$(cat "/proc/$holder/gid_map" 2>/dev/null)" ]]; then
             break
         fi
         sleep 0.05
@@ -2003,11 +2008,14 @@ run_in_sandbox() {
         if [[ -z "$SANDBOX_CHILD_PID" ]] || ! setup_isolated_network; then
             [[ -n "$SANDBOX_CHILD_PID" ]] || echo -e "${RED}Error: bwrap did not report the sandbox pid${NC}" >&2
             # bwrap ignores SIGTERM while its child still waits on --block-fd,
-            # so the blocked child is killed directly and bwrap follows
+            # so the blocked child is killed directly and bwrap follows; when
+            # the pid was never reported the child is looked up as bwrap's child
+            [[ -n "$SANDBOX_CHILD_PID" ]] || SANDBOX_CHILD_PID=$(pgrep -P "$SANDBOX_PID" 2>/dev/null | head -n 1 || true)
             kill -s TERM "$SANDBOX_PID" 2>/dev/null || true
             if [[ -n "$SANDBOX_CHILD_PID" ]]; then
                 kill -s KILL "$SANDBOX_CHILD_PID" 2>/dev/null || true
             fi
+            SANDBOX_CHILD_PID=""
             wait "$SANDBOX_PID" 2>/dev/null || true
             SANDBOX_PID=""
             exec {NETWORK_INFO_FD}>&- {NETWORK_BLOCK_FD}>&- {SANDBOX_USERNS_FD}>&- {SANDBOX_USERNS2_FD}>&-
