@@ -21,6 +21,8 @@
 # Named agent profile. Each profile has its own login, settings and memory.
 # "default" is the host configuration. New profiles start empty: run /login
 # inside the sandbox once and the profile stays logged in.
+# In a project file, a different AI_AGENT_SANDBOX_PROFILE (e.g. set per provider
+# instance by T3 Code) is an error instead of an override; --profile still wins.
 profile: work
 
 # Agent to run: claudecode (default) or opencode

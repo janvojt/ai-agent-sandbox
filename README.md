@@ -174,7 +174,9 @@ AI_AGENT_SANDBOX_PROFILE=customer-x ./ai-agent-sandbox.sh
 - To seed a new profile from your host settings without the login, copy what you want by hand, for example `cp -a ~/.claude/settings.json ~/.local/share/ai-agent-sandbox/profiles/<name>/home/.claude/`. Skills do not need to be copied; a copy made earlier takes precedence over the host version until you delete it from the profile.
 - The profile store is hidden inside the sandbox even when a whitelist entry covers it (for example `~/.local/share`), so one profile can never read another profile's credentials.
 
-Usually you do not pass `--profile` by hand: pin it per project in `.ai-agent-sandbox/config.yaml` (see [Configuration file](#configuration-file-configyaml)).
+Usually you do not pass `--profile` by hand: pin it per project in `.ai-agent-sandbox/config.yaml`, or in the git-ignored `.ai-agent-sandbox/config.local.yaml` if the choice is personal (see [Configuration file](#configuration-file-configyaml)).
+
+A profile pinned in a project file is a requirement, not just a default: when `AI_AGENT_SANDBOX_PROFILE` names a *different* profile, the sandbox refuses to start instead of silently using it (the environment variable still wins over the project otherwise, so a repository cannot switch your credentials, only refuse the wrong ones). This catches a T3 thread started with the provider instance of the wrong account. `--profile` on the command line is a deliberate choice and overrides the project without an error.
 
 ### Pass arguments to the selected agent:
 ```bash
@@ -239,12 +241,15 @@ Then, in T3 Code:
    `--host-port 3773` keeps T3's MCP server (its tools for the agent) reachable from the isolated sandbox network; use the port of your T3 server if you changed it.
 2. Whitelist T3's attachments directory, which T3 hands to Claude with `--add-dir` for images pasted into a thread: add `~/.t3/userdata/attachments` to the `whitelist:` of your user-level `config.yaml` (use your `T3CODE_HOME` if you changed it).
 3. To run T3 threads under a sandbox [profile](#profiles), add the environment variable `AI_AGENT_SANDBOX_PROFILE=<name>` to the provider instance (**Settings → Providers → instance → Environment variables**) and set the instance's **CLAUDE_CONFIG_DIR path** to `~/.local/share/ai-agent-sandbox/profiles/<name>/home/.claude`, so that T3's host-side readers (thread history, usage limits) look at the same directory the sandbox mounts as `~/.claude`. The sandbox ignores `CLAUDE_CONFIG_DIR` itself and uses the profile.
+4. With one provider instance per profile (say, work and private subscriptions), make each project use the right one:
+   - In T3, set the project's default model to a model of the matching instance, so new threads start with it.
+   - In the sandbox, pin the profile in the project's `.ai-agent-sandbox/config.local.yaml` (`profile: work`). A thread started with the other instance then fails on its first message ("profile mismatch") instead of running on the wrong subscription; T3 only shows that the provider exited, the reason is in the log file mentioned below. The file is git-ignored and therefore not copied into T3's worktrees, so the sandbox reads it from the main checkout when the worktree has none (see [Git worktrees](#git-worktrees)).
 
 Good to know:
 
 - T3 creates worktrees under `~/.t3/worktrees/<repo>/<branch>`; the sandbox follows the worktree's `.git` link (see [Git worktrees](#git-worktrees)), so git keeps working for the agent.
 - T3 discards the agent's stderr, where the sandbox logs. While setting things up, append `2>>"$HOME/.local/state/ai-agent-sandbox/t3.log"` to the `exec` line and drop `--quiet` to see what the sandbox does. T3 also runs its periodic health probe and `--version` check through the wrapper (no API calls, the working directory may be `~/.t3/userdata`).
-- The project configuration in `.ai-agent-sandbox/` of the worktree applies as usual.
+- The project configuration in `.ai-agent-sandbox/` of the worktree applies as usual, plus the main checkout's `config.local.yaml` if the worktree has none.
 - T3's own integrated terminal, git operations and project setup scripts run on the host, outside the sandbox, by design: they are driven by you, not by the model.
 - A stop from T3 (or any `SIGTERM` to the wrapper) terminates the sandbox immediately.
 - OpenCode 1 works the same way (`--agent opencode`, T3 runs `opencode serve` per thread in the project directory). OpenCode 2 runs one server for all directories, which a per-directory sandbox cannot confine. Codex is not supported by the sandbox yet.
@@ -262,7 +267,7 @@ All configuration lives in YAML config files, which are processed in order:
 
 2. **Project-level files** (automatically included if they exist):
    - `.ai-agent-sandbox/config.yaml` (in working directory, commit to version control)
-   - `.ai-agent-sandbox/config.local.yaml` (in working directory, personal overrides, add to `.gitignore`)
+   - `.ai-agent-sandbox/config.local.yaml` (in working directory, personal overrides, add to `.gitignore`). In a [git worktree](#git-worktrees) without its own `config.local.yaml`, the main checkout's file is used, because git does not copy ignored files into new worktrees
    - **Never auto-generated** - create manually if needed
 
 3. **Command-line options**
@@ -328,7 +333,7 @@ See [`config-example.yaml`](config-example.yaml) for a commented example of ever
 | `agent_args` | list | arguments always passed to the agent, before anything given after `--` |
 | `protect_project_config` | bool | `--no-protect-project-config`; only honoured in the user-level file |
 
-**Precedence:** `~/.config/ai-agent-sandbox/config.yaml` < `~/.config/ai-agent-sandbox/config.local.yaml` < `.ai-agent-sandbox/config.yaml` < `.ai-agent-sandbox/config.local.yaml` < `AI_AGENT_SANDBOX_PROFILE` < command-line flags. Scalars from a later source override earlier ones; lists are merged. Relative paths are resolved against the working directory.
+**Precedence:** `~/.config/ai-agent-sandbox/config.yaml` < `~/.config/ai-agent-sandbox/config.local.yaml` < `.ai-agent-sandbox/config.yaml` < `.ai-agent-sandbox/config.local.yaml` < `AI_AGENT_SANDBOX_PROFILE` < command-line flags. Scalars from a later source override earlier ones; lists are merged. Relative paths are resolved against the working directory. Exception: a `profile` from a project file is not overridden by a different `AI_AGENT_SANDBOX_PROFILE`, that is an error (see [Profiles](#profiles)).
 
 **Supported YAML subset.** The file is parsed by the script itself, without `yq`, so only a flat subset of YAML is understood:
 - `key: value` scalars; quoted (`"..."` or `'...'`) or unquoted. Booleans accept `true/false`, `yes/no`, `on/off`; anything else is an error.
@@ -528,6 +533,8 @@ Add the required paths to the `whitelist:` list in your `config.yaml`. Common ad
 
 ### The sandbox uses the wrong Claude account
 Check the `Profile:` line in the startup summary; it shows the profile and where it came from (`.ai-agent-sandbox/config.yaml`, `config.local.yaml`, `AI_AGENT_SANDBOX_PROFILE` or `--profile`). Use `--profile default` to force the host configuration, or `--list-profiles` to see which profiles are logged in.
+
+`Error: profile mismatch` means the project pins a profile and `AI_AGENT_SANDBOX_PROFILE` names a different one; in T3 Code, start the thread with the provider instance of the project's profile. Pass `--profile <name>` to run under another profile on purpose.
 
 ### The agent needs to access a specific sensitive file
 If you genuinely need the agent to access a file that's blacklisted:

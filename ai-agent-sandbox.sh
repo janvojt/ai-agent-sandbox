@@ -23,6 +23,12 @@ DEFAULT_CONFIG_LOCAL_FILE="${AI_AGENT_SANDBOX_CONFIG_LOCAL:-$HOME/.config/ai-age
 PROJECT_CONFIG_DIR="$WORKING_DIR/.ai-agent-sandbox"
 PROJECT_CONFIG_FILE="$PROJECT_CONFIG_DIR/config.yaml"
 PROJECT_CONFIG_LOCAL_FILE="$PROJECT_CONFIG_DIR/config.local.yaml"
+# config.local.yaml of the main checkout, used by a git worktree without its own
+MAIN_CHECKOUT_CONFIG_LOCAL_FILE=""
+# Profile requested by the project-level config files (checked against
+# AI_AGENT_SANDBOX_PROFILE, see check_project_profile)
+PROJECT_PROFILE=""
+PROJECT_PROFILE_SOURCE=""
 CONFIG_FILES_LOADED=()
 CONFIG_LOG_MESSAGES=()
 CONFIG_AGENT_ARGS=()
@@ -161,10 +167,13 @@ CONFIGURATION FILES (automatically included if they exist):
        - $DEFAULT_CONFIG_LOCAL_FILE
     2. Project-level (if present):
        - .ai-agent-sandbox/config.yaml (in working directory)
-       - .ai-agent-sandbox/config.local.yaml (in working directory, personal overrides)
+       - .ai-agent-sandbox/config.local.yaml (in working directory, personal overrides;
+         in a git worktree without one, the main checkout's file is used)
     Precedence: user config < user local config < project config
                 < project local config < AI_AGENT_SANDBOX_PROFILE
                 < command-line options
+    A profile set in a project file is not overridden by AI_AGENT_SANDBOX_PROFILE:
+    a different value there is an error (--profile still overrides).
 
 DEPRECATED LEGACY FILES:
     whitelist.txt, blacklist.txt, .env and .env.local next to the config files
@@ -415,6 +424,10 @@ apply_config_scalar() {
                 PROFILE="$value"
                 PROFILE_SOURCE="$file"
             fi
+            if is_project_config_file "$file"; then
+                PROJECT_PROFILE="$PROFILE"
+                PROJECT_PROFILE_SOURCE="$PROFILE_SOURCE"
+            fi
             ;;
         agent)
             [[ "$is_null" = true ]] || AGENT="$value"
@@ -445,7 +458,7 @@ apply_config_scalar() {
                 protect_project_config)
                     # The project itself must not be able to switch off the
                     # protection of its own sandbox configuration
-                    if [[ "$file" == "$PROJECT_CONFIG_DIR/"* ]]; then
+                    if is_project_config_file "$file"; then
                         config_warn "Ignoring '$key' in $file (only allowed in user-level config files or on the command line)"
                     else
                         PROTECT_PROJECT_CONFIG="$bool"
@@ -648,10 +661,17 @@ parse_config_file() {
     fi
 }
 
+# Project-level files are controlled by the repository (or, for the main
+# checkout's config.local.yaml, by whoever works in it)
+is_project_config_file() {
+    [[ "$1" == "$PROJECT_CONFIG_DIR/"* || ( -n "$MAIN_CHECKOUT_CONFIG_LOCAL_FILE" && "$1" == "$MAIN_CHECKOUT_CONFIG_LOCAL_FILE" ) ]]
+}
+
 load_config_files() {
     local file
     for file in "$DEFAULT_CONFIG_FILE" "$DEFAULT_CONFIG_LOCAL_FILE" \
-        "$PROJECT_CONFIG_FILE" "$PROJECT_CONFIG_LOCAL_FILE"; do
+        "$PROJECT_CONFIG_FILE" "$MAIN_CHECKOUT_CONFIG_LOCAL_FILE" "$PROJECT_CONFIG_LOCAL_FILE"; do
+        [[ -n "$file" ]] || continue
         [[ -f "$file" ]] || continue
         CONFIG_FILES_LOADED+=("$file")
         parse_config_file "$file"
@@ -781,6 +801,103 @@ overlay_shared_profile_dir() {
     log_info "${GREEN}✓${NC} Mounted ~/$rel (host skills shared, profile skills on top)"
 }
 
+# --- Git worktrees ------------------------------------------------------------
+#
+# Git worktrees and submodule checkouts have a ".git" file instead of a
+# directory. It points at a gitdir inside the main repository, usually outside
+# the working directory (git worktree add ../x, T3 Code's ~/.t3/worktrees/...),
+# and a worktree gitdir in turn names the shared "commondir" that holds objects
+# and refs. mount_git_linked_dirs binds that directory read-write at its own
+# path, otherwise every git command inside the sandbox fails. This exposes
+# nothing a normal checkout does not already expose through its own .git
+# (hooks, config). The main checkout's config.local.yaml is loaded as well when
+# the worktree has none (git-ignored files are not copied into a worktree).
+# Only verified worktree layouts are followed, see resolve_git_worktree.
+GIT_LINKED_DIRS=()
+GIT_WORKTREE_COMMON_DIR=""
+GIT_WORKTREE_WARNINGS=()
+
+# Usage: resolve_git_link_path <base-dir> <path>; relative paths resolve against base-dir
+resolve_git_link_path() {
+    local target="$2"
+    [[ "$target" = /* ]] || target="$1/$target"
+    realpath -m -- "$target"
+}
+
+# Usage: path_is_within <path> <dir>
+path_is_within() {
+    [[ "$1" = "$2" || "$1" = "$2"/* ]]
+}
+
+# Sets GIT_WORKTREE_COMMON_DIR when $WORKING_DIR is a verified worktree;
+# otherwise collects the reason in GIT_WORKTREE_WARNINGS (logged later by
+# mount_git_linked_dirs, once --quiet is known).
+resolve_git_worktree() {
+    local git_file="$WORKING_DIR/.git"
+    [[ -f "$git_file" ]] || return 0
+    # The .git file is writable by the agent, so nothing read from it (or from a
+    # directory it names) may decide what gets mounted on its own. The link is
+    # followed only when the target has the layout git writes for a worktree of
+    # THIS working tree: <common>/worktrees/<name> whose gitdir back-link points
+    # at $WORKING_DIR/.git. An agent cannot forge that back-link in a directory
+    # it has no access to. The common dir is derived from the path, never from
+    # the editable commondir file.
+    local line gitdir common_dir back_link
+    IFS= read -r line < "$git_file" || true
+    if [[ "$line" != gitdir:* ]]; then
+        GIT_WORKTREE_WARNINGS+=("Warning: $git_file is not a gitdir link; git may not work inside the sandbox")
+        return 0
+    fi
+    gitdir=$(resolve_git_link_path "$WORKING_DIR" "$(trim_whitespace "${line#gitdir:}")")
+    if [[ ! -d "$gitdir" ]]; then
+        GIT_WORKTREE_WARNINGS+=("Warning: gitdir $gitdir referenced by $git_file does not exist; not following the .git link")
+        return 0
+    fi
+    if [[ "$(basename "$(dirname "$gitdir")")" != worktrees ]]; then
+        GIT_WORKTREE_WARNINGS+=("Warning: $gitdir is not a git worktree directory (<repo>/.git/worktrees/<name>); not following the .git link."
+            "         Separate git dirs and submodules are not followed automatically; add the git dir with --whitelist-path-rw or the whitelist: key of your user config instead")
+        return 0
+    fi
+    common_dir=$(dirname "$(dirname "$gitdir")")
+    if [[ ! -f "$gitdir/gitdir" ]]; then
+        GIT_WORKTREE_WARNINGS+=("Warning: $gitdir/gitdir is missing; not following the .git link (run 'git worktree repair')")
+        return 0
+    fi
+    IFS= read -r line < "$gitdir/gitdir" || true
+    back_link=$(resolve_git_link_path "$gitdir" "$(trim_whitespace "$line")")
+    if [[ "$back_link" != "$(realpath -m -- "$git_file")" ]]; then
+        GIT_WORKTREE_WARNINGS+=("Warning: $gitdir belongs to the worktree $back_link, not to $git_file; not following the .git link (run 'git worktree repair' if the worktree was moved)")
+        return 0
+    fi
+    if [[ ! -f "$gitdir/commondir" ]]; then
+        GIT_WORKTREE_WARNINGS+=("Warning: $gitdir/commondir is missing; not following the .git link")
+        return 0
+    fi
+    IFS= read -r line < "$gitdir/commondir" || true
+    if [[ "$(resolve_git_link_path "$gitdir" "$(trim_whitespace "$line")")" != "$common_dir" ]]; then
+        GIT_WORKTREE_WARNINGS+=("Warning: $gitdir/commondir does not point at $common_dir; not following the .git link")
+        return 0
+    fi
+    if [[ ! -f "$common_dir/HEAD" || ! -d "$common_dir/objects" ]]; then
+        GIT_WORKTREE_WARNINGS+=("Warning: $common_dir is not a git directory; not following the .git link")
+        return 0
+    fi
+    GIT_WORKTREE_COMMON_DIR="$common_dir"
+
+    # The main checkout of a non-bare repository is the parent of its .git
+    # directory. The agent in this worktree cannot write there (only the git
+    # directory itself is mounted), so its personal config.local.yaml is as
+    # trustworthy as the worktree's own would be.
+    local main_checkout
+    [[ "$(basename "$common_dir")" == .git ]] || return 0
+    main_checkout=$(dirname "$common_dir")
+    [[ "$main_checkout" != "$WORKING_DIR" ]] || return 0
+    if [[ ! -f "$PROJECT_CONFIG_LOCAL_FILE" && -f "$main_checkout/.ai-agent-sandbox/config.local.yaml" ]]; then
+        MAIN_CHECKOUT_CONFIG_LOCAL_FILE="$main_checkout/.ai-agent-sandbox/config.local.yaml"
+    fi
+}
+
+resolve_git_worktree
 load_config_files
 
 # The environment variable beats config files on purpose: a repository must not
@@ -789,6 +906,20 @@ if [[ -n "${AI_AGENT_SANDBOX_PROFILE:-}" ]]; then
     PROFILE="$AI_AGENT_SANDBOX_PROFILE"
     PROFILE_SOURCE="AI_AGENT_SANDBOX_PROFILE"
 fi
+
+# A project that names a profile may not switch the profile, but it may refuse
+# to run under a different one coming from the environment. Orchestrators such
+# as T3 Code set AI_AGENT_SANDBOX_PROFILE per provider instance, so picking the
+# wrong instance in a new thread would otherwise bill the wrong subscription.
+# An explicit --profile on the command line is a deliberate choice and wins.
+check_project_profile() {
+    [[ "$PROFILE_SOURCE" == AI_AGENT_SANDBOX_PROFILE ]] || return 0
+    [[ -n "$PROJECT_PROFILE" && "$PROJECT_PROFILE" != "$PROFILE" ]] || return 0
+    echo -e "${RED}Error: profile mismatch: $PROJECT_PROFILE_SOURCE requires profile '$PROJECT_PROFILE', but AI_AGENT_SANDBOX_PROFILE is '$PROFILE'${NC}" >&2
+    echo "In an orchestrator such as T3 Code, start the thread with the provider instance of profile '$PROJECT_PROFILE'." >&2
+    echo "To run under '$PROFILE' anyway, pass --profile $PROFILE." >&2
+    exit 1
+}
 
 if [[ -n "${AI_AGENT_SANDBOX_NETWORK:-}" ]]; then
     validate_network_mode "$AI_AGENT_SANDBOX_NETWORK" || { echo -e "${RED}Error: invalid AI_AGENT_SANDBOX_NETWORK '$AI_AGENT_SANDBOX_NETWORK' (expected isolated, host or none)${NC}" >&2; exit 1; }
@@ -1263,7 +1394,7 @@ if [[ -f "$DEFAULT_CONFIG_FILE" || -f "$DEFAULT_CONFIG_LOCAL_FILE" ]]; then
     USER_HAS_YAML=true
 fi
 PROJECT_HAS_YAML=false
-if [[ -f "$PROJECT_CONFIG_FILE" || -f "$PROJECT_CONFIG_LOCAL_FILE" ]]; then
+if [[ -f "$PROJECT_CONFIG_FILE" || -f "$PROJECT_CONFIG_LOCAL_FILE" || -n "$MAIN_CHECKOUT_CONFIG_LOCAL_FILE" ]]; then
     PROJECT_HAS_YAML=true
 fi
 
@@ -1320,6 +1451,7 @@ if [[ -z "$PROFILE" ]]; then
     PROFILE="default"
     PROFILE_SOURCE="default"
 fi
+check_project_profile
 validate_profile_name
 resolve_profile_home
 
@@ -2518,85 +2650,21 @@ protect_project_config_dir() {
     log_info "${GREEN}✓${NC} Mounted .ai-agent-sandbox/ read-only (sandbox configuration protected)"
 }
 
-# Git worktrees and submodule checkouts have a ".git" file instead of a
-# directory. It points at a gitdir inside the main repository, usually outside
-# the working directory (git worktree add ../x, T3 Code's ~/.t3/worktrees/...),
-# and a worktree gitdir in turn names the shared "commondir" that holds objects
-# and refs. Bind those directories read-write at their own paths, otherwise
-# every git command inside the sandbox fails. This exposes nothing a normal
-# checkout does not already expose through its own .git (hooks, config).
-# Only verified worktree layouts are followed, see mount_git_linked_dirs.
-GIT_LINKED_DIRS=()
-
-# Usage: resolve_git_link_path <base-dir> <path>; relative paths resolve against base-dir
-resolve_git_link_path() {
-    local target="$2"
-    [[ "$target" = /* ]] || target="$1/$target"
-    realpath -m -- "$target"
-}
-
-# Usage: path_is_within <path> <dir>
-path_is_within() {
-    [[ "$1" = "$2" || "$1" = "$2"/* ]]
-}
-
+# Mount the main repository's git directory into a verified git worktree, see
+# resolve_git_worktree (run before the config files are loaded)
 mount_git_linked_dirs() {
-    local git_file="$WORKING_DIR/.git"
-    [[ -f "$git_file" ]] || return 0
-    # The .git file is writable by the agent, so nothing read from it (or from a
-    # directory it names) may decide what gets mounted on its own. The link is
-    # followed only when the target has the layout git writes for a worktree of
-    # THIS working tree: <common>/worktrees/<name> whose gitdir back-link points
-    # at $WORKING_DIR/.git. An agent cannot forge that back-link in a directory
-    # it has no access to. The common dir is derived from the path, never from
-    # the editable commondir file.
-    local line gitdir common_dir back_link
-    IFS= read -r line < "$git_file" || true
-    if [[ "$line" != gitdir:* ]]; then
-        log_info "${YELLOW}Warning: $git_file is not a gitdir link; git may not work inside the sandbox${NC}"
-        return 0
-    fi
-    gitdir=$(resolve_git_link_path "$WORKING_DIR" "$(trim_whitespace "${line#gitdir:}")")
-    if [[ ! -d "$gitdir" ]]; then
-        log_info "${YELLOW}Warning: gitdir $gitdir referenced by $git_file does not exist; not following the .git link${NC}"
-        return 0
-    fi
-    if [[ "$(basename "$(dirname "$gitdir")")" != worktrees ]]; then
-        log_info "${YELLOW}Warning: $gitdir is not a git worktree directory (<repo>/.git/worktrees/<name>); not following the .git link.${NC}"
-        log_info "${YELLOW}         Separate git dirs and submodules are not followed automatically; add the git dir with --whitelist-path-rw or the whitelist: key of your user config instead${NC}"
-        return 0
-    fi
-    common_dir=$(dirname "$(dirname "$gitdir")")
-    if [[ ! -f "$gitdir/gitdir" ]]; then
-        log_info "${YELLOW}Warning: $gitdir/gitdir is missing; not following the .git link (run 'git worktree repair')${NC}"
-        return 0
-    fi
-    IFS= read -r line < "$gitdir/gitdir" || true
-    back_link=$(resolve_git_link_path "$gitdir" "$(trim_whitespace "$line")")
-    if [[ "$back_link" != "$(realpath -m -- "$git_file")" ]]; then
-        log_info "${YELLOW}Warning: $gitdir belongs to the worktree $back_link, not to $git_file; not following the .git link (run 'git worktree repair' if the worktree was moved)${NC}"
-        return 0
-    fi
-    if [[ ! -f "$gitdir/commondir" ]]; then
-        log_info "${YELLOW}Warning: $gitdir/commondir is missing; not following the .git link${NC}"
-        return 0
-    fi
-    IFS= read -r line < "$gitdir/commondir" || true
-    if [[ "$(resolve_git_link_path "$gitdir" "$(trim_whitespace "$line")")" != "$common_dir" ]]; then
-        log_info "${YELLOW}Warning: $gitdir/commondir does not point at $common_dir; not following the .git link${NC}"
-        return 0
-    fi
-    if [[ ! -f "$common_dir/HEAD" || ! -d "$common_dir/objects" ]]; then
-        log_info "${YELLOW}Warning: $common_dir is not a git directory; not following the .git link${NC}"
-        return 0
-    fi
+    local warning
+    for warning in "${GIT_WORKTREE_WARNINGS[@]}"; do
+        log_info "${YELLOW}$warning${NC}"
+    done
+    [[ -n "$GIT_WORKTREE_COMMON_DIR" ]] || return 0
     # A working directory inside its own repository's .git is left alone, and a
     # common dir inside the working directory is already mounted.
-    path_is_within "$WORKING_DIR" "$common_dir" && return 0
-    path_is_within "$common_dir" "$WORKING_DIR" && return 0
-    BWRAP_ARGS+=(--bind "$common_dir" "$common_dir")
-    GIT_LINKED_DIRS+=("$common_dir")
-    log_info "${GREEN}✓${NC} Mounted linked git directory read-write: $common_dir"
+    path_is_within "$WORKING_DIR" "$GIT_WORKTREE_COMMON_DIR" && return 0
+    path_is_within "$GIT_WORKTREE_COMMON_DIR" "$WORKING_DIR" && return 0
+    BWRAP_ARGS+=(--bind "$GIT_WORKTREE_COMMON_DIR" "$GIT_WORKTREE_COMMON_DIR")
+    GIT_LINKED_DIRS+=("$GIT_WORKTREE_COMMON_DIR")
+    log_info "${GREEN}✓${NC} Mounted linked git directory read-write: $GIT_WORKTREE_COMMON_DIR"
 }
 
 # Bind Claude Code configuration and state from the active profile
