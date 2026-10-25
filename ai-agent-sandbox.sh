@@ -81,12 +81,14 @@ UNSHARE_BIN=""
 SANDBOX_USERNS_FD=""
 SANDBOX_USERNS2_FD=""
 IP_BIN=""
-# Addressing of the isolated namespace: a /30 of link-local space nobody routes,
+# Addressing of the isolated namespace: a /24 of link-local space nobody routes,
 # so the namespace never sits on one of the blocked subnets (the host's own IPv4
 # subnet included). pasta proxies connections through host sockets, so the
-# address inside is never visible to peers.
+# address inside is never visible to peers. The DNS address must be a plain
+# host address of the subnet: in a /30 it would be the broadcast address and
+# every query would fail with EACCES ("permission denied").
 NETWORK_IFNAME="sandbox0"
-NETWORK_NS_ADDR4="169.254.2.1/30"
+NETWORK_NS_ADDR4="169.254.2.1/24"
 NETWORK_GW4="169.254.2.2"
 NETWORK_DNS4="169.254.2.3"
 # The IPv6 DNS address is in the documentation prefix (never routed), so it
@@ -2021,6 +2023,15 @@ setup_isolated_network() {
     if ! "$PASTA_BIN" "${pasta_args[@]}"; then
         echo -e "${RED}Error: pasta could not set up the sandbox network${NC}" >&2
         return 1
+    fi
+
+    # pasta sets ping_group_range to "0 2147483647" in the namespace so ping can
+    # use ICMP datagram sockets, but a group id must be mapped in the user
+    # namespace to be accepted and ours maps only our own gid: set that one.
+    # Without it ping fails with "Operation not permitted" (CAP_NET_RAW is
+    # dropped in the sandbox) although TCP/UDP work.
+    if ! ns_exec sh -c 'echo "$1 $1" > /proc/sys/net/ipv4/ping_group_range' sh "$(id -g)" 2>/dev/null; then
+        echo -e "${YELLOW}⚠ Could not enable ICMP sockets in the sandbox network; ping will not work${NC}" >&2
     fi
 
     # Blocked ranges: the private ranges plus every subnet the host is on

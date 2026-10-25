@@ -95,7 +95,8 @@ By default the sandbox runs in its own network namespace. [pasta](https://passt.
 - the host's loopback is **not** reachable: a database, Docker port or control plane listening on `localhost` on the host is invisible unless you forward it;
 - private networks are **blocked**: `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `100.64/10`, `fc00::/7`, `fe80::/10` and every subnet the host itself is attached to (also when it has public addresses);
 - ports the agent binds inside (dev servers, test fixtures) are published on the host as before, so your browser still reaches `localhost:3000`;
-- Unix sockets (Docker proxy, GPG agent) are unaffected.
+- Unix sockets (Docker proxy, GPG agent) are unaffected;
+- `ping` works for internet hosts (ICMP echo is relayed by pasta); the sandbox has no `CAP_NET_RAW`, so `traceroute`, raw sockets and other ICMP types do not.
 
 ```bash
 # T3 Code's MCP server, a database published by Docker: reachable at localhost inside
