@@ -176,8 +176,8 @@ CONFIGURATION FILES (automatically included if they exist):
                 < command-line options
     A profile set in a project file is not overridden by AI_AGENT_SANDBOX_PROFILE:
     a different value there is an error (--profile still overrides). When launched
-    through the Claude Agent SDK (e.g. by T3 Code), a missing AI_AGENT_SANDBOX_PROFILE
-    counts as 'default' for this check.
+    by an orchestrator such as T3 Code (Claude Agent SDK, or 'opencode serve'), a
+    missing AI_AGENT_SANDBOX_PROFILE counts as 'default' for this check.
 
 DEPRECATED LEGACY FILES:
     whitelist.txt, blacklist.txt, .env and .env.local next to the config files
@@ -911,10 +911,16 @@ if [[ -n "${AI_AGENT_SANDBOX_PROFILE:-}" ]]; then
     PROFILE_SOURCE="AI_AGENT_SANDBOX_PROFILE"
 fi
 
-# Started by an orchestrator through the Claude Agent SDK (T3 Code and others),
-# which sets these variables for the Claude Code process it spawns
-launched_by_agent_sdk() {
-    [[ -n "${CLAUDE_AGENT_SDK_VERSION:-}" || "${CLAUDE_CODE_ENTRYPOINT:-}" == sdk-* ]]
+# Started by an orchestrator rather than from a terminal. Claude Code: the
+# Claude Agent SDK (T3 Code and others) sets these variables for the process it
+# spawns. OpenCode: orchestrators run it as a headless server, so the first
+# argument they pass is "serve" (T3 Code: serve --hostname=... --port=...).
+launched_by_orchestrator() {
+    if [[ "$AGENT" == opencode ]]; then
+        [[ "${AGENT_ARGS[${#CONFIG_AGENT_ARGS[@]}]:-}" == serve ]]
+    else
+        [[ -n "${CLAUDE_AGENT_SDK_VERSION:-}" || "${CLAUDE_CODE_ENTRYPOINT:-}" == sdk-* ]]
+    fi
 }
 
 # A project that names a profile may not switch the profile, but it may refuse
@@ -922,8 +928,9 @@ launched_by_agent_sdk() {
 # as T3 Code set AI_AGENT_SANDBOX_PROFILE per provider instance, so picking the
 # wrong instance in a new thread would otherwise bill the wrong subscription.
 # An instance without the variable uses the host configuration (T3 reads its
-# transcripts from ~/.claude), so for SDK launches a missing variable counts as
-# "default". In a terminal the project's profile simply applies. An explicit
+# transcripts and usage from there), so for orchestrated launches a missing
+# variable counts as "default". In a terminal the project's profile simply
+# applies. An explicit
 # --profile on the command line is a deliberate choice and wins.
 check_project_profile() {
     [[ -n "$PROJECT_PROFILE" ]] || return 0
@@ -931,7 +938,7 @@ check_project_profile() {
     if [[ "$PROFILE_SOURCE" == AI_AGENT_SANDBOX_PROFILE ]]; then
         requested="$PROFILE"
         origin="AI_AGENT_SANDBOX_PROFILE is '$requested'"
-    elif [[ "$PROFILE_SOURCE" != --profile ]] && launched_by_agent_sdk; then
+    elif [[ "$PROFILE_SOURCE" != --profile ]] && launched_by_orchestrator; then
         requested="default"
         origin="the orchestrator's provider instance sets no AI_AGENT_SANDBOX_PROFILE (counts as 'default')"
     else
