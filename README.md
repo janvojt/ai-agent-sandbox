@@ -176,7 +176,7 @@ AI_AGENT_SANDBOX_PROFILE=customer-x ./ai-agent-sandbox.sh
 
 Usually you do not pass `--profile` by hand: pin it per project in `.ai-agent-sandbox/config.yaml`, or in the git-ignored `.ai-agent-sandbox/config.local.yaml` if the choice is personal (see [Configuration file](#configuration-file-configyaml)).
 
-A profile pinned in a project file is a requirement, not just a default: when `AI_AGENT_SANDBOX_PROFILE` names a *different* profile, the sandbox refuses to start instead of silently using it (the environment variable still wins over the project otherwise, so a repository cannot switch your credentials, only refuse the wrong ones). This catches a T3 thread started with the provider instance of the wrong account. `--profile` on the command line is a deliberate choice and overrides the project without an error.
+A profile pinned in a project file is a requirement, not just a default: when `AI_AGENT_SANDBOX_PROFILE` names a *different* profile, the sandbox refuses to start instead of silently using it (the environment variable still wins over the project otherwise, so a repository cannot switch your credentials, only refuse the wrong ones). This catches a T3 thread started with the provider instance of the wrong account. When the sandbox is launched through the Claude Agent SDK (T3 Code and other orchestrators), a provider instance without `AI_AGENT_SANDBOX_PROFILE` counts as `default`, because such an instance uses your host configuration: a project pinned to `work` therefore also refuses the instance without a profile. In a terminal, a missing variable just means the project's profile applies. `--profile` on the command line is a deliberate choice and overrides the project without an error.
 
 ### Pass arguments to the selected agent:
 ```bash
@@ -243,7 +243,7 @@ Then, in T3 Code:
 3. To run T3 threads under a sandbox [profile](#profiles), add the environment variable `AI_AGENT_SANDBOX_PROFILE=<name>` to the provider instance (**Settings → Providers → instance → Environment variables**) and set the instance's **CLAUDE_CONFIG_DIR path** to `~/.local/share/ai-agent-sandbox/profiles/<name>/home/.claude`, so that T3's host-side readers (thread history, usage limits) look at the same directory the sandbox mounts as `~/.claude`. The sandbox ignores `CLAUDE_CONFIG_DIR` itself and uses the profile.
 4. With one provider instance per profile (say, work and private subscriptions), make each project use the right one:
    - In T3, set the project's default model to a model of the matching instance, so new threads start with it.
-   - In the sandbox, pin the profile in the project's `.ai-agent-sandbox/config.local.yaml` (`profile: work`). A thread started with the other instance then fails on its first message ("profile mismatch") instead of running on the wrong subscription; T3 only shows that the provider exited, the reason is in the log file mentioned below. The file is git-ignored and therefore not copied into T3's worktrees, so the sandbox reads it from the main checkout when the worktree has none (see [Git worktrees](#git-worktrees)).
+   - In the sandbox, pin the profile in the project's `.ai-agent-sandbox/config.local.yaml` (`profile: work`, or `profile: default` for projects that use the instance without `AI_AGENT_SANDBOX_PROFILE`, i.e. your host configuration). A thread started with the other instance then fails on its first message ("profile mismatch") instead of running on the wrong subscription; T3 only shows that the provider exited, the reason is in the log file mentioned below. The file is git-ignored and therefore not copied into T3's worktrees, so the sandbox reads it from the main checkout when the worktree has none (see [Git worktrees](#git-worktrees)).
 
 Good to know:
 
@@ -534,7 +534,7 @@ Add the required paths to the `whitelist:` list in your `config.yaml`. Common ad
 ### The sandbox uses the wrong Claude account
 Check the `Profile:` line in the startup summary; it shows the profile and where it came from (`.ai-agent-sandbox/config.yaml`, `config.local.yaml`, `AI_AGENT_SANDBOX_PROFILE` or `--profile`). Use `--profile default` to force the host configuration, or `--list-profiles` to see which profiles are logged in.
 
-`Error: profile mismatch` means the project pins a profile and `AI_AGENT_SANDBOX_PROFILE` names a different one; in T3 Code, start the thread with the provider instance of the project's profile. Pass `--profile <name>` to run under another profile on purpose.
+`Error: profile mismatch` means the project pins a profile and `AI_AGENT_SANDBOX_PROFILE` names a different one (under T3 Code, a provider instance without the variable counts as `default`); in T3 Code, start the thread with the provider instance of the project's profile. Pass `--profile <name>` to run under another profile on purpose.
 
 ### The agent needs to access a specific sensitive file
 If you genuinely need the agent to access a file that's blacklisted:

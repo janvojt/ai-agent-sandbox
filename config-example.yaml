@@ -23,6 +23,8 @@
 # inside the sandbox once and the profile stays logged in.
 # In a project file, a different AI_AGENT_SANDBOX_PROFILE (e.g. set per provider
 # instance by T3 Code) is an error instead of an override; --profile still wins.
+# Under T3 Code (any Claude Agent SDK launch) a provider instance without
+# AI_AGENT_SANDBOX_PROFILE counts as "default".
 profile: work
 
 # Agent to run: claudecode (default) or opencode

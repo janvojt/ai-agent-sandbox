@@ -173,7 +173,9 @@ CONFIGURATION FILES (automatically included if they exist):
                 < project local config < AI_AGENT_SANDBOX_PROFILE
                 < command-line options
     A profile set in a project file is not overridden by AI_AGENT_SANDBOX_PROFILE:
-    a different value there is an error (--profile still overrides).
+    a different value there is an error (--profile still overrides). When launched
+    through the Claude Agent SDK (e.g. by T3 Code), a missing AI_AGENT_SANDBOX_PROFILE
+    counts as 'default' for this check.
 
 DEPRECATED LEGACY FILES:
     whitelist.txt, blacklist.txt, .env and .env.local next to the config files
@@ -907,17 +909,36 @@ if [[ -n "${AI_AGENT_SANDBOX_PROFILE:-}" ]]; then
     PROFILE_SOURCE="AI_AGENT_SANDBOX_PROFILE"
 fi
 
+# Started by an orchestrator through the Claude Agent SDK (T3 Code and others),
+# which sets these variables for the Claude Code process it spawns
+launched_by_agent_sdk() {
+    [[ -n "${CLAUDE_AGENT_SDK_VERSION:-}" || "${CLAUDE_CODE_ENTRYPOINT:-}" == sdk-* ]]
+}
+
 # A project that names a profile may not switch the profile, but it may refuse
 # to run under a different one coming from the environment. Orchestrators such
 # as T3 Code set AI_AGENT_SANDBOX_PROFILE per provider instance, so picking the
 # wrong instance in a new thread would otherwise bill the wrong subscription.
-# An explicit --profile on the command line is a deliberate choice and wins.
+# An instance without the variable uses the host configuration (T3 reads its
+# transcripts from ~/.claude), so for SDK launches a missing variable counts as
+# "default". In a terminal the project's profile simply applies. An explicit
+# --profile on the command line is a deliberate choice and wins.
 check_project_profile() {
-    [[ "$PROFILE_SOURCE" == AI_AGENT_SANDBOX_PROFILE ]] || return 0
-    [[ -n "$PROJECT_PROFILE" && "$PROJECT_PROFILE" != "$PROFILE" ]] || return 0
-    echo -e "${RED}Error: profile mismatch: $PROJECT_PROFILE_SOURCE requires profile '$PROJECT_PROFILE', but AI_AGENT_SANDBOX_PROFILE is '$PROFILE'${NC}" >&2
+    [[ -n "$PROJECT_PROFILE" ]] || return 0
+    local requested origin
+    if [[ "$PROFILE_SOURCE" == AI_AGENT_SANDBOX_PROFILE ]]; then
+        requested="$PROFILE"
+        origin="AI_AGENT_SANDBOX_PROFILE is '$requested'"
+    elif [[ "$PROFILE_SOURCE" != --profile ]] && launched_by_agent_sdk; then
+        requested="default"
+        origin="the orchestrator's provider instance sets no AI_AGENT_SANDBOX_PROFILE (counts as 'default')"
+    else
+        return 0
+    fi
+    [[ "$PROJECT_PROFILE" != "$requested" ]] || return 0
+    echo -e "${RED}Error: profile mismatch: $PROJECT_PROFILE_SOURCE requires profile '$PROJECT_PROFILE', but $origin${NC}" >&2
     echo "In an orchestrator such as T3 Code, start the thread with the provider instance of profile '$PROJECT_PROFILE'." >&2
-    echo "To run under '$PROFILE' anyway, pass --profile $PROFILE." >&2
+    echo "To run under '$requested' anyway, pass --profile $requested." >&2
     exit 1
 }
 
