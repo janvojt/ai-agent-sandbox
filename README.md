@@ -177,7 +177,7 @@ AI_AGENT_SANDBOX_PROFILE=customer-x ./ai-agent-sandbox.sh
 
 Usually you do not pass `--profile` by hand: pin it per project in `.ai-agent-sandbox/config.yaml`, or in the git-ignored `.ai-agent-sandbox/config.local.yaml` if the choice is personal (see [Configuration file](#configuration-file-configyaml)).
 
-A profile pinned in a project file is a requirement, not just a default: when `AI_AGENT_SANDBOX_PROFILE` names a *different* profile, the sandbox refuses to start instead of silently using it (the environment variable still wins over the project otherwise, so a repository cannot switch your credentials, only refuse the wrong ones). This catches a T3 thread started with the provider instance of the wrong account. When the sandbox is launched by an orchestrator (Claude Code through the Claude Agent SDK, as T3 Code does, or OpenCode as `opencode serve`), a provider instance without `AI_AGENT_SANDBOX_PROFILE` counts as `default`, because such an instance uses your host configuration: a project pinned to `work` therefore also refuses the instance without a profile. In a terminal, a missing variable just means the project's profile applies. `--profile` on the command line is a deliberate choice and overrides the project without an error.
+A profile pinned in a project file is a requirement, not just a default: when `AI_AGENT_SANDBOX_PROFILE` names a *different* profile, the sandbox refuses to start instead of silently using it (the environment variable still wins over the project otherwise, so a repository cannot switch your credentials, only refuse the wrong ones). This catches a T3 thread started with the provider instance of the wrong account. With `--strict-profile`, a missing `AI_AGENT_SANDBOX_PROFILE` counts as `default`. Use it in an orchestrator's wrapper: a T3 provider instance without the variable uses your host configuration, so a project pinned to `work` then also refuses that instance. Without the flag (e.g. in a terminal), a missing variable just means the project's profile applies. `--profile` on the command line is a deliberate choice and overrides the project without an error.
 
 ### Pass arguments to the selected agent:
 ```bash
@@ -233,7 +233,7 @@ export AI_AGENT_SANDBOX_PROFILES_DIR=/path/to/profile-store
 ```sh
 #!/bin/sh
 # ~/.local/bin/claude-sandboxed  (chmod +x; do not give it a .js/.ts extension, T3 would run those with node)
-exec /path/to/ai-agent-sandbox.sh --quiet --host-port 3773 -- "$@"
+exec /path/to/ai-agent-sandbox.sh --quiet --host-port 3773 --strict-profile -- "$@"
 ```
 
 Then, in T3 Code:
@@ -535,7 +535,7 @@ Add the required paths to the `whitelist:` list in your `config.yaml`. Common ad
 ### The sandbox uses the wrong Claude account
 Check the `Profile:` line in the startup summary; it shows the profile and where it came from (`.ai-agent-sandbox/config.yaml`, `config.local.yaml`, `AI_AGENT_SANDBOX_PROFILE` or `--profile`). Use `--profile default` to force the host configuration, or `--list-profiles` to see which profiles are logged in.
 
-`Error: profile mismatch` means the project pins a profile and `AI_AGENT_SANDBOX_PROFILE` names a different one (under T3 Code, a provider instance without the variable counts as `default`); in T3 Code, start the thread with the provider instance of the project's profile. Pass `--profile <name>` to run under another profile on purpose.
+`Error: profile mismatch` means the project pins a profile and `AI_AGENT_SANDBOX_PROFILE` names a different one (with `--strict-profile`, as in the T3 wrapper, a missing variable counts as `default`); in T3 Code, start the thread with the provider instance of the project's profile. Pass `--profile <name>` to run under another profile on purpose.
 
 ### The agent needs to access a specific sensitive file
 If you genuinely need the agent to access a file that's blacklisted:

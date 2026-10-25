@@ -38,6 +38,7 @@ PROFILE_SOURCE=""
 PROFILES_DIR="${AI_AGENT_SANDBOX_PROFILES_DIR:-$HOME/.local/share/ai-agent-sandbox/profiles}"
 PROFILE_HOME=""
 LIST_PROFILES=false
+STRICT_PROFILE=false
 MIGRATE_PROJECT_CONFIG=false
 PROTECT_PROJECT_CONFIG=true
 # Deprecated whitelist.txt / blacklist.txt / .env files still in use
@@ -132,6 +133,9 @@ OPTIONS:
     --profile, -p NAME      Use a named agent profile (separate login, settings, memory);
                             'default' is the host configuration. New profiles start empty.
     --list-profiles         List available profiles and exit
+    --strict-profile        A missing AI_AGENT_SANDBOX_PROFILE counts as 'default' when
+                            checking a profile pinned by the project (for orchestrator
+                            wrappers, e.g. T3 Code)
     --migrate-project-conf  Migrate legacy .ai-agent-sandbox/ files (whitelist.txt,
                             blacklist.txt, .env, .env.local) into config.yaml and exit
     --env, -e KEY=VALUE     Set environment variable inside sandbox (can be specified multiple times)
@@ -175,9 +179,8 @@ CONFIGURATION FILES (automatically included if they exist):
                 < project local config < AI_AGENT_SANDBOX_PROFILE
                 < command-line options
     A profile set in a project file is not overridden by AI_AGENT_SANDBOX_PROFILE:
-    a different value there is an error (--profile still overrides). When launched
-    by an orchestrator such as T3 Code (Claude Agent SDK, or 'opencode serve'), a
-    missing AI_AGENT_SANDBOX_PROFILE counts as 'default' for this check.
+    a different value there is an error (--profile still overrides). With
+    --strict-profile, a missing AI_AGENT_SANDBOX_PROFILE counts as 'default' for this check.
 
 DEPRECATED LEGACY FILES:
     whitelist.txt, blacklist.txt, .env and .env.local next to the config files
@@ -911,36 +914,24 @@ if [[ -n "${AI_AGENT_SANDBOX_PROFILE:-}" ]]; then
     PROFILE_SOURCE="AI_AGENT_SANDBOX_PROFILE"
 fi
 
-# Started by an orchestrator rather than from a terminal. Claude Code: the
-# Claude Agent SDK (T3 Code and others) sets these variables for the process it
-# spawns. OpenCode: orchestrators run it as a headless server, so the first
-# argument they pass is "serve" (T3 Code: serve --hostname=... --port=...).
-launched_by_orchestrator() {
-    if [[ "$AGENT" == opencode ]]; then
-        [[ "${AGENT_ARGS[${#CONFIG_AGENT_ARGS[@]}]:-}" == serve ]]
-    else
-        [[ -n "${CLAUDE_AGENT_SDK_VERSION:-}" || "${CLAUDE_CODE_ENTRYPOINT:-}" == sdk-* ]]
-    fi
-}
-
 # A project that names a profile may not switch the profile, but it may refuse
 # to run under a different one coming from the environment. Orchestrators such
 # as T3 Code set AI_AGENT_SANDBOX_PROFILE per provider instance, so picking the
 # wrong instance in a new thread would otherwise bill the wrong subscription.
 # An instance without the variable uses the host configuration (T3 reads its
-# transcripts and usage from there), so for orchestrated launches a missing
-# variable counts as "default". In a terminal the project's profile simply
-# applies. An explicit
-# --profile on the command line is a deliberate choice and wins.
+# transcripts and usage from there), so with --strict-profile (passed by the
+# orchestrator's wrapper) a missing variable counts as "default". Otherwise the
+# project's profile simply applies. An explicit --profile is a deliberate
+# choice and wins.
 check_project_profile() {
     [[ -n "$PROJECT_PROFILE" ]] || return 0
     local requested origin
     if [[ "$PROFILE_SOURCE" == AI_AGENT_SANDBOX_PROFILE ]]; then
         requested="$PROFILE"
         origin="AI_AGENT_SANDBOX_PROFILE is '$requested'"
-    elif [[ "$PROFILE_SOURCE" != --profile ]] && launched_by_orchestrator; then
+    elif [[ "$STRICT_PROFILE" = true && "$PROFILE_SOURCE" != --profile ]]; then
         requested="default"
-        origin="the orchestrator's provider instance sets no AI_AGENT_SANDBOX_PROFILE (counts as 'default')"
+        origin="AI_AGENT_SANDBOX_PROFILE is not set (counts as 'default' with --strict-profile)"
     else
         return 0
     fi
@@ -973,6 +964,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --list-profiles)
             LIST_PROFILES=true
+            shift
+            ;;
+        --strict-profile)
+            STRICT_PROFILE=true
             shift
             ;;
         --migrate-project-conf)
