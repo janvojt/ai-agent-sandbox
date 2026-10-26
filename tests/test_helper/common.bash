@@ -28,7 +28,7 @@ setup_test_env() {
     local var
     for var in $(compgen -e); do
         case "$var" in
-            AI_AGENT_SANDBOX_*|CLAUDE_CONFIG_DIR|OPENCODE_CONFIG_DIR|OPENCODE_DB|GNUPGHOME|DOCKER_HOST)
+            AI_AGENT_SANDBOX_*|CLAUDE*|OPENCODE*|GNUPGHOME|DOCKER_HOST)
                 unset "$var" ;;
         esac
     done
@@ -68,17 +68,28 @@ exit \${STUB_BWRAP_STATUS:-0}"
 # Run the script as a subprocess in TEST_WORK with stdin from /dev/null and a
 # stub bwrap and claude. The network mode defaults to host (isolated mode needs
 # pasta and real namespaces); export AI_AGENT_SANDBOX_NETWORK to change it.
-# Sets bats' status/output (stdout and stderr combined) and loads the recorded
-# bwrap arguments into BWRAP_RECORDED.
+# Sets bats' status/output (stdout and stderr combined, colors stripped), loads
+# the recorded bwrap arguments into BWRAP_RECORDED and the command bwrap was
+# asked to run (everything after the first --) into SANDBOX_COMMAND.
 run_sandbox() {
     [[ -x "$STUB_DIR/bwrap" ]] || stub_bwrap
     [[ -x "$STUB_DIR/claude" ]] || stub_command claude 'echo "2.1.0 (Claude Code)"'
     rm -f "$BWRAP_ARGS_FILE"
     run env AI_AGENT_SANDBOX_NETWORK="${AI_AGENT_SANDBOX_NETWORK:-host}" \
         bash "$SANDBOX_SCRIPT" "$@" </dev/null
+    output="$(printf '%s' "$output" | sed 's/\x1b\[[0-9;]*m//g')"
+    mapfile -t lines <<< "$output"
     BWRAP_RECORDED=()
+    SANDBOX_COMMAND=()
     if [[ -f "$BWRAP_ARGS_FILE" ]]; then
         mapfile -t BWRAP_RECORDED < "$BWRAP_ARGS_FILE"
+        local i
+        for ((i = 0; i < ${#BWRAP_RECORDED[@]}; i++)); do
+            if [[ "${BWRAP_RECORDED[i]}" == -- ]]; then
+                SANDBOX_COMMAND=("${BWRAP_RECORDED[@]:i+1}")
+                break
+            fi
+        done
     fi
 }
 
