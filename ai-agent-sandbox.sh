@@ -2791,25 +2791,6 @@ build_opencode2_launch_args() {
     AGENT_LAUNCH_ARGS+=("${AGENT_ARGS[@]:insert_at}")
 }
 
-# --- Main ----------------------------------------------------------------------
-#
-# Everything above only defines functions and defaults. When the script is
-# sourced (the bats tests in tests/ do this to call single functions), stop
-# here so nothing is parsed, mounted or started.
-if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
-    return 0
-fi
-
-resolve_git_worktree
-load_config_files
-
-# The environment variable beats config files on purpose: a repository must not
-# be able to silently switch the credentials a user chose in their shell.
-if [[ -n "${AI_AGENT_SANDBOX_PROFILE:-}" ]]; then
-    PROFILE="$AI_AGENT_SANDBOX_PROFILE"
-    PROFILE_SOURCE="AI_AGENT_SANDBOX_PROFILE"
-fi
-
 # A project that names a profile may not switch the profile, but it may refuse
 # to run under a different one coming from the environment. Orchestrators such
 # as T3 Code set AI_AGENT_SANDBOX_PROFILE per provider instance, so picking the
@@ -2837,6 +2818,25 @@ check_project_profile() {
     echo "To run under '$requested' anyway, pass --profile $requested." >&2
     exit 1
 }
+
+# --- Main ----------------------------------------------------------------------
+#
+# Everything above only defines functions and defaults. When the script is
+# sourced (the bats tests in tests/ do this to call single functions), stop
+# here so nothing is parsed, mounted or started.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
+
+resolve_git_worktree
+load_config_files
+
+# The environment variable beats config files on purpose: a repository must not
+# be able to silently switch the credentials a user chose in their shell.
+if [[ -n "${AI_AGENT_SANDBOX_PROFILE:-}" ]]; then
+    PROFILE="$AI_AGENT_SANDBOX_PROFILE"
+    PROFILE_SOURCE="AI_AGENT_SANDBOX_PROFILE"
+fi
 
 if [[ -n "${AI_AGENT_SANDBOX_NETWORK:-}" ]]; then
     validate_network_mode "$AI_AGENT_SANDBOX_NETWORK" || { echo -e "${RED}Error: invalid AI_AGENT_SANDBOX_NETWORK '$AI_AGENT_SANDBOX_NETWORK' (expected isolated, host or none)${NC}" >&2; exit 1; }
