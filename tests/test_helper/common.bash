@@ -21,18 +21,14 @@ setup_test_env() {
     STUB_DIR="$BATS_TEST_TMPDIR/stubs"
     BWRAP_ARGS_FILE="$BATS_TEST_TMPDIR/bwrap.args"
     mkdir -p "$TEST_HOME" "$TEST_WORK" "$STUB_DIR"
-    TEST_HOME="$(cd "$TEST_HOME" && pwd -P)"
-    TEST_WORK="$(cd "$TEST_WORK" && pwd -P)"
+    # Physical paths without subshells (every command is slow under bats);
+    # ends in TEST_WORK
+    cd -P "$TEST_HOME" && TEST_HOME="$PWD"
+    cd -P "$TEST_WORK" && TEST_WORK="$PWD"
     export HOME="$TEST_HOME"
     export PATH="$STUB_DIR:$PATH"
-    local var
-    for var in $(compgen -e); do
-        case "$var" in
-            AI_AGENT_SANDBOX_*|CLAUDE*|OPENCODE*|GNUPGHOME|DOCKER_HOST)
-                unset "$var" ;;
-        esac
-    done
-    cd "$TEST_WORK"
+    unset "${!AI_AGENT_SANDBOX_@}" "${!CLAUDE@}" "${!OPENCODE@}" \
+        GNUPGHOME DOCKER_HOST
 }
 
 # Source the script from the test working directory. Its defaults are

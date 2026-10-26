@@ -12,7 +12,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bats bats-assert bats-support bats-file bubblewrap
+          sudo apt-get install -y bats bats-assert bats-support bats-file bubblewrap parallel
       - name: Allow unprivileged user namespaces
         # Ubuntu 24.04 restricts them through AppArmor; bwrap needs them for
         # the integration tests
