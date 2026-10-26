@@ -44,6 +44,9 @@ load_sandbox_script() {
     # shellcheck source=../../ai-agent-sandbox.sh
     source "$SANDBOX_SCRIPT"
     set +u +o pipefail
+    # declare inside a sourced file is local to the sourcing function, so the
+    # script's top-level associative array has to be made global again
+    declare -gA SANDBOX_ENV=()
 }
 
 # Usage: stub_command <name> [script-body]
