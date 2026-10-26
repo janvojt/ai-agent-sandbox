@@ -39,6 +39,9 @@ PROFILES_DIR="${AI_AGENT_SANDBOX_PROFILES_DIR:-$HOME/.local/share/ai-agent-sandb
 PROFILE_HOME=""
 LIST_PROFILES=false
 STRICT_PROFILE=false
+ALLOW_HOME_WORKDIR=false
+# Agent called with nothing but --version/-v (health checks of orchestrators)
+VERSION_QUERY=false
 MIGRATE_PROJECT_CONFIG=false
 PROTECT_PROJECT_CONFIG=true
 # Deprecated whitelist.txt / blacklist.txt / .env files still in use
@@ -136,6 +139,9 @@ OPTIONS:
     --strict-profile        A missing AI_AGENT_SANDBOX_PROFILE counts as 'default' when
                             checking a profile pinned by the project (for orchestrator
                             wrappers, e.g. T3 Code)
+    --allow-home-workdir    Allow running in your home directory or one of its parents
+                            (refused by default: the agent would get read-write access
+                            to your whole home directory)
     --migrate-project-conf  Migrate legacy .ai-agent-sandbox/ files (whitelist.txt,
                             blacklist.txt, .env, .env.local) into config.yaml and exit
     --env, -e KEY=VALUE     Set environment variable inside sandbox (can be specified multiple times)
@@ -970,6 +976,10 @@ while [[ $# -gt 0 ]]; do
             STRICT_PROFILE=true
             shift
             ;;
+        --allow-home-workdir)
+            ALLOW_HOME_WORKDIR=true
+            shift
+            ;;
         --migrate-project-conf)
             MIGRATE_PROJECT_CONFIG=true
             shift
@@ -1089,6 +1099,11 @@ done
 
 # Configuration files were parsed before the command line so that flags win;
 # now that --quiet/--verbose are known, report what the parser had to say.
+# A bare version query is answered by the host binary without a sandbox (see
+# below); decided before agent_args from the config are prepended.
+if [[ ${#AGENT_ARGS[@]} -eq 1 && ( "${AGENT_ARGS[0]}" == "--version" || "${AGENT_ARGS[0]}" == "-v" ) ]]; then
+    VERSION_QUERY=true
+fi
 AGENT_ARGS=("${CONFIG_AGENT_ARGS[@]}" "${AGENT_ARGS[@]}")
 flush_config_log
 
@@ -2821,22 +2836,6 @@ if [[ "$AGENT" != "claudecode" ]] && [[ "$AGENT" != "opencode" ]]; then
     exit 1
 fi
 
-validate_docker
-validate_gpg_agent
-detect_venv
-
-# Cache command availability checks
-BWRAP_BIN=$(command -v bwrap 2>/dev/null)
-
-# Check if bubblewrap is installed
-if [[ -z "$BWRAP_BIN" ]]; then
-    echo -e "${RED}Error: bubblewrap (bwrap) is not installed${NC}" >&2
-    echo "Install it with: sudo apt install bubblewrap (Debian/Ubuntu) or sudo dnf install bubblewrap (Fedora)" >&2
-    exit 1
-fi
-
-resolve_network_mode
-
 # Detect agent binary based on selection
 AGENT_BIN=""
 if [[ "$AGENT" = "claudecode" ]]; then
@@ -2860,6 +2859,45 @@ elif [[ "$AGENT" = "opencode" ]]; then
     fi
 fi
 
+# Orchestrators such as T3 Code check the agent with a bare --version, in their
+# own working directory (often the home directory) and with a short timeout.
+# Starting a sandbox there would scan the whole directory for blacklist matches
+# and could exceed the timeout, so the host binary answers directly: the sandbox
+# runs the same binary, and the script runs `opencode --version` on the host
+# anyway to detect the version. Claude reports the upper-layer launcher when an
+# in-sandbox update made it newer than the host's.
+if [[ "$VERSION_QUERY" = true && "$DRY_RUN" = false ]]; then
+    VERSION_BIN="$AGENT_BIN"
+    if [[ "$AGENT" = "claudecode" && "$CLAUDE_NATIVE_INSTALL" = true && -x "$CLAUDE_SANDBOX_BIN_DIR/claude" ]]; then
+        VERSION_BIN="$CLAUDE_SANDBOX_BIN_DIR/claude"
+    fi
+    exec "$VERSION_BIN" "${AGENT_ARGS[@]: -1}"
+fi
+
+# Refuse to run in the home directory or one of its parents: the working
+# directory is bound read-write, so the agent would get the whole home directory
+# (SSH keys, credentials, every other project) with only the blacklist applied.
+# T3 Code starts OpenCode's shared server in its own working directory, which is
+# usually the home directory, so this also stops that setup from silently
+# running unconfined.
+REAL_WORKING_DIR=$(realpath -m "$WORKING_DIR")
+REAL_HOME=$(realpath -m "$HOME")
+if [[ "$ALLOW_HOME_WORKDIR" = false ]] \
+    && [[ "$REAL_HOME" == "$REAL_WORKING_DIR" || "$REAL_HOME" == "${REAL_WORKING_DIR%/}/"* ]]; then
+    if [[ "$REAL_HOME" == "$REAL_WORKING_DIR" ]]; then
+        echo -e "${RED}Error: the working directory $WORKING_DIR is your home directory${NC}" >&2
+    else
+        echo -e "${RED}Error: the working directory $WORKING_DIR contains your home directory${NC}" >&2
+    fi
+    echo "The agent would get read-write access to all of it. Run the sandbox from a project" >&2
+    echo "directory, or pass --allow-home-workdir if this is really what you want." >&2
+    if [[ "$AGENT" = "opencode" ]]; then
+        echo "T3 Code runs one OpenCode server in its own working directory for all projects;" >&2
+        echo "that setup cannot be sandboxed per project (see README, T3 Code section)." >&2
+    fi
+    exit 1
+fi
+
 # OpenCode 1 and 2 have different command lines (see build_opencode_launch_args),
 # so the major version is read from the installed binary before the sandbox
 # starts. Unknown or unreadable versions are treated as the current major (2).
@@ -2881,6 +2919,22 @@ detect_opencode_version() {
 if [[ "$AGENT" = "opencode" ]] && [[ -x "$AGENT_BIN" ]]; then
     detect_opencode_version
 fi
+
+validate_docker
+validate_gpg_agent
+detect_venv
+
+# Cache command availability checks
+BWRAP_BIN=$(command -v bwrap 2>/dev/null)
+
+# Check if bubblewrap is installed
+if [[ -z "$BWRAP_BIN" ]]; then
+    echo -e "${RED}Error: bubblewrap (bwrap) is not installed${NC}" >&2
+    echo "Install it with: sudo apt install bubblewrap (Debian/Ubuntu) or sudo dnf install bubblewrap (Fedora)" >&2
+    exit 1
+fi
+
+resolve_network_mode
 
 # Create a default user-level config.yaml on first run: no user-level
 # configuration of either kind exists and the whitelist or blacklist was not

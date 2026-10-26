@@ -55,6 +55,8 @@ cp config-example.yaml ~/.config/ai-agent-sandbox/config.yaml
 ./ai-agent-sandbox.sh
 ```
 
+Run it from the project directory: the current directory becomes the agent's read-write working directory. The sandbox refuses to start in your home directory or one of its parents (such as `/`), because the agent would get read-write access to everything in it; pass `--allow-home-workdir` if you really want that.
+
 ### Custom whitelist/blacklist:
 Whitelist and blacklist entries live in the `whitelist:` and `blacklist:` lists of the [config files](#configuration-file-configyaml). For a single run, add paths on the command line:
 ```bash
@@ -228,32 +230,32 @@ export AI_AGENT_SANDBOX_PROFILES_DIR=/path/to/profile-store
 
 ### Using with T3 Code and other orchestrators
 
-[T3 Code](https://github.com/pingdotgg/t3code) is a local control plane that drives the agent CLIs you already have installed: its server runs on your machine, owns git, worktrees and the integrated terminal, and starts Claude Code as a subprocess that talks to it over stdin/stdout. The sandbox fits in between: the T3 server keeps running on the host, and every agent it launches runs inside bubblewrap. No T3 changes are needed, only a wrapper that T3 uses as the Claude binary:
+[T3 Code](https://github.com/pingdotgg/t3code) is a local control plane that drives the agent CLIs you already have installed: its server runs on your machine, owns git, worktrees and the integrated terminal, and starts Claude Code as a subprocess that talks to it over stdin/stdout. The sandbox fits in between: the T3 server keeps running on the host, and every agent it launches runs inside bubblewrap. No T3 changes are needed, only a wrapper that T3 uses as the Claude binary (`/home/you` stands for your home directory):
 
 ```sh
 #!/bin/sh
-# ~/.local/bin/claude-sandboxed  (chmod +x; do not give it a .js/.ts extension, T3 would run those with node)
-exec /path/to/ai-agent-sandbox.sh --quiet --host-port 3773 --strict-profile -- "$@"
+# /home/you/.local/bin/claude-sandboxed  (chmod +x; do not give it a .js/.ts extension, T3 would run those with node)
+exec /home/you/ai-agent-sandbox/ai-agent-sandbox.sh --quiet --host-port 3773 --strict-profile -- "$@"
 ```
 
-Then, in T3 Code:
+Then, in T3 Code (enter every path in T3's settings as an absolute path: T3 expands `~` in some fields, such as the Claude binary path, but not in others, such as the OpenCode binary path, where `~/...` fails with "not installed or not on PATH"):
 
-1. **Settings → Providers → your Claude instance → Binary path**: the wrapper, e.g. `~/.local/bin/claude-sandboxed`. T3 passes its own flags (`--permission-mode`, `--add-dir`, `--resume`, ...) after `--`; the sandbox leaves them untouched.
+1. **Settings → Providers → your Claude instance → Binary path**: the wrapper, e.g. `/home/you/.local/bin/claude-sandboxed`. T3 passes its own flags (`--permission-mode`, `--add-dir`, `--resume`, ...) after `--`; the sandbox leaves them untouched.
    `--host-port 3773` keeps T3's MCP server (its tools for the agent) reachable from the isolated sandbox network; use the port of your T3 server if you changed it.
-2. Whitelist T3's attachments directory, which T3 hands to Claude with `--add-dir` for images pasted into a thread: add `~/.t3/userdata/attachments` to the `whitelist:` of your user-level `config.yaml` (use your `T3CODE_HOME` if you changed it).
-3. To run T3 threads under a sandbox [profile](#profiles), add the environment variable `AI_AGENT_SANDBOX_PROFILE=<name>` to the provider instance (**Settings → Providers → instance → Environment variables**) and set the instance's **CLAUDE_CONFIG_DIR path** to `~/.local/share/ai-agent-sandbox/profiles/<name>/home/.claude`, so that T3's host-side readers (thread history, usage limits) look at the same directory the sandbox mounts as `~/.claude`. The sandbox ignores `CLAUDE_CONFIG_DIR` itself and uses the profile.
+2. Whitelist T3's attachments directory, which T3 hands to Claude with `--add-dir` for images pasted into a thread: add `/home/you/.t3/userdata/attachments` to the `whitelist:` of your user-level `config.yaml` (use your `T3CODE_HOME` if you changed it).
+3. To run T3 threads under a sandbox [profile](#profiles), add the environment variable `AI_AGENT_SANDBOX_PROFILE=<name>` to the provider instance (**Settings → Providers → instance → Environment variables**) and set the instance's **CLAUDE_CONFIG_DIR path** to `/home/you/.local/share/ai-agent-sandbox/profiles/<name>/home/.claude`, so that T3's host-side readers (thread history, usage limits) look at the same directory the sandbox mounts as `~/.claude`. The sandbox ignores `CLAUDE_CONFIG_DIR` itself and uses the profile.
 4. With one provider instance per profile (say, work and private subscriptions), make each project use the right one:
    - In T3, set the project's default model to a model of the matching instance, so new threads start with it.
    - In the sandbox, pin the profile in the project's `.ai-agent-sandbox/config.local.yaml` (`profile: work`, or `profile: default` for projects that use the instance without `AI_AGENT_SANDBOX_PROFILE`, i.e. your host configuration). A thread started with the other instance then fails on its first message ("profile mismatch") instead of running on the wrong subscription; T3 only shows that the provider exited, the reason is in the log file mentioned below. The file is git-ignored and therefore not copied into T3's worktrees, so the sandbox reads it from the main checkout when the worktree has none (see [Git worktrees](#git-worktrees)).
 
 Good to know:
 
-- T3 creates worktrees under `~/.t3/worktrees/<repo>/<branch>`; the sandbox follows the worktree's `.git` link (see [Git worktrees](#git-worktrees)), so git keeps working for the agent.
-- T3 discards the agent's stderr, where the sandbox logs. While setting things up, append `2>>"$HOME/.local/state/ai-agent-sandbox/t3.log"` to the `exec` line and drop `--quiet` to see what the sandbox does. T3 also runs its periodic health probe and `--version` check through the wrapper (no API calls, the working directory may be `~/.t3/userdata`).
+- T3 creates worktrees under `/home/you/.t3/worktrees/<repo>/<branch>`; the sandbox follows the worktree's `.git` link (see [Git worktrees](#git-worktrees)), so git keeps working for the agent.
+- T3 discards the agent's stderr, where the sandbox logs. While setting things up, append `2>>"$HOME/.local/state/ai-agent-sandbox/t3.log"` to the `exec` line and drop `--quiet` to see what the sandbox does. T3 also runs its periodic health probe and `--version` check through the wrapper (no API calls, the working directory may be `/home/you/.t3/userdata` or T3's own working directory). A bare `--version` (or `-v`) is answered by the host binary without starting a sandbox, so the check stays fast in any directory; `--dry-run` still runs it inside.
 - The project configuration in `.ai-agent-sandbox/` of the worktree applies as usual, plus the main checkout's `config.local.yaml` if the worktree has none.
 - T3's own integrated terminal, git operations and project setup scripts run on the host, outside the sandbox, by design: they are driven by you, not by the model.
 - A stop from T3 (or any `SIGTERM` to the wrapper) terminates the sandbox immediately.
-- OpenCode 1 works the same way (`--agent opencode`, T3 runs `opencode serve` per thread in the project directory). OpenCode 2 runs one server for all directories, which a per-directory sandbox cannot confine. Codex is not supported by the sandbox yet.
+- OpenCode is not supported through the wrapper. T3 starts a single shared `opencode serve` (OpenCode 1 and 2) in its own working directory, usually your home directory, and sends each thread to it as a request for that thread's project directory. A sandbox per project cannot confine that server: rooted at your home directory it would give every thread read-write access to all of it, so the sandbox refuses to start there (see [Basic usage](#basic-usage)); T3 then shows the OpenCode provider as failing. Codex is not supported by the sandbox yet.
 
 ## Configuration
 
@@ -474,7 +476,7 @@ blacklist:
 1. ✅ **Filesystem access outside working directory** - Only whitelisted system paths are readable
 2. ✅ **Sensitive files in working directory** - Blacklisted patterns are hidden
 3. ✅ **SSH agent access** - SSH_AUTH_SOCK is removed from environment
-4. ✅ **Home directory access** - Only minimal agent-specific config is exposed
+4. ✅ **Home directory access** - Only minimal agent-specific config is exposed; starting the sandbox in the home directory itself (or a parent such as `/`) is refused unless `--allow-home-workdir` is given
 5. ✅ **Credential separation** - With profiles, a project only sees the login, settings and memory of its own profile; the profile store itself is never visible inside the sandbox
 6. ✅ **Self-modifying sandbox rules** - `.ai-agent-sandbox/` is mounted read-only so the agent cannot change the profile, whitelist or environment it runs with next time
 7. ✅ **OpenCode 2 background server** - OpenCode 2 is started with `--standalone`, so the server that executes its tools runs inside the sandbox instead of the shared per-user service on the host
@@ -531,6 +533,9 @@ Add the required paths to the `whitelist:` list in your `config.yaml`. Common ad
 - `/usr/lib/x86_64-linux-gnu` (Debian/Ubuntu)
 - `/usr/lib64` (RedHat/Fedora)
 - `/opt/custom-tools`
+
+### "the working directory … is your home directory"
+The sandbox was started in your home directory or a directory containing it (such as `/`). Change to the project directory first. If you really want the agent to have read-write access to your whole home directory, pass `--allow-home-workdir`. In T3 Code this happens with the OpenCode provider, which is not supported through the wrapper (see [Using with T3 Code](#using-with-t3-code-and-other-orchestrators)).
 
 ### The sandbox uses the wrong Claude account
 Check the `Profile:` line in the startup summary; it shows the profile and where it came from (`.ai-agent-sandbox/config.yaml`, `config.local.yaml`, `AI_AGENT_SANDBOX_PROFILE` or `--profile`). Use `--profile default` to force the host configuration, or `--list-profiles` to see which profiles are logged in.
