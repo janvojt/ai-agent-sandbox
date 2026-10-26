@@ -179,6 +179,24 @@ bash -n ai-agent-sandbox.sh
 shellcheck ai-agent-sandbox.sh
 ```
 
+### Automated Tests (bats)
+
+The suite in `tests/` uses [bats-core](https://github.com/bats-core/bats-core) with bats-support, bats-assert and bats-file (Debian/Ubuntu: `apt install bats bats-assert bats-support bats-file`; the libraries are found through `BATS_LIB_PATH`, default `/usr/lib/bats`). Inside a sandbox, `/usr/libexec/bats-core` must be whitelisted, `/usr/bin/bats` only execs it.
+
+```bash
+tests/run.sh                    # unit + script tests (shellcheck first, when installed)
+tests/run.sh --integration      # also the tests that start real bwrap sandboxes
+bats tests/unit/path_rules.bats # a single file
+```
+
+- **Sourceable script**: all functions and defaults come before the `# --- Main ---` guard (`[[ "${BASH_SOURCE[0]}" != "$0" ]] && return 0`); everything that parses, mounts or starts something comes after it. New functions must be defined above the guard, otherwise the unit tests cannot call them
+- `tests/test_helper/common.bash`: `setup_test_env` (per-test `HOME`, working directory and stub directory under `BATS_TEST_TMPDIR`, strips `AI_AGENT_SANDBOX_*`, `CLAUDE*`, `OPENCODE*`, `GNUPGHOME`, `DOCKER_HOST` from the environment), `load_sandbox_script` (sources the script from the test working directory, switches `-u`/`pipefail` off again and redeclares `SANDBOX_ENV` globally), `stub_command`, `stub_bwrap`, `run_sandbox`, `assert_args_contain`/`refute_args_contain`
+- `tests/unit/`: single functions with the script sourced. Functions that set globals (`BWRAP_ARGS`, `AGENT_LAUNCH_ARGS`, …) are called directly, functions that `exit` through `run`
+- `tests/script/`: the script as a subprocess through `run_sandbox`, with a stub `bwrap` that records its arguments (`BWRAP_RECORDED`, the command after the first `--` in `SANDBOX_COMMAND`, colors stripped from `output`). The network mode defaults to `host` there. OpenCode is looked up at `~/.opencode/bin/opencode`, not on `PATH`
+- `tests/integration/` (bats tag `integration`): real bwrap in `--dry-run` mode with commands on stdin, isolated mode with a stub `pasta` (see "Testing from inside a sandbox" above). Needs unprivileged user namespaces; nested bwrap inside this sandbox works
+- Tests that document a known bug are written for the correct behaviour and marked `skip "BUG: …"`; remove the `skip` with the fix
+- CI (`.github/workflows/tests.yml`) runs `tests/run.sh --integration` on Ubuntu 24.04 (with `kernel.apparmor_restrict_unprivileged_userns=0`) and an advisory shellcheck job
+
 ## Important Implementation Details
 
 ### Security Considerations
@@ -307,6 +325,8 @@ Add the key to `is_config_list_key` (lists) and to `apply_config_list_item`, or 
 
 ## Testing Checklist
 
+Run `tests/run.sh --integration` first and add tests for new behaviour. Items 1–11, 13, 15, 20, 22–35 are largely covered by the automated suite (bwrap arguments rather than real mounts for most of them); the real `pasta` connectivity in item 33, GPG signing (19), Docker (16–18, 27), `/login` (21), interactive Ctrl+C and the TTY migration prompt still need a manual check.
+
 When modifying the script:
 1. Test with a fresh `$HOME` (should auto-generate `config.yaml` with whitelist and blacklist and use it in the same run)
 2. Test with `--whitelist-path`/`--blacklist-path` on a fresh `$HOME` (should NOT auto-generate the corresponding section; both given → no file). `--whitelist`, `--blacklist`, `--env-path` and the `*_files` config keys must fail with an error
@@ -352,6 +372,8 @@ When modifying the script:
 - `config-example.yaml` - Example config file (every key)
 - `.gitignore` - Git ignore patterns
 - `AGENTS.md` - Developer documentation (this file)
+- `tests/` - bats test suite (`run.sh`, `test_helper/`, `unit/`, `script/`, `integration/`)
+- `.github/workflows/tests.yml` - CI running the test suite
 
 ## Project-Level Configuration
 

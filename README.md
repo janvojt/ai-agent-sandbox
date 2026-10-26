@@ -616,6 +616,13 @@ blacklist:
 
 ## Contributing
 
+Run the test suite before sending changes (needs [bats-core](https://github.com/bats-core/bats-core) with bats-support, bats-assert and bats-file, e.g. `apt install bats bats-assert bats-support bats-file`):
+
+```bash
+tests/run.sh                # unit and script tests
+tests/run.sh --integration  # also tests that start real bwrap sandboxes
+```
+
 Suggestions for improvements:
 1. More sophisticated overlay filesystem handling
 2. Integration with security audit tools

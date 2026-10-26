@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  bats:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats bats-assert bats-support bats-file bubblewrap
+      - name: Allow unprivileged user namespaces
+        # Ubuntu 24.04 restricts them through AppArmor; bwrap needs them for
+        # the integration tests
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Run unit, script and integration tests
+        run: tests/run.sh --integration
+
+  shellcheck:
+    runs-on: ubuntu-24.04
+    # Advisory until the script is shellcheck-clean
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        run: shellcheck -x ai-agent-sandbox.sh tests/run.sh
