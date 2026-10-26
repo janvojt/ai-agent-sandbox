@@ -910,208 +910,6 @@ resolve_git_worktree() {
     fi
 }
 
-resolve_git_worktree
-load_config_files
-
-# The environment variable beats config files on purpose: a repository must not
-# be able to silently switch the credentials a user chose in their shell.
-if [[ -n "${AI_AGENT_SANDBOX_PROFILE:-}" ]]; then
-    PROFILE="$AI_AGENT_SANDBOX_PROFILE"
-    PROFILE_SOURCE="AI_AGENT_SANDBOX_PROFILE"
-fi
-
-# A project that names a profile may not switch the profile, but it may refuse
-# to run under a different one coming from the environment. Orchestrators such
-# as T3 Code set AI_AGENT_SANDBOX_PROFILE per provider instance, so picking the
-# wrong instance in a new thread would otherwise bill the wrong subscription.
-# An instance without the variable uses the host configuration (T3 reads its
-# transcripts and usage from there), so with --strict-profile (passed by the
-# orchestrator's wrapper) a missing variable counts as "default". Otherwise the
-# project's profile simply applies. An explicit --profile is a deliberate
-# choice and wins.
-check_project_profile() {
-    [[ -n "$PROJECT_PROFILE" ]] || return 0
-    local requested origin
-    if [[ "$PROFILE_SOURCE" == AI_AGENT_SANDBOX_PROFILE ]]; then
-        requested="$PROFILE"
-        origin="AI_AGENT_SANDBOX_PROFILE is '$requested'"
-    elif [[ "$STRICT_PROFILE" = true && "$PROFILE_SOURCE" != --profile ]]; then
-        requested="default"
-        origin="AI_AGENT_SANDBOX_PROFILE is not set (counts as 'default' with --strict-profile)"
-    else
-        return 0
-    fi
-    [[ "$PROJECT_PROFILE" != "$requested" ]] || return 0
-    echo -e "${RED}Error: profile mismatch: $PROJECT_PROFILE_SOURCE requires profile '$PROJECT_PROFILE', but $origin${NC}" >&2
-    echo "In an orchestrator such as T3 Code, start the thread with the provider instance of profile '$PROJECT_PROFILE'." >&2
-    echo "To run under '$requested' anyway, pass --profile $requested." >&2
-    exit 1
-}
-
-if [[ -n "${AI_AGENT_SANDBOX_NETWORK:-}" ]]; then
-    validate_network_mode "$AI_AGENT_SANDBOX_NETWORK" || { echo -e "${RED}Error: invalid AI_AGENT_SANDBOX_NETWORK '$AI_AGENT_SANDBOX_NETWORK' (expected isolated, host or none)${NC}" >&2; exit 1; }
-    NETWORK_MODE="$AI_AGENT_SANDBOX_NETWORK"
-    NETWORK_MODE_SOURCE="AI_AGENT_SANDBOX_NETWORK"
-fi
-
-# Parse command line arguments (kept for the restart after a config migration)
-ORIGINAL_ARGS=("$@")
-AGENT_ARGS=()
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --whitelist|--blacklist|--env-path)
-            echo -e "${RED}Error: $1 is no longer supported, put the entries into the whitelist, blacklist or env key of a config.yaml${NC}" >&2
-            exit 1
-            ;;
-        --profile|-p)
-            PROFILE="$2"
-            PROFILE_SOURCE="--profile"
-            shift 2
-            ;;
-        --list-profiles)
-            LIST_PROFILES=true
-            shift
-            ;;
-        --strict-profile)
-            STRICT_PROFILE=true
-            shift
-            ;;
-        --allow-home-workdir)
-            ALLOW_HOME_WORKDIR=true
-            shift
-            ;;
-        --migrate-project-conf)
-            MIGRATE_PROJECT_CONFIG=true
-            shift
-            ;;
-        --no-docker)
-            ENABLE_DOCKER=false
-            shift
-            ;;
-        --no-venv)
-            ENABLE_VENV=false
-            shift
-            ;;
-        --gitconfig)
-            MOUNT_GITCONFIG=true
-            shift
-            ;;
-        --no-gpg-agent)
-            ENABLE_GPG_AGENT=false
-            shift
-            ;;
-        --no-protect-project-config)
-            PROTECT_PROJECT_CONFIG=false
-            shift
-            ;;
-        --env|-e)
-            ENV_VARS+=("$2")
-            shift 2
-            ;;
-        --blacklist-path)
-            BLACKLIST_PATHS+=("$2")
-            EXPLICIT_BLACKLIST=true
-            shift 2
-            ;;
-        --whitelist-path)
-            WHITELIST_PATHS_RO+=("$2")
-            EXPLICIT_WHITELIST=true
-            shift 2
-            ;;
-        --whitelist-path-rw)
-            WHITELIST_PATHS_RW+=("$2")
-            EXPLICIT_WHITELIST=true
-            shift 2
-            ;;
-        --enable-docker|-d)
-            ENABLE_DOCKER=true
-            shift
-            ;;
-        --venv)
-            ENABLE_VENV=true
-            shift
-            ;;
-        --no-gitconfig)
-            MOUNT_GITCONFIG=false
-            shift
-            ;;
-        --shared-skills)
-            SHARE_SKILLS=true
-            shift
-            ;;
-        --no-shared-skills)
-            SHARE_SKILLS=false
-            shift
-            ;;
-        --gpg-agent)
-            ENABLE_GPG_AGENT=true
-            shift
-            ;;
-        --docker-image)
-            SOCKET_PROXY_IMAGE="$2"
-            shift 2
-            ;;
-        --network)
-            validate_network_mode "$2" || { echo -e "${RED}Error: invalid --network mode '$2' (expected isolated, host or none)${NC}" >&2; exit 1; }
-            NETWORK_MODE="$2"
-            NETWORK_MODE_SOURCE="--network"
-            shift 2
-            ;;
-        --host-port)
-            validate_host_port "$2" || { echo -e "${RED}Error: invalid --host-port '$2' (expected a TCP port or range a-b)${NC}" >&2; exit 1; }
-            NETWORK_HOST_PORTS+=("$2")
-            shift 2
-            ;;
-        --allow-host)
-            NETWORK_ALLOW_HOSTS+=("$2")
-            shift 2
-            ;;
-        --agent|-a)
-            AGENT="$2"
-            shift 2
-            ;;
-        --dry-run)
-            DRY_RUN=true
-            shift
-            ;;
-        --quiet|-q)
-            QUIET=true
-            shift
-            ;;
-        --verbose|-v)
-            QUIET=false
-            shift
-            ;;
-        -h|--help)
-            usage
-            ;;
-        --)
-            shift
-            AGENT_ARGS=("$@")
-            break
-            ;;
-        *)
-            echo -e "${RED}Error: Unknown option $1${NC}" >&2
-            usage
-            ;;
-    esac
-done
-
-# Configuration files were parsed before the command line so that flags win;
-# now that --quiet/--verbose are known, report what the parser had to say.
-# A bare version query is answered by the host binary without a sandbox (see
-# below); decided before agent_args from the config are prepended.
-if [[ ${#AGENT_ARGS[@]} -eq 1 && ( "${AGENT_ARGS[0]}" == "--version" || "${AGENT_ARGS[0]}" == "-v" ) ]]; then
-    VERSION_QUERY=true
-fi
-AGENT_ARGS=("${CONFIG_AGENT_ARGS[@]}" "${AGENT_ARGS[@]}")
-flush_config_log
-
-if [[ "$LIST_PROFILES" = true ]]; then
-    list_profiles
-    exit 0
-fi
-
 # --- Legacy configuration files (deprecated) -----------------------------------
 #
 # whitelist.txt, blacklist.txt, .env and .env.local predate config.yaml. Each
@@ -1413,87 +1211,6 @@ EOMIGRATE
         echo -e "${RED}Migrating them makes their entries active again.${NC}" >&2
     fi
 }
-
-USER_LEGACY_FILES=()
-for legacy_file in "$DEFAULT_WHITELIST_FILE" "$DEFAULT_BLACKLIST_FILE" \
-    "$DEFAULT_ENV_FILE" "$DEFAULT_ENV_LOCAL_FILE"; do
-    if [[ -f "$legacy_file" ]]; then
-        USER_LEGACY_FILES+=("$legacy_file")
-    fi
-done
-PROJECT_LEGACY_FILES=()
-for legacy_file in "$PROJECT_WHITELIST_FILE" "$PROJECT_BLACKLIST_FILE" \
-    "$PROJECT_ENV_FILE" "$PROJECT_ENV_LOCAL_FILE"; do
-    if [[ -f "$legacy_file" ]]; then
-        PROJECT_LEGACY_FILES+=("$legacy_file")
-    fi
-done
-
-USER_HAS_YAML=false
-if [[ -f "$DEFAULT_CONFIG_FILE" || -f "$DEFAULT_CONFIG_LOCAL_FILE" ]]; then
-    USER_HAS_YAML=true
-fi
-PROJECT_HAS_YAML=false
-if [[ -f "$PROJECT_CONFIG_FILE" || -f "$PROJECT_CONFIG_LOCAL_FILE" || -n "$MAIN_CHECKOUT_CONFIG_LOCAL_FILE" ]]; then
-    PROJECT_HAS_YAML=true
-fi
-
-if [[ "$MIGRATE_PROJECT_CONFIG" = true ]]; then
-    if [[ ${#PROJECT_LEGACY_FILES[@]} -eq 0 ]]; then
-        echo "No legacy configuration files found in $PROJECT_CONFIG_DIR, nothing to migrate" >&2
-        exit 0
-    fi
-    explain_legacy_migration "$PROJECT_CONFIG_FILE" "$PROJECT_CONFIG_LOCAL_FILE" \
-        "$PROJECT_HAS_YAML" "${PROJECT_LEGACY_FILES[@]}"
-    echo >&2
-    migrate_legacy_config "$PROJECT_CONFIG_FILE" "$PROJECT_CONFIG_LOCAL_FILE" \
-        "$PROJECT_WHITELIST_FILE" "$PROJECT_BLACKLIST_FILE" \
-        "$PROJECT_ENV_FILE" "$PROJECT_ENV_LOCAL_FILE" || exit 1
-    echo -e "\n${GREEN}Project configuration migrated.${NC} Review the result, delete the *.migrated files and commit." >&2
-    echo "Team members need a sandbox version that supports config.yaml before they pull this change." >&2
-    if [[ -n "${MIGRATED_TARGETS[*]}" && " ${MIGRATED_TARGETS[*]} " == *" $PROJECT_CONFIG_LOCAL_FILE "* ]] \
-        && git -C "$WORKING_DIR" rev-parse --is-inside-work-tree &>/dev/null \
-        && ! git -C "$WORKING_DIR" check-ignore -q "$PROJECT_CONFIG_LOCAL_FILE"; then
-        echo -e "${YELLOW}Warning: $PROJECT_CONFIG_LOCAL_FILE is not ignored by git; add it to .gitignore, it holds the former .env.local entries${NC}" >&2
-    fi
-    exit 0
-fi
-
-# Offer to migrate the user-level files when someone can answer. After a
-# successful migration the script restarts so the new config.yaml is loaded
-# with the usual precedence (config files are parsed before the command line).
-if [[ ${#USER_LEGACY_FILES[@]} -gt 0 && -t 0 && -t 2 ]]; then
-    explain_legacy_migration "$DEFAULT_CONFIG_FILE" "$DEFAULT_CONFIG_LOCAL_FILE" \
-        "$USER_HAS_YAML" "${USER_LEGACY_FILES[@]}"
-    migrate_answer=""
-    read -r -p "Migrate your user-level configuration now? [y/N] " migrate_answer || migrate_answer=""
-    case "$migrate_answer" in
-        y|Y|yes|Yes|YES)
-            if migrate_legacy_config "$DEFAULT_CONFIG_FILE" "$DEFAULT_CONFIG_LOCAL_FILE" \
-                "$DEFAULT_WHITELIST_FILE" "$DEFAULT_BLACKLIST_FILE" \
-                "$DEFAULT_ENV_FILE" "$DEFAULT_ENV_LOCAL_FILE"; then
-                echo -e "${GREEN}User configuration migrated, restarting with $DEFAULT_CONFIG_FILE${NC}\n" >&2
-                exec "$BASH" "$0" "${ORIGINAL_ARGS[@]}"
-            fi
-            ;;
-        *)
-            echo "Not migrating; you will be asked again on the next start." >&2
-            ;;
-    esac
-fi
-
-warn_legacy_files "user-level" "$DEFAULT_CONFIG_FILE" "$USER_HAS_YAML" \
-    "start the sandbox in a terminal to migrate them automatically" "${USER_LEGACY_FILES[@]}"
-warn_legacy_files "project-level" "$PROJECT_CONFIG_FILE" "$PROJECT_HAS_YAML" \
-    "run with --migrate-project-conf to migrate them" "${PROJECT_LEGACY_FILES[@]}"
-
-if [[ -z "$PROFILE" ]]; then
-    PROFILE="default"
-    PROFILE_SOURCE="default"
-fi
-check_project_profile
-validate_profile_name
-resolve_profile_home
 
 # Check Docker availability when enabled
 validate_docker() {
@@ -1823,7 +1540,6 @@ cleanup_socket_proxy() {
     fi
 }
 
-
 # --- Network isolation ---------------------------------------------------------
 #
 # In isolated mode bwrap keeps a new network namespace and pasta (package passt)
@@ -2134,14 +1850,6 @@ forward_signal_and_exit() {
     fi
     exit "$2"
 }
-
-trap cleanup_sandbox EXIT
-trap 'forward_signal_and_exit HUP "$SIGHUP_EXIT_STATUS"' HUP
-trap 'forward_signal_and_exit TERM "$SIGTERM_EXIT_STATUS"' TERM
-# Ctrl+C belongs to the agent: a trapped (not ignored) signal keeps the default
-# disposition in the children, and bash just returns to waiting. bwrap itself
-# ignores SIGINT, so the sandbox survives it like a foreground child would.
-trap ':' INT
 
 # Usage: run_in_sandbox <command> [args...]; returns the command's exit status
 run_in_sandbox() {
@@ -2830,6 +2538,559 @@ prepare_claude_native_install() {
     fi
 }
 
+# OpenCode 1 and 2 have different command lines (see build_opencode_launch_args),
+# so the major version is read from the installed binary before the sandbox
+# starts. Unknown or unreadable versions are treated as the current major (2).
+OPENCODE_MAJOR_VERSION=""
+detect_opencode_version() {
+    local output=""
+    if command -v timeout >/dev/null 2>&1; then
+        output=$(timeout 15 "$AGENT_BIN" --version 2>/dev/null) || output=""
+    else
+        output=$("$AGENT_BIN" --version 2>/dev/null) || output=""
+    fi
+    if [[ "$output" =~ ([0-9]+)\.[0-9]+ ]]; then
+        OPENCODE_MAJOR_VERSION="${BASH_REMATCH[1]}"
+    else
+        OPENCODE_MAJOR_VERSION=2
+        log_info "${YELLOW}⚠${NC} Could not detect the OpenCode version from '$AGENT_BIN --version', assuming OpenCode 2"
+    fi
+}
+
+# --- Claude Code command line --------------------------------------------------
+#
+# The sandbox is the safety net, so Claude Code normally runs with
+# --dangerously-skip-permissions. An orchestrator such as T3 Code chooses the
+# permission mode itself (--permission-mode <mode>, plus
+# --dangerously-skip-permissions for its "Full access" mode); forcing the flag
+# would silently turn its supervised modes into full access.
+claude_should_add_skip_permissions() {
+    local arg
+    for arg in "${AGENT_ARGS[@]}"; do
+        case "$arg" in
+            --permission-mode|--permission-mode=*|--dangerously-skip-permissions|--allow-dangerously-skip-permissions)
+                return 1
+                ;;
+        esac
+    done
+    return 0
+}
+
+# --- OpenCode 1 command line ---------------------------------------------------
+
+opencode1_option_takes_value() {
+    case "$1" in
+        --agent|--attach|--command|--dir|--file|--hostname|--log-level|--mdns-domain|--method|--model|--password|--port|--prompt|--session|--title|--username|--variant|-f|-m|-p|-s|-u)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+opencode1_command_accepts_default_agent() {
+    case "$1" in
+        ""|run)
+            return 0
+            ;;
+        acp|agent|attach|auth|completion|db|debug|export|github|import|mcp|models|plugin|plug|pr|providers|serve|session|stats|uninstall|upgrade|web)
+            return 1
+            ;;
+    esac
+
+    # Non-command positionals are treated as the default command's project path.
+    return 0
+}
+
+opencode1_should_add_default_agent() {
+    local arg
+    local consume_next=false
+    local explicit_agent=false
+
+    for arg in "${AGENT_ARGS[@]}"; do
+        if [[ "$consume_next" = true ]]; then
+            consume_next=false
+            continue
+        fi
+
+        case "$arg" in
+            --)
+                break
+                ;;
+            --agent|--agent=*)
+                explicit_agent=true
+                if [[ "$arg" != *=* ]]; then
+                    consume_next=true
+                fi
+                continue
+                ;;
+            --*=*)
+                continue
+                ;;
+            --*)
+                if opencode1_option_takes_value "$arg"; then
+                    consume_next=true
+                fi
+                continue
+                ;;
+            -f|-m|-p|-s|-u)
+                consume_next=true
+                continue
+                ;;
+            -*)
+                continue
+                ;;
+            *)
+                if [[ "$explicit_agent" = true ]]; then
+                    return 1
+                fi
+                opencode1_command_accepts_default_agent "$arg"
+                return
+                ;;
+        esac
+    done
+
+    [[ "$explicit_agent" = false ]]
+}
+
+# --- OpenCode 2 command line ---------------------------------------------------
+#
+# OpenCode 2 connects every command to one shared background server per user,
+# discovered through ~/.local/state/opencode/service.json and reached over the
+# loopback interface. The server owns tool execution, so from inside the sandbox
+# (shared network namespace, state directory bound from the profile) the agent
+# would run its commands outside the sandbox. --standalone makes the client
+# spawn a private server as its own child instead, which keeps everything
+# inside. Permissions are a flag now (--auto) rather than OPENCODE_PERMISSION.
+
+opencode2_option_takes_value() {
+    case "$1" in
+        --server|--session|--prompt|--model|--agent|--format|--file|--title|--replay-limit|--log-level|--completions|-s|-m|-f)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+# Fills AGENT_LAUNCH_ARGS from AGENT_ARGS, inserting --standalone after the
+# (sub)command for every command that accepts it and --auto for the two
+# commands with permission flags (the TUI and run). Flags the user passed
+# themselves are respected.
+build_opencode2_launch_args() {
+    local -a positionals=()
+    local -a positional_index=()
+    local consume_next=false
+    local has_server_flag=false
+    local has_permission_flag=false
+    local explicit_server=false
+    local i arg
+
+    for ((i = 0; i < ${#AGENT_ARGS[@]}; i++)); do
+        arg="${AGENT_ARGS[i]}"
+        if [[ "$consume_next" = true ]]; then
+            consume_next=false
+            continue
+        fi
+
+        case "$arg" in
+            --)
+                break
+                ;;
+            --standalone)
+                has_server_flag=true
+                ;;
+            --server|--server=*)
+                has_server_flag=true
+                explicit_server=true
+                if [[ "$arg" == "--server" ]]; then
+                    consume_next=true
+                fi
+                ;;
+            --auto|--yolo|--dangerously-skip-permissions)
+                has_permission_flag=true
+                ;;
+            --*=*)
+                ;;
+            -*)
+                if opencode2_option_takes_value "$arg"; then
+                    consume_next=true
+                fi
+                ;;
+            *)
+                positionals+=("$arg")
+                positional_index+=("$i")
+                ;;
+        esac
+    done
+
+    local command="${positionals[0]:-}"
+    local subcommand="${positionals[1]:-}"
+    local insert_at=0
+    local add_server=false
+    local add_permission=false
+
+    case "$command" in
+        "")
+            # Interactive TUI
+            add_server=true
+            add_permission=true
+            ;;
+        run)
+            add_server=true
+            add_permission=true
+            insert_at=$((positional_index[0] + 1))
+            ;;
+        api|models|stats|mini|reload)
+            add_server=true
+            insert_at=$((positional_index[0] + 1))
+            ;;
+        session)
+            case "$subcommand" in
+                list|delete|export|import)
+                    add_server=true
+                    insert_at=$((positional_index[1] + 1))
+                    ;;
+            esac
+            ;;
+        auth)
+            case "$subcommand" in
+                list|login|logout|export|import|switch)
+                    add_server=true
+                    insert_at=$((positional_index[1] + 1))
+                    ;;
+            esac
+            ;;
+        upgrade|update|uninstall|acp|debug|mcp|plugin|pair|serve|service)
+            # No --standalone/--auto flags on these commands
+            ;;
+        *)
+            # Any other positional is the TUI's project directory argument
+            add_server=true
+            add_permission=true
+            ;;
+    esac
+
+    if [[ "$has_server_flag" = true ]]; then
+        add_server=false
+    fi
+    if [[ "$has_permission_flag" = true ]]; then
+        add_permission=false
+    fi
+    if [[ "$explicit_server" = true ]]; then
+        log_info "${YELLOW}⚠${NC} --server given: OpenCode will execute tools on that server, outside the sandbox"
+    fi
+
+    AGENT_LAUNCH_ARGS=("${AGENT_ARGS[@]:0:insert_at}")
+    if [[ "$add_server" = true ]]; then
+        AGENT_LAUNCH_ARGS+=(--standalone)
+    fi
+    if [[ "$add_permission" = true ]]; then
+        AGENT_LAUNCH_ARGS+=(--auto)
+    fi
+    AGENT_LAUNCH_ARGS+=("${AGENT_ARGS[@]:insert_at}")
+}
+
+# --- Main ----------------------------------------------------------------------
+#
+# Everything above only defines functions and defaults. When the script is
+# sourced (the bats tests in tests/ do this to call single functions), stop
+# here so nothing is parsed, mounted or started.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
+
+resolve_git_worktree
+load_config_files
+
+# The environment variable beats config files on purpose: a repository must not
+# be able to silently switch the credentials a user chose in their shell.
+if [[ -n "${AI_AGENT_SANDBOX_PROFILE:-}" ]]; then
+    PROFILE="$AI_AGENT_SANDBOX_PROFILE"
+    PROFILE_SOURCE="AI_AGENT_SANDBOX_PROFILE"
+fi
+
+# A project that names a profile may not switch the profile, but it may refuse
+# to run under a different one coming from the environment. Orchestrators such
+# as T3 Code set AI_AGENT_SANDBOX_PROFILE per provider instance, so picking the
+# wrong instance in a new thread would otherwise bill the wrong subscription.
+# An instance without the variable uses the host configuration (T3 reads its
+# transcripts and usage from there), so with --strict-profile (passed by the
+# orchestrator's wrapper) a missing variable counts as "default". Otherwise the
+# project's profile simply applies. An explicit --profile is a deliberate
+# choice and wins.
+check_project_profile() {
+    [[ -n "$PROJECT_PROFILE" ]] || return 0
+    local requested origin
+    if [[ "$PROFILE_SOURCE" == AI_AGENT_SANDBOX_PROFILE ]]; then
+        requested="$PROFILE"
+        origin="AI_AGENT_SANDBOX_PROFILE is '$requested'"
+    elif [[ "$STRICT_PROFILE" = true && "$PROFILE_SOURCE" != --profile ]]; then
+        requested="default"
+        origin="AI_AGENT_SANDBOX_PROFILE is not set (counts as 'default' with --strict-profile)"
+    else
+        return 0
+    fi
+    [[ "$PROJECT_PROFILE" != "$requested" ]] || return 0
+    echo -e "${RED}Error: profile mismatch: $PROJECT_PROFILE_SOURCE requires profile '$PROJECT_PROFILE', but $origin${NC}" >&2
+    echo "In an orchestrator such as T3 Code, start the thread with the provider instance of profile '$PROJECT_PROFILE'." >&2
+    echo "To run under '$requested' anyway, pass --profile $requested." >&2
+    exit 1
+}
+
+if [[ -n "${AI_AGENT_SANDBOX_NETWORK:-}" ]]; then
+    validate_network_mode "$AI_AGENT_SANDBOX_NETWORK" || { echo -e "${RED}Error: invalid AI_AGENT_SANDBOX_NETWORK '$AI_AGENT_SANDBOX_NETWORK' (expected isolated, host or none)${NC}" >&2; exit 1; }
+    NETWORK_MODE="$AI_AGENT_SANDBOX_NETWORK"
+    NETWORK_MODE_SOURCE="AI_AGENT_SANDBOX_NETWORK"
+fi
+
+# Parse command line arguments (kept for the restart after a config migration)
+ORIGINAL_ARGS=("$@")
+AGENT_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --whitelist|--blacklist|--env-path)
+            echo -e "${RED}Error: $1 is no longer supported, put the entries into the whitelist, blacklist or env key of a config.yaml${NC}" >&2
+            exit 1
+            ;;
+        --profile|-p)
+            PROFILE="$2"
+            PROFILE_SOURCE="--profile"
+            shift 2
+            ;;
+        --list-profiles)
+            LIST_PROFILES=true
+            shift
+            ;;
+        --strict-profile)
+            STRICT_PROFILE=true
+            shift
+            ;;
+        --allow-home-workdir)
+            ALLOW_HOME_WORKDIR=true
+            shift
+            ;;
+        --migrate-project-conf)
+            MIGRATE_PROJECT_CONFIG=true
+            shift
+            ;;
+        --no-docker)
+            ENABLE_DOCKER=false
+            shift
+            ;;
+        --no-venv)
+            ENABLE_VENV=false
+            shift
+            ;;
+        --gitconfig)
+            MOUNT_GITCONFIG=true
+            shift
+            ;;
+        --no-gpg-agent)
+            ENABLE_GPG_AGENT=false
+            shift
+            ;;
+        --no-protect-project-config)
+            PROTECT_PROJECT_CONFIG=false
+            shift
+            ;;
+        --env|-e)
+            ENV_VARS+=("$2")
+            shift 2
+            ;;
+        --blacklist-path)
+            BLACKLIST_PATHS+=("$2")
+            EXPLICIT_BLACKLIST=true
+            shift 2
+            ;;
+        --whitelist-path)
+            WHITELIST_PATHS_RO+=("$2")
+            EXPLICIT_WHITELIST=true
+            shift 2
+            ;;
+        --whitelist-path-rw)
+            WHITELIST_PATHS_RW+=("$2")
+            EXPLICIT_WHITELIST=true
+            shift 2
+            ;;
+        --enable-docker|-d)
+            ENABLE_DOCKER=true
+            shift
+            ;;
+        --venv)
+            ENABLE_VENV=true
+            shift
+            ;;
+        --no-gitconfig)
+            MOUNT_GITCONFIG=false
+            shift
+            ;;
+        --shared-skills)
+            SHARE_SKILLS=true
+            shift
+            ;;
+        --no-shared-skills)
+            SHARE_SKILLS=false
+            shift
+            ;;
+        --gpg-agent)
+            ENABLE_GPG_AGENT=true
+            shift
+            ;;
+        --docker-image)
+            SOCKET_PROXY_IMAGE="$2"
+            shift 2
+            ;;
+        --network)
+            validate_network_mode "$2" || { echo -e "${RED}Error: invalid --network mode '$2' (expected isolated, host or none)${NC}" >&2; exit 1; }
+            NETWORK_MODE="$2"
+            NETWORK_MODE_SOURCE="--network"
+            shift 2
+            ;;
+        --host-port)
+            validate_host_port "$2" || { echo -e "${RED}Error: invalid --host-port '$2' (expected a TCP port or range a-b)${NC}" >&2; exit 1; }
+            NETWORK_HOST_PORTS+=("$2")
+            shift 2
+            ;;
+        --allow-host)
+            NETWORK_ALLOW_HOSTS+=("$2")
+            shift 2
+            ;;
+        --agent|-a)
+            AGENT="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --quiet|-q)
+            QUIET=true
+            shift
+            ;;
+        --verbose|-v)
+            QUIET=false
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        --)
+            shift
+            AGENT_ARGS=("$@")
+            break
+            ;;
+        *)
+            echo -e "${RED}Error: Unknown option $1${NC}" >&2
+            usage
+            ;;
+    esac
+done
+
+# Configuration files were parsed before the command line so that flags win;
+# now that --quiet/--verbose are known, report what the parser had to say.
+# A bare version query is answered by the host binary without a sandbox (see
+# below); decided before agent_args from the config are prepended.
+if [[ ${#AGENT_ARGS[@]} -eq 1 && ( "${AGENT_ARGS[0]}" == "--version" || "${AGENT_ARGS[0]}" == "-v" ) ]]; then
+    VERSION_QUERY=true
+fi
+AGENT_ARGS=("${CONFIG_AGENT_ARGS[@]}" "${AGENT_ARGS[@]}")
+flush_config_log
+
+if [[ "$LIST_PROFILES" = true ]]; then
+    list_profiles
+    exit 0
+fi
+
+USER_LEGACY_FILES=()
+for legacy_file in "$DEFAULT_WHITELIST_FILE" "$DEFAULT_BLACKLIST_FILE" \
+    "$DEFAULT_ENV_FILE" "$DEFAULT_ENV_LOCAL_FILE"; do
+    if [[ -f "$legacy_file" ]]; then
+        USER_LEGACY_FILES+=("$legacy_file")
+    fi
+done
+PROJECT_LEGACY_FILES=()
+for legacy_file in "$PROJECT_WHITELIST_FILE" "$PROJECT_BLACKLIST_FILE" \
+    "$PROJECT_ENV_FILE" "$PROJECT_ENV_LOCAL_FILE"; do
+    if [[ -f "$legacy_file" ]]; then
+        PROJECT_LEGACY_FILES+=("$legacy_file")
+    fi
+done
+
+USER_HAS_YAML=false
+if [[ -f "$DEFAULT_CONFIG_FILE" || -f "$DEFAULT_CONFIG_LOCAL_FILE" ]]; then
+    USER_HAS_YAML=true
+fi
+PROJECT_HAS_YAML=false
+if [[ -f "$PROJECT_CONFIG_FILE" || -f "$PROJECT_CONFIG_LOCAL_FILE" || -n "$MAIN_CHECKOUT_CONFIG_LOCAL_FILE" ]]; then
+    PROJECT_HAS_YAML=true
+fi
+
+if [[ "$MIGRATE_PROJECT_CONFIG" = true ]]; then
+    if [[ ${#PROJECT_LEGACY_FILES[@]} -eq 0 ]]; then
+        echo "No legacy configuration files found in $PROJECT_CONFIG_DIR, nothing to migrate" >&2
+        exit 0
+    fi
+    explain_legacy_migration "$PROJECT_CONFIG_FILE" "$PROJECT_CONFIG_LOCAL_FILE" \
+        "$PROJECT_HAS_YAML" "${PROJECT_LEGACY_FILES[@]}"
+    echo >&2
+    migrate_legacy_config "$PROJECT_CONFIG_FILE" "$PROJECT_CONFIG_LOCAL_FILE" \
+        "$PROJECT_WHITELIST_FILE" "$PROJECT_BLACKLIST_FILE" \
+        "$PROJECT_ENV_FILE" "$PROJECT_ENV_LOCAL_FILE" || exit 1
+    echo -e "\n${GREEN}Project configuration migrated.${NC} Review the result, delete the *.migrated files and commit." >&2
+    echo "Team members need a sandbox version that supports config.yaml before they pull this change." >&2
+    if [[ -n "${MIGRATED_TARGETS[*]}" && " ${MIGRATED_TARGETS[*]} " == *" $PROJECT_CONFIG_LOCAL_FILE "* ]] \
+        && git -C "$WORKING_DIR" rev-parse --is-inside-work-tree &>/dev/null \
+        && ! git -C "$WORKING_DIR" check-ignore -q "$PROJECT_CONFIG_LOCAL_FILE"; then
+        echo -e "${YELLOW}Warning: $PROJECT_CONFIG_LOCAL_FILE is not ignored by git; add it to .gitignore, it holds the former .env.local entries${NC}" >&2
+    fi
+    exit 0
+fi
+
+# Offer to migrate the user-level files when someone can answer. After a
+# successful migration the script restarts so the new config.yaml is loaded
+# with the usual precedence (config files are parsed before the command line).
+if [[ ${#USER_LEGACY_FILES[@]} -gt 0 && -t 0 && -t 2 ]]; then
+    explain_legacy_migration "$DEFAULT_CONFIG_FILE" "$DEFAULT_CONFIG_LOCAL_FILE" \
+        "$USER_HAS_YAML" "${USER_LEGACY_FILES[@]}"
+    migrate_answer=""
+    read -r -p "Migrate your user-level configuration now? [y/N] " migrate_answer || migrate_answer=""
+    case "$migrate_answer" in
+        y|Y|yes|Yes|YES)
+            if migrate_legacy_config "$DEFAULT_CONFIG_FILE" "$DEFAULT_CONFIG_LOCAL_FILE" \
+                "$DEFAULT_WHITELIST_FILE" "$DEFAULT_BLACKLIST_FILE" \
+                "$DEFAULT_ENV_FILE" "$DEFAULT_ENV_LOCAL_FILE"; then
+                echo -e "${GREEN}User configuration migrated, restarting with $DEFAULT_CONFIG_FILE${NC}\n" >&2
+                exec "$BASH" "$0" "${ORIGINAL_ARGS[@]}"
+            fi
+            ;;
+        *)
+            echo "Not migrating; you will be asked again on the next start." >&2
+            ;;
+    esac
+fi
+
+warn_legacy_files "user-level" "$DEFAULT_CONFIG_FILE" "$USER_HAS_YAML" \
+    "start the sandbox in a terminal to migrate them automatically" "${USER_LEGACY_FILES[@]}"
+warn_legacy_files "project-level" "$PROJECT_CONFIG_FILE" "$PROJECT_HAS_YAML" \
+    "run with --migrate-project-conf to migrate them" "${PROJECT_LEGACY_FILES[@]}"
+
+if [[ -z "$PROFILE" ]]; then
+    PROFILE="default"
+    PROFILE_SOURCE="default"
+fi
+check_project_profile
+validate_profile_name
+resolve_profile_home
+
+trap cleanup_sandbox EXIT
+trap 'forward_signal_and_exit HUP "$SIGHUP_EXIT_STATUS"' HUP
+trap 'forward_signal_and_exit TERM "$SIGTERM_EXIT_STATUS"' TERM
+# Ctrl+C belongs to the agent: a trapped (not ignored) signal keeps the default
+# disposition in the children, and bash just returns to waiting. bwrap itself
+# ignores SIGINT, so the sandbox survives it like a foreground child would.
+trap ':' INT
+
 # Validate agent selection
 if [[ "$AGENT" != "claudecode" ]] && [[ "$AGENT" != "opencode" ]]; then
     echo -e "${RED}Error: Invalid agent '$AGENT'. Must be 'claudecode' or 'opencode'${NC}" >&2
@@ -2898,24 +3159,6 @@ if [[ "$ALLOW_HOME_WORKDIR" = false ]] \
     exit 1
 fi
 
-# OpenCode 1 and 2 have different command lines (see build_opencode_launch_args),
-# so the major version is read from the installed binary before the sandbox
-# starts. Unknown or unreadable versions are treated as the current major (2).
-OPENCODE_MAJOR_VERSION=""
-detect_opencode_version() {
-    local output=""
-    if command -v timeout >/dev/null 2>&1; then
-        output=$(timeout 15 "$AGENT_BIN" --version 2>/dev/null) || output=""
-    else
-        output=$("$AGENT_BIN" --version 2>/dev/null) || output=""
-    fi
-    if [[ "$output" =~ ([0-9]+)\.[0-9]+ ]]; then
-        OPENCODE_MAJOR_VERSION="${BASH_REMATCH[1]}"
-    else
-        OPENCODE_MAJOR_VERSION=2
-        log_info "${YELLOW}⚠${NC} Could not detect the OpenCode version from '$AGENT_BIN --version', assuming OpenCode 2"
-    fi
-}
 if [[ "$AGENT" = "opencode" ]] && [[ -x "$AGENT_BIN" ]]; then
     detect_opencode_version
 fi
@@ -3348,240 +3591,6 @@ if [[ ${#ENV_VARS[@]} -gt 0 ]]; then
         set_sandbox_env "$env_var" "--env"
     done
 fi
-
-# --- Claude Code command line --------------------------------------------------
-#
-# The sandbox is the safety net, so Claude Code normally runs with
-# --dangerously-skip-permissions. An orchestrator such as T3 Code chooses the
-# permission mode itself (--permission-mode <mode>, plus
-# --dangerously-skip-permissions for its "Full access" mode); forcing the flag
-# would silently turn its supervised modes into full access.
-claude_should_add_skip_permissions() {
-    local arg
-    for arg in "${AGENT_ARGS[@]}"; do
-        case "$arg" in
-            --permission-mode|--permission-mode=*|--dangerously-skip-permissions|--allow-dangerously-skip-permissions)
-                return 1
-                ;;
-        esac
-    done
-    return 0
-}
-
-# --- OpenCode 1 command line ---------------------------------------------------
-
-opencode1_option_takes_value() {
-    case "$1" in
-        --agent|--attach|--command|--dir|--file|--hostname|--log-level|--mdns-domain|--method|--model|--password|--port|--prompt|--session|--title|--username|--variant|-f|-m|-p|-s|-u)
-            return 0
-            ;;
-    esac
-
-    return 1
-}
-
-opencode1_command_accepts_default_agent() {
-    case "$1" in
-        ""|run)
-            return 0
-            ;;
-        acp|agent|attach|auth|completion|db|debug|export|github|import|mcp|models|plugin|plug|pr|providers|serve|session|stats|uninstall|upgrade|web)
-            return 1
-            ;;
-    esac
-
-    # Non-command positionals are treated as the default command's project path.
-    return 0
-}
-
-opencode1_should_add_default_agent() {
-    local arg
-    local consume_next=false
-    local explicit_agent=false
-
-    for arg in "${AGENT_ARGS[@]}"; do
-        if [[ "$consume_next" = true ]]; then
-            consume_next=false
-            continue
-        fi
-
-        case "$arg" in
-            --)
-                break
-                ;;
-            --agent|--agent=*)
-                explicit_agent=true
-                if [[ "$arg" != *=* ]]; then
-                    consume_next=true
-                fi
-                continue
-                ;;
-            --*=*)
-                continue
-                ;;
-            --*)
-                if opencode1_option_takes_value "$arg"; then
-                    consume_next=true
-                fi
-                continue
-                ;;
-            -f|-m|-p|-s|-u)
-                consume_next=true
-                continue
-                ;;
-            -*)
-                continue
-                ;;
-            *)
-                if [[ "$explicit_agent" = true ]]; then
-                    return 1
-                fi
-                opencode1_command_accepts_default_agent "$arg"
-                return
-                ;;
-        esac
-    done
-
-    [[ "$explicit_agent" = false ]]
-}
-
-# --- OpenCode 2 command line ---------------------------------------------------
-#
-# OpenCode 2 connects every command to one shared background server per user,
-# discovered through ~/.local/state/opencode/service.json and reached over the
-# loopback interface. The server owns tool execution, so from inside the sandbox
-# (shared network namespace, state directory bound from the profile) the agent
-# would run its commands outside the sandbox. --standalone makes the client
-# spawn a private server as its own child instead, which keeps everything
-# inside. Permissions are a flag now (--auto) rather than OPENCODE_PERMISSION.
-
-opencode2_option_takes_value() {
-    case "$1" in
-        --server|--session|--prompt|--model|--agent|--format|--file|--title|--replay-limit|--log-level|--completions|-s|-m|-f)
-            return 0
-            ;;
-    esac
-
-    return 1
-}
-
-# Fills AGENT_LAUNCH_ARGS from AGENT_ARGS, inserting --standalone after the
-# (sub)command for every command that accepts it and --auto for the two
-# commands with permission flags (the TUI and run). Flags the user passed
-# themselves are respected.
-build_opencode2_launch_args() {
-    local -a positionals=()
-    local -a positional_index=()
-    local consume_next=false
-    local has_server_flag=false
-    local has_permission_flag=false
-    local explicit_server=false
-    local i arg
-
-    for ((i = 0; i < ${#AGENT_ARGS[@]}; i++)); do
-        arg="${AGENT_ARGS[i]}"
-        if [[ "$consume_next" = true ]]; then
-            consume_next=false
-            continue
-        fi
-
-        case "$arg" in
-            --)
-                break
-                ;;
-            --standalone)
-                has_server_flag=true
-                ;;
-            --server|--server=*)
-                has_server_flag=true
-                explicit_server=true
-                if [[ "$arg" == "--server" ]]; then
-                    consume_next=true
-                fi
-                ;;
-            --auto|--yolo|--dangerously-skip-permissions)
-                has_permission_flag=true
-                ;;
-            --*=*)
-                ;;
-            -*)
-                if opencode2_option_takes_value "$arg"; then
-                    consume_next=true
-                fi
-                ;;
-            *)
-                positionals+=("$arg")
-                positional_index+=("$i")
-                ;;
-        esac
-    done
-
-    local command="${positionals[0]:-}"
-    local subcommand="${positionals[1]:-}"
-    local insert_at=0
-    local add_server=false
-    local add_permission=false
-
-    case "$command" in
-        "")
-            # Interactive TUI
-            add_server=true
-            add_permission=true
-            ;;
-        run)
-            add_server=true
-            add_permission=true
-            insert_at=$((positional_index[0] + 1))
-            ;;
-        api|models|stats|mini|reload)
-            add_server=true
-            insert_at=$((positional_index[0] + 1))
-            ;;
-        session)
-            case "$subcommand" in
-                list|delete|export|import)
-                    add_server=true
-                    insert_at=$((positional_index[1] + 1))
-                    ;;
-            esac
-            ;;
-        auth)
-            case "$subcommand" in
-                list|login|logout|export|import|switch)
-                    add_server=true
-                    insert_at=$((positional_index[1] + 1))
-                    ;;
-            esac
-            ;;
-        upgrade|update|uninstall|acp|debug|mcp|plugin|pair|serve|service)
-            # No --standalone/--auto flags on these commands
-            ;;
-        *)
-            # Any other positional is the TUI's project directory argument
-            add_server=true
-            add_permission=true
-            ;;
-    esac
-
-    if [[ "$has_server_flag" = true ]]; then
-        add_server=false
-    fi
-    if [[ "$has_permission_flag" = true ]]; then
-        add_permission=false
-    fi
-    if [[ "$explicit_server" = true ]]; then
-        log_info "${YELLOW}⚠${NC} --server given: OpenCode will execute tools on that server, outside the sandbox"
-    fi
-
-    AGENT_LAUNCH_ARGS=("${AGENT_ARGS[@]:0:insert_at}")
-    if [[ "$add_server" = true ]]; then
-        AGENT_LAUNCH_ARGS+=(--standalone)
-    fi
-    if [[ "$add_permission" = true ]]; then
-        AGENT_LAUNCH_ARGS+=(--auto)
-    fi
-    AGENT_LAUNCH_ARGS+=("${AGENT_ARGS[@]:insert_at}")
-}
 
 # Build the agent command line (sandbox defaults merged with user args)
 AGENT_LAUNCH_ARGS=()
