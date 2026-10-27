@@ -1563,6 +1563,8 @@ cleanup_socket_proxy() {
 # (joining a user namespace one created grants all capabilities in it), and
 # --userns2 moves the sandboxed process into the second, nested one, where it
 # has no capabilities over the network namespace and cannot alter the routes.
+# The first one maps our uid to root, so commands run in it (ip) keep its
+# capabilities across exec; the second maps root of the first back to our uid.
 
 # Decides the effective mode and checks the tools it needs. Fatal when the user
 # asked for isolation explicitly; a silent default falls back to the host
@@ -1589,8 +1591,6 @@ resolve_network_mode() {
     [[ -n "$PASTA_BIN" ]] || missing+=("pasta (package passt)")
     if [[ -z "$NSENTER_BIN" ]]; then
         missing+=("nsenter (package util-linux)")
-    elif ! "$NSENTER_BIN" --help 2>&1 | grep -q -- --keep-caps; then
-        missing+=("nsenter with --keep-caps (util-linux >= 2.37)")
     fi
     [[ -n "$IP_BIN" ]] || missing+=("ip (package iproute2)")
     [[ ${#missing[@]} -eq 0 ]] && return 0
@@ -1649,21 +1649,23 @@ prepare_isolated_network() {
     BWRAP_ARGS+=(--ro-bind "$NETWORK_TMP_DIR/resolv.conf" /etc/resolv.conf)
 }
 
-# Creates a user namespace mapping our uid and gid to themselves and stores an
-# fd to it in the variable named by $1; with a parent fd in $2 the namespace is
-# nested in that one (its maps must be written from inside the parent, which
-# unshare does when run through nsenter). The fd alone keeps the namespace
-# alive, the helper process is only needed until the fd is open.
+# Creates a user namespace and stores an fd to it in the variable named by $1.
+# Without a parent it maps our uid and gid to root; with a parent fd in $2 the
+# namespace is nested in that one and maps root of the parent back to our uid
+# and gid (the maps must be written from inside the parent, which unshare does
+# when run through nsenter). The fd alone keeps the namespace alive, the helper
+# process is only needed until the fd is open.
 create_user_namespace() {
     local out_ref="$1" parent_fd="${2:-}" holder own parent current fd i
-    local -a cmd=()
+    local -a cmd=() map=(--map-root-user)
     own=$(readlink /proc/self/ns/user)
     parent="$own"
     if [[ -n "$parent_fd" ]]; then
         cmd=("$NSENTER_BIN" --preserve-credentials --user="/proc/self/fd/$parent_fd" --)
         parent=$(readlink "/proc/self/fd/$parent_fd")
+        map=(--map-user="$(id -u)" --map-group="$(id -g)")
     fi
-    "${cmd[@]}" "$UNSHARE_BIN" --user --map-user="$(id -u)" --map-group="$(id -g)" -- sleep 60 &
+    "${cmd[@]}" "$UNSHARE_BIN" --user "${map[@]}" -- sleep 60 &
     holder=$!
     # The holder starts in our namespace, moves to the parent (nsenter) and
     # ends up in the new one, where unshare writes both maps before it execs
@@ -1688,11 +1690,11 @@ create_user_namespace() {
 }
 
 # Runs a command inside the sandbox's network namespace with the capabilities
-# of the user namespace that owns it (ours, see above). --keep-caps (util-linux
-# >= 2.37) carries them over the exec as ambient capabilities; a non-root uid
-# would otherwise lose them when running ip.
+# of the user namespace that owns it (ours, see above). Our uid is root there,
+# so the command keeps them across exec (nsenter --keep-caps, which would do
+# that for a non-root uid, needs util-linux >= 2.40; Ubuntu 24.04 has 2.39).
 ns_exec() {
-    "$NSENTER_BIN" --preserve-credentials --keep-caps \
+    "$NSENTER_BIN" --preserve-credentials \
         --user="/proc/self/fd/$SANDBOX_USERNS_FD" --net="/proc/$SANDBOX_CHILD_PID/ns/net" -- "$@"
 }
 
@@ -1762,11 +1764,12 @@ setup_isolated_network() {
 
     # pasta sets ping_group_range to "0 2147483647" in the namespace so ping can
     # use ICMP datagram sockets, but a group id must be mapped in the user
-    # namespace to be accepted and ours maps only our own gid: set that one.
+    # namespace to be accepted and ours maps only our own gid (root there): set
+    # that one.
     # Without it ping fails with "Operation not permitted" (CAP_NET_RAW is
     # dropped in the sandbox) although TCP/UDP work.
     # shellcheck disable=SC2016  # expanded by the inner sh
-    if ! ns_exec sh -c 'echo "$1 $1" > /proc/sys/net/ipv4/ping_group_range' sh "$(id -g)" 2>/dev/null; then
+    if ! ns_exec sh -c 'gid=$(id -g); echo "$gid $gid" > /proc/sys/net/ipv4/ping_group_range' 2>/dev/null; then
         echo -e "${YELLOW}⚠ Could not enable ICMP sockets in the sandbox network; ping will not work${NC}" >&2
     fi
 

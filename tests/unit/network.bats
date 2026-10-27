@@ -28,7 +28,7 @@ setup() {
 # Stubs for every tool isolated mode needs, with help texts of current versions
 stub_network_tools() {
     stub_command pasta
-    stub_command nsenter 'echo "  -c, --keep-caps  retain capabilities granted in user namespaces"'
+    stub_command nsenter
     stub_command unshare 'echo "     --map-user=<uid>|<name>  map current user to uid"'
     stub_command ip
 }
@@ -82,14 +82,23 @@ resolve_with_stubs() {
     assert_output --partial "Error: network isolation"
 }
 
-@test "an nsenter without --keep-caps counts as missing" {
+@test "an nsenter without --keep-caps (util-linux < 2.40) is enough" {
     stub_network_tools
     stub_command nsenter 'echo "  -F, --no-fork  do not fork before exec'\''ing <program>"'
     NETWORK_MODE=isolated
     NETWORK_MODE_SOURCE=--network
+    resolve_with_stubs
+    assert_equal "$NETWORK_MODE" isolated
+}
+
+@test "a missing nsenter is fatal for an explicit isolated mode" {
+    stub_network_tools
+    rm "$STUB_DIR/nsenter"
+    NETWORK_MODE=isolated
+    NETWORK_MODE_SOURCE=--network
     run resolve_with_stubs
     assert_failure 1
-    assert_output --partial "nsenter with --keep-caps (util-linux >= 2.37)"
+    assert_output --partial "nsenter (package util-linux)"
 }
 
 @test "an unshare without --map-user counts as missing" {
