@@ -564,6 +564,8 @@ parse_yaml_flow_map() {
 #   env: {KEY: value}     flow mapping
 #   # comments, ---/... document markers, CRLF line endings, tab indentation
 # Anything else produces a warning and is ignored.
+# The file name is only passed on for messages, nothing writes to it
+# shellcheck disable=SC2094
 parse_config_file() {
     local file="$1"
     local raw_line line lineno=0
@@ -608,7 +610,7 @@ parse_config_file() {
 
             if [[ $indent -gt 0 ]]; then
                 if [[ "$state" == pending && "$current_key" == env ]]; then
-                    state=env
+                    state="env"
                 fi
                 case "$state" in
                     env)
@@ -1763,6 +1765,7 @@ setup_isolated_network() {
     # namespace to be accepted and ours maps only our own gid: set that one.
     # Without it ping fails with "Operation not permitted" (CAP_NET_RAW is
     # dropped in the sandbox) although TCP/UDP work.
+    # shellcheck disable=SC2016  # expanded by the inner sh
     if ! ns_exec sh -c 'echo "$1 $1" > /proc/sys/net/ipv4/ping_group_range' sh "$(id -g)" 2>/dev/null; then
         echo -e "${YELLOW}⚠ Could not enable ICMP sockets in the sandbox network; ping will not work${NC}" >&2
     fi
@@ -2098,7 +2101,7 @@ display_path() {
     if [[ "$path" == "$WORKING_DIR" ]]; then
         echo "."
     elif [[ "$path" == "$WORKING_DIR/"* ]]; then
-        echo "${path#$WORKING_DIR/}"
+        echo "${path#"$WORKING_DIR"/}"
     else
         echo "$path"
     fi
@@ -2210,7 +2213,7 @@ whitelist_path() {
             local parent="${prefix%/*}"
             if [[ -d "$parent" && -n "$parent" ]]; then
                 base_dir="$parent"
-                pattern="${path#$parent}"
+                pattern="${path#"$parent"}"
                 pattern="${pattern#/}"
             fi
         else
@@ -3577,6 +3580,8 @@ if [[ ${#ENV_FILES[@]} -gt 0 ]]; then
 
         log_info "${GREEN}Processing env:${NC} $ENV_FILE"
 
+        # The file name is only passed on for messages
+        # shellcheck disable=SC2094
         while IFS= read -r line || [[ -n "$line" ]]; do
             trimmed_line=$(trim_whitespace "$line")
             [[ -z "$trimmed_line" || "$trimmed_line" =~ ^# ]] && continue

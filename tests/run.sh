@@ -5,7 +5,7 @@
 #   Without options: unit and script tests (no real sandbox is started).
 #   --integration:   also the tests that start real bwrap sandboxes; they
 #                    need unprivileged user namespaces.
-# shellcheck is run first when it is installed. Test files run in parallel
+# Runs shellcheck first when it is installed. Test files run in parallel
 # when GNU parallel is installed (pass --jobs 1 to run them sequentially).
 
 set -euo pipefail

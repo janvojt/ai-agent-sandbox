@@ -196,7 +196,7 @@ bats tests/unit/path_rules.bats # a single file
 - `tests/script/`: the script as a subprocess through `run_sandbox`, with a stub `bwrap` that records its arguments (`BWRAP_RECORDED`, the command after the first `--` in `SANDBOX_COMMAND`, colors stripped from `output`). The network mode defaults to `host` there. OpenCode is looked up at `~/.opencode/bin/opencode`, not on `PATH`
 - `tests/integration/` (bats tag `integration`): real bwrap in `--dry-run` mode with commands on stdin, isolated mode with a stub `pasta` (see "Testing from inside a sandbox" above). Needs unprivileged user namespaces; nested bwrap inside this sandbox works
 - Tests that document a known bug are written for the correct behaviour and marked `skip "BUG: …"`; remove the `skip` with the fix
-- CI (`.github/workflows/tests.yml`) runs `tests/run.sh --integration` on Ubuntu 24.04 (with `kernel.apparmor_restrict_unprivileged_userns=0`) and an advisory shellcheck job
+- CI (`.github/workflows/tests.yml`) runs `tests/run.sh --integration` on Ubuntu 24.04 (with `kernel.apparmor_restrict_unprivileged_userns=0`) and a shellcheck job (`tests/run.sh` also runs shellcheck first when it is installed, as on the GitHub runners, so any finding fails the test job too)
 
 ## Important Implementation Details
 

@@ -22,8 +22,6 @@ jobs:
 
   shellcheck:
     runs-on: ubuntu-24.04
-    # Advisory until the script is shellcheck-clean
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Run shellcheck
