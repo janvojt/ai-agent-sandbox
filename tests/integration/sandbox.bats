@@ -89,6 +89,17 @@ touch $ws/other/file && echo other-rw"
     assert_output --partial no-ssh
 }
 
+@test "OpenCode's ACP agent started in the home directory sees none of it" {
+    mkdir -p "$TEST_HOME/project"
+    printf 'secret\n' > "$TEST_HOME/project/notes"
+    cd "$TEST_HOME"
+    run_real_sandbox 'echo "PWD:$PWD"; ls -A ~/project 2>&1 || echo no-project' --agent opencode -- acp
+    assert_success
+    assert_output --partial "PWD:$TEST_HOME"
+    assert_output --partial no-project
+    refute_output --partial notes
+}
+
 @test "a git worktree outside the working directory can commit" {
     command -v git >/dev/null || skip "git is not installed"
     local repo="$BATS_TEST_TMPDIR/repo"

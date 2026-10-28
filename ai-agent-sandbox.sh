@@ -42,6 +42,11 @@ STRICT_PROFILE=false
 ALLOW_HOME_WORKDIR=false
 # Agent called with nothing but --version/-v (health checks of orchestrators)
 VERSION_QUERY=false
+# Agent command line starts with `acp` (OpenCode as an Agent Client Protocol agent)
+ACP_COMMAND=false
+# Working directory is not mounted: OpenCode's ACP agent started in the home
+# directory (T3 Code's health probe), where there is no project to give it
+NO_PROJECT_WORKDIR=false
 MIGRATE_PROJECT_CONFIG=false
 PROTECT_PROJECT_CONFIG=true
 # Host paths mounted read-only by protect_sandbox_config (refused by the Docker proxy)
@@ -2240,6 +2245,10 @@ whitelist_path() {
 
     # Convert relative paths to absolute (relative to working directory)
     if [[ "$path" != /* ]]; then
+        if [[ "$NO_PROJECT_WORKDIR" = true ]]; then
+            log_info "${YELLOW}⚠${NC} Skipped relative whitelist entry without a project directory: $1"
+            return 0
+        fi
         is_relative_path=true
         path="$WORKING_DIR/$path"
     fi
@@ -2502,7 +2511,8 @@ user_config_protect_paths() {
 # create it there anyway); git does not track empty directories.
 create_missing_project_config_dirs() {
     [[ "$PROTECT_PROJECT_CONFIG" = true ]] || return 0
-    local -a roots=("$WORKING_DIR")
+    local -a roots=()
+    [[ "$NO_PROJECT_WORKDIR" = true ]] || roots+=("$WORKING_DIR")
     local i=0 root
     while [[ $i -lt ${#BWRAP_ARGS[@]} ]]; do
         if [[ "${BWRAP_ARGS[$i]}" == "--bind" && "${BWRAP_ARGS[$((i+1))]}" == "${BWRAP_ARGS[$((i+2))]}" ]]; then
@@ -3169,6 +3179,9 @@ done
 if [[ ${#AGENT_ARGS[@]} -eq 1 && ( "${AGENT_ARGS[0]}" == "--version" || "${AGENT_ARGS[0]}" == "-v" ) ]]; then
     VERSION_QUERY=true
 fi
+if [[ ${#AGENT_ARGS[@]} -gt 0 && "${AGENT_ARGS[0]}" == "acp" ]]; then
+    ACP_COMMAND=true
+fi
 AGENT_ARGS=("${CONFIG_AGENT_ARGS[@]}" "${AGENT_ARGS[@]}")
 flush_config_log
 
@@ -3316,9 +3329,21 @@ fi
 # T3 Code starts OpenCode's shared server in its own working directory, which is
 # usually the home directory, so this also stops that setup from silently
 # running unconfined.
+# Exception: OpenCode's ACP agent (`opencode acp`) started in the home directory
+# itself runs without a working directory mount. T3 Code starts one ACP process
+# per thread in the thread's directory, but runs its health probe (initialize,
+# authentication, models) in its own working directory, usually the home
+# directory; there is no project there, so the agent only gets its private home.
 REAL_WORKING_DIR=$(realpath -m "$WORKING_DIR")
 REAL_HOME=$(realpath -m "$HOME")
-if [[ "$ALLOW_HOME_WORKDIR" = false ]] \
+if [[ "$ALLOW_HOME_WORKDIR" = false && "$AGENT" = "opencode" && "$ACP_COMMAND" = true \
+    && "$REAL_HOME" == "$REAL_WORKING_DIR" ]]; then
+    NO_PROJECT_WORKDIR=true
+    if [[ "$ENABLE_DOCKER" = true ]]; then
+        log_info "${YELLOW}⚠${NC} Docker disabled: no project directory for the proxy socket"
+        ENABLE_DOCKER=false
+    fi
+elif [[ "$ALLOW_HOME_WORKDIR" = false ]] \
     && [[ "$REAL_HOME" == "$REAL_WORKING_DIR" || "$REAL_HOME" == "${REAL_WORKING_DIR%/}/"* ]]; then
     if [[ "$REAL_HOME" == "$REAL_WORKING_DIR" ]]; then
         echo -e "${RED}Error: the working directory $WORKING_DIR is your home directory${NC}" >&2
@@ -3328,8 +3353,9 @@ if [[ "$ALLOW_HOME_WORKDIR" = false ]] \
     echo "The agent would get read-write access to all of it. Run the sandbox from a project" >&2
     echo "directory, or pass --allow-home-workdir if this is really what you want." >&2
     if [[ "$AGENT" = "opencode" ]]; then
-        echo "T3 Code runs one OpenCode server in its own working directory for all projects;" >&2
-        echo "that setup cannot be sandboxed per project (see README, T3 Code section)." >&2
+        echo "T3 Code's OpenCode provider runs one server in its own working directory for all" >&2
+        echo "projects, which cannot be sandboxed per project; use OpenCode through T3's ACP" >&2
+        echo "provider instead (see README, T3 Code section)." >&2
     fi
     exit 1
 fi
@@ -3484,11 +3510,13 @@ BWRAP_ARGS=(
 
 # Setup minimal home directory using tmpfs
 BWRAP_ARGS+=(--tmpfs "$HOME")
-BLACKLIST_SEARCH_ROOTS+=("$WORKING_DIR")
 
 # Bind working directory (after tmpfs home, so it's visible)
-BWRAP_ARGS+=(--bind "$WORKING_DIR" "$WORKING_DIR")
-mount_git_linked_dirs
+if [[ "$NO_PROJECT_WORKDIR" = false ]]; then
+    BLACKLIST_SEARCH_ROOTS+=("$WORKING_DIR")
+    BWRAP_ARGS+=(--bind "$WORKING_DIR" "$WORKING_DIR")
+    mount_git_linked_dirs
+fi
 
 # Forward gpg-agent before whitelist processing: bwrap does not change the mode
 # of directories that already exist, and gpg requires /run/user/<uid> to be 0700
@@ -3810,7 +3838,11 @@ if [[ "$PROFILE" = "default" ]]; then
 else
     log_info "Profile: ${YELLOW}$PROFILE${NC} (from $PROFILE_SOURCE) -> $PROFILE_HOME"
 fi
-log_info "Working Directory: ${YELLOW}$WORKING_DIR${NC}"
+if [[ "$NO_PROJECT_WORKDIR" = true ]]; then
+    log_info "Working Directory: ${YELLOW}$WORKING_DIR${NC} (not mounted: ACP agent without a project)"
+else
+    log_info "Working Directory: ${YELLOW}$WORKING_DIR${NC}"
+fi
 case "$NETWORK_MODE" in
     isolated)
         NETWORK_SUMMARY="isolated"

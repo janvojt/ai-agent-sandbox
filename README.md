@@ -55,7 +55,7 @@ cp config-example.yaml ~/.config/ai-agent-sandbox/config.yaml
 ./ai-agent-sandbox.sh
 ```
 
-Run it from the project directory: the current directory becomes the agent's read-write working directory. The sandbox refuses to start in your home directory or one of its parents (such as `/`), because the agent would get read-write access to everything in it; pass `--allow-home-workdir` if you really want that.
+Run it from the project directory: the current directory becomes the agent's read-write working directory. The sandbox refuses to start in your home directory or one of its parents (such as `/`), because the agent would get read-write access to everything in it; pass `--allow-home-workdir` if you really want that. The one exception is OpenCode's ACP agent (`--agent opencode -- acp`) started in the home directory itself: it runs without any working directory mounted (an orchestrator's health check, see [Using with T3 Code](#using-with-t3-code-and-other-orchestrators)).
 
 ### Custom whitelist/blacklist:
 Whitelist and blacklist entries live in the `whitelist:` and `blacklist:` lists of the [config files](#configuration-file-configyaml). For a single run, add paths on the command line:
@@ -255,7 +255,30 @@ Good to know:
 - The project configuration in `.ai-agent-sandbox/` of the worktree applies as usual, plus the main checkout's `config.local.yaml` if the worktree has none.
 - T3's own integrated terminal, git operations and project setup scripts run on the host, outside the sandbox, by design: they are driven by you, not by the model.
 - A stop from T3 (or any `SIGTERM` to the wrapper) terminates the sandbox immediately.
-- OpenCode is not supported through the wrapper. T3 starts a single shared `opencode serve` (OpenCode 1 and 2) in its own working directory, usually your home directory, and sends each thread to it as a request for that thread's project directory. A sandbox per project cannot confine that server: rooted at your home directory it would give every thread read-write access to all of it, so the sandbox refuses to start there (see [Basic usage](#basic-usage)); T3 then shows the OpenCode provider as failing. Codex is not supported by the sandbox yet.
+- Codex is not supported by the sandbox yet.
+
+#### OpenCode in T3 Code (through ACP)
+
+T3's own OpenCode provider cannot be sandboxed: it starts a single shared `opencode serve` in T3's working directory, usually your home directory, and sends every thread to it as a request for that thread's project directory. The sandbox refuses to start there (see [Basic usage](#basic-usage)), so T3 shows that provider as failing. Use T3's **ACP** provider instead: with a local command it starts one process per thread in the thread's directory, like Claude, and `opencode acp` (OpenCode 2) speaks the Agent Client Protocol on stdin/stdout with its own private server. Every thread then gets its own sandbox of its own project. The wrapper:
+
+```sh
+#!/bin/sh
+# /home/you/.local/bin/opencode-acp-sandboxed  (chmod +x)
+exec /home/you/ai-agent-sandbox/ai-agent-sandbox.sh --agent opencode --quiet --host-port 3773 -- acp "$@"
+```
+
+Then, in T3 Code:
+
+1. **Settings → Providers → add an ACP provider instance → ACP source: Local command**, and set **Executable override** to the wrapper, e.g. `/home/you/.local/bin/opencode-acp-sandboxed` (absolute path). Disable the built-in OpenCode provider.
+2. Profiles work per project with a single instance: leave `AI_AGENT_SANDBOX_PROFILE` out of the instance and pin the profile in each project's `.ai-agent-sandbox/config.local.yaml` (`profile: work`); projects without a pin use your host configuration. T3 reads ACP threads through the protocol, not from the profile's files, so unlike Claude no instance per profile is needed. Prefer the git-ignored `config.local.yaml` (read from the main checkout in worktrees, see [Git worktrees](#git-worktrees)) over the committed `config.yaml`, so a repository cannot choose your credentials.
+3. Log in once per profile in a terminal, from any project directory: `./ai-agent-sandbox.sh --agent opencode --profile work -- auth login` (`--profile default` for your host configuration).
+
+Good to know:
+
+- T3 runs its health check (initialize, sign-in state, models) by starting the wrapper in its own working directory, usually your home directory. There is no project there, so the sandbox mounts no working directory at all: the agent only gets its private home and the profile's OpenCode configuration (the summary shows `not mounted: ACP agent without a project`). Relative whitelist entries are skipped and Docker is off in that case. That check runs under the profile without a pin (your host configuration by default), so T3's sign-in state and model list are those of that profile.
+- Every new thread starts a sandbox and a fresh OpenCode server, which takes a few seconds. T3 resumes a thread by asking the new process to load its session, which OpenCode keeps in the profile's database.
+- T3's generic ACP integration does not have every feature of its native OpenCode provider (for example OpenCode Go usage limits).
+- Logging, worktrees, the project configuration and stopping behave as for Claude above.
 
 ## Configuration
 
@@ -535,7 +558,7 @@ Add the required paths to the `whitelist:` list in your `config.yaml`. Common ad
 - `/opt/custom-tools`
 
 ### "the working directory … is your home directory"
-The sandbox was started in your home directory or a directory containing it (such as `/`). Change to the project directory first. If you really want the agent to have read-write access to your whole home directory, pass `--allow-home-workdir`. In T3 Code this happens with the OpenCode provider, which is not supported through the wrapper (see [Using with T3 Code](#using-with-t3-code-and-other-orchestrators)).
+The sandbox was started in your home directory or a directory containing it (such as `/`). Change to the project directory first. If you really want the agent to have read-write access to your whole home directory, pass `--allow-home-workdir`. In T3 Code this happens with T3's built-in OpenCode provider; use OpenCode through T3's ACP provider instead (see [OpenCode in T3 Code](#opencode-in-t3-code-through-acp)).
 
 ### The sandbox uses the wrong Claude account
 Check the `Profile:` line in the startup summary; it shows the profile and where it came from (`.ai-agent-sandbox/config.yaml`, `config.local.yaml`, `AI_AGENT_SANDBOX_PROFILE` or `--profile`). Use `--profile default` to force the host configuration, or `--list-profiles` to see which profiles are logged in.

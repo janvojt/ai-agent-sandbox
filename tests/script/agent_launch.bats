@@ -104,7 +104,46 @@ stub_opencode() {
     cd "$TEST_HOME"
     run_sandbox --agent opencode -- serve
     assert_failure 1
-    assert_output --partial "T3 Code runs one OpenCode server"
+    assert_output --partial "use OpenCode through T3's ACP"
+}
+
+@test "OpenCode's ACP agent in the home directory runs without a working directory mount" {
+    stub_opencode 'echo 2.0.1'
+    mkdir -p "$TEST_HOME/data"
+    cd "$TEST_HOME"
+    run_sandbox --agent opencode --whitelist-path data -d -- acp
+    assert_success
+    assert_output --partial "(not mounted: ACP agent without a project)"
+    assert_output --partial "Skipped relative whitelist entry without a project directory: data"
+    assert_output --partial "Docker disabled"
+    assert_equal "${SANDBOX_COMMAND[*]}" "$OPENCODE_BIN acp"
+    refute_args_contain BWRAP_RECORDED --bind "$TEST_HOME" "$TEST_HOME"
+    refute_args_contain BWRAP_RECORDED --ro-bind "$TEST_HOME/data" "$TEST_HOME/data"
+    assert_args_contain BWRAP_RECORDED --chdir "$TEST_HOME"
+    assert_not_exist "$TEST_HOME/.ai-agent-sandbox"
+}
+
+@test "OpenCode's ACP agent in a project directory mounts it as usual" {
+    stub_opencode 'echo 2.0.1'
+    run_sandbox --agent opencode -- acp
+    assert_success
+    assert_equal "${SANDBOX_COMMAND[*]}" "$OPENCODE_BIN acp"
+    assert_args_contain BWRAP_RECORDED --bind "$TEST_WORK" "$TEST_WORK"
+    refute_output --partial "not mounted"
+}
+
+@test "the ACP exception covers neither parents of the home directory nor Claude" {
+    stub_opencode 'echo 2.0.1'
+    cd "$TEST_HOME/.."
+    run_sandbox --agent opencode -- acp
+    assert_failure 1
+    assert_output --partial "contains your home directory"
+    cd "$TEST_HOME"
+    run_sandbox -- acp
+    assert_failure 1
+    assert_output --partial "is your home directory"
+    run_sandbox --agent opencode -- run acp
+    assert_failure 1
 }
 
 @test "--allow-home-workdir starts the sandbox in the home directory" {
