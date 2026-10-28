@@ -421,31 +421,144 @@ assert_matches() {
     assert_output ""
 }
 
-# --- protect_project_config_dir --------------------------------------------------
+# --- protect_sandbox_config ------------------------------------------------------
 
-@test "protect_project_config_dir: binds .ai-agent-sandbox read-only when present" {
+@test "protect_sandbox_config: binds .ai-agent-sandbox in the working directory read-only" {
     mkdir -p "$PROJECT_CONFIG_DIR"
-    protect_project_config_dir
-    assert_equal "${BWRAP_ARGS[*]}" "--ro-bind $TEST_WORK/.ai-agent-sandbox $TEST_WORK/.ai-agent-sandbox"
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
+    assert_equal "${BWRAP_ARGS[*]}" \
+        "--bind $TEST_WORK $TEST_WORK --ro-bind $PROJECT_CONFIG_DIR $PROJECT_CONFIG_DIR"
+    assert_equal "${PROTECTED_CONFIG_SOURCES[*]}" "$PROJECT_CONFIG_DIR"
 }
 
-@test "protect_project_config_dir: nothing when the directory does not exist" {
-    protect_project_config_dir
-    assert_equal "${#BWRAP_ARGS[@]}" 0
+@test "protect_sandbox_config: finds nested configuration, skips .git and read-only binds" {
+    local ws="$BATS_TEST_TMPDIR/ws" ro="$BATS_TEST_TMPDIR/ro"
+    mkdir -p "$ws/a/.ai-agent-sandbox/inner/.ai-agent-sandbox" "$ws/b/c/.ai-agent-sandbox" \
+        "$ws/.git/x/.ai-agent-sandbox" "$ro/.ai-agent-sandbox"
+    BWRAP_ARGS=(--bind "$ws" "$ws" --ro-bind "$ro" "$ro")
+    protect_sandbox_config BWRAP_ARGS
+    assert_args_contain BWRAP_ARGS --ro-bind "$ws/a/.ai-agent-sandbox" "$ws/a/.ai-agent-sandbox"
+    assert_args_contain BWRAP_ARGS --ro-bind "$ws/b/c/.ai-agent-sandbox" "$ws/b/c/.ai-agent-sandbox"
+    refute_args_contain BWRAP_ARGS --ro-bind "$ws/a/.ai-agent-sandbox/inner/.ai-agent-sandbox" "$ws/a/.ai-agent-sandbox/inner/.ai-agent-sandbox"
+    refute_args_contain BWRAP_ARGS --ro-bind "$ws/.git/x/.ai-agent-sandbox" "$ws/.git/x/.ai-agent-sandbox"
+    refute_args_contain BWRAP_ARGS --ro-bind "$ro/.ai-agent-sandbox" "$ro/.ai-agent-sandbox"
 }
 
-@test "protect_project_config_dir: nothing when protection is switched off" {
+@test "protect_sandbox_config: overlapping binds mount each directory once" {
+    local ws="$BATS_TEST_TMPDIR/ws"
+    mkdir -p "$ws/p/.ai-agent-sandbox"
+    BWRAP_ARGS=(--bind "$ws" "$ws" --bind "$ws/p" "$ws/p")
+    protect_sandbox_config BWRAP_ARGS
+    assert_equal "${#PROTECTED_CONFIG_SOURCES[@]}" 1
+}
+
+@test "protect_sandbox_config: maps the source of a bind to its destination" {
+    local src="$BATS_TEST_TMPDIR/src"
+    mkdir -p "$src/.ai-agent-sandbox"
+    BWRAP_ARGS=(--bind "$src" /mnt/dest)
+    protect_sandbox_config BWRAP_ARGS
+    assert_args_contain BWRAP_ARGS --ro-bind "$src/.ai-agent-sandbox" /mnt/dest/.ai-agent-sandbox
+}
+
+@test "protect_sandbox_config: protects the target of a symlinked configuration when it is visible" {
+    local ws="$BATS_TEST_TMPDIR/ws"
+    mkdir -p "$ws/real" "$ws/p"
+    ln -s ../real "$ws/p/.ai-agent-sandbox"
+    BWRAP_ARGS=(--bind "$ws" "$ws")
+    protect_sandbox_config BWRAP_ARGS
+    assert_args_contain BWRAP_ARGS --ro-bind "$ws/real" "$ws/real"
+}
+
+@test "protect_sandbox_config: appends to the given target array" {
+    local other="$BATS_TEST_TMPDIR/other"
+    mkdir -p "$other/.ai-agent-sandbox"
+    WHITELIST_OVERRIDE_ARGS=(--bind "$other" "$other")
+    protect_sandbox_config WHITELIST_OVERRIDE_ARGS
+    assert_args_contain BWRAP_ARGS --ro-bind "$other/.ai-agent-sandbox" "$other/.ai-agent-sandbox"
+    assert_equal "${#WHITELIST_OVERRIDE_ARGS[@]}" 3
+}
+
+@test "protect_sandbox_config: user config files directly in HOME are protected one by one" {
+    DEFAULT_CONFIG_FILE="$HOME/sandbox.yaml"
+    : > "$DEFAULT_CONFIG_FILE"
+    BWRAP_ARGS=(--bind "$HOME" "$HOME")
+    protect_sandbox_config BWRAP_ARGS
+    assert_args_contain BWRAP_ARGS --ro-bind "$HOME/sandbox.yaml" "$HOME/sandbox.yaml"
+    refute_args_contain BWRAP_ARGS --ro-bind "$HOME" "$HOME"
+}
+
+@test "protect_sandbox_config: nothing when protection is switched off" {
     mkdir -p "$PROJECT_CONFIG_DIR"
     PROTECT_PROJECT_CONFIG=false
-    protect_project_config_dir
-    assert_equal "${#BWRAP_ARGS[@]}" 0
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
+    assert_equal "${#BWRAP_ARGS[@]}" 3
 }
 
 @test "blacklisted files in .ai-agent-sandbox are hidden on top of the read-only bind" {
     mkdir -p "$PROJECT_CONFIG_DIR"
     : > "$PROJECT_CONFIG_DIR/secret.env"
-    protect_project_config_dir
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
     blacklist_pattern '.ai-agent-sandbox/*.env'
     assert_equal "${BWRAP_ARGS[*]}" \
-        "--ro-bind $PROJECT_CONFIG_DIR $PROJECT_CONFIG_DIR --ro-bind /dev/null $PROJECT_CONFIG_DIR/secret.env"
+        "--bind $TEST_WORK $TEST_WORK --ro-bind $PROJECT_CONFIG_DIR $PROJECT_CONFIG_DIR --ro-bind /dev/null $PROJECT_CONFIG_DIR/secret.env"
+}
+
+# --- create_missing_project_config_dirs -------------------------------------------
+
+@test "create_missing_project_config_dirs: creates the working directory's and git roots' directory" {
+    local repo="$BATS_TEST_TMPDIR/repo" plain="$BATS_TEST_TMPDIR/plain"
+    mkdir -p "$repo/.git" "$plain"
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK" --bind "$repo" "$repo" --bind "$plain" "$plain")
+    create_missing_project_config_dirs
+    assert_dir_exists "$PROJECT_CONFIG_DIR"
+    assert_dir_exists "$repo/.ai-agent-sandbox"
+    assert_not_exist "$plain/.ai-agent-sandbox"
+}
+
+@test "create_missing_project_config_dirs: leaves an existing entry or symlink alone" {
+    ln -s /nonexistent "$PROJECT_CONFIG_DIR"
+    create_missing_project_config_dirs
+    assert_link_exists "$PROJECT_CONFIG_DIR"
+}
+
+@test "create_missing_project_config_dirs: nothing when protection is switched off" {
+    PROTECT_PROJECT_CONFIG=false
+    create_missing_project_config_dirs
+    assert_not_exist "$PROJECT_CONFIG_DIR"
+}
+
+# --- Docker proxy bind mount paths -------------------------------------------------
+
+@test "split_mount_root: a root without protected paths is kept" {
+    run split_mount_root "$TEST_WORK" "$BATS_TEST_TMPDIR/elsewhere/.ai-agent-sandbox"
+    assert_success
+    assert_output "$TEST_WORK"
+}
+
+@test "split_mount_root: a root containing protected paths is replaced by its other entries" {
+    mkdir -p "$PROJECT_CONFIG_DIR" "$TEST_WORK/src" "$TEST_WORK/sub/.ai-agent-sandbox" "$TEST_WORK/sub/lib"
+    : > "$TEST_WORK/.hidden"
+    QUIET=true
+    run split_mount_root "$TEST_WORK" "$PROJECT_CONFIG_DIR" "$TEST_WORK/sub/.ai-agent-sandbox"
+    assert_success
+    assert_equal "$(sort <<< "$output")" "$(printf '%s\n' "$TEST_WORK/.hidden" "$TEST_WORK/src" "$TEST_WORK/sub/lib")"
+}
+
+@test "split_mount_root: a protected root is refused" {
+    QUIET=true
+    run split_mount_root "$PROJECT_CONFIG_DIR/x" "$PROJECT_CONFIG_DIR"
+    assert_success
+    assert_output ""
+}
+
+@test "collect_allowed_mount_paths: the working directory is split around its configuration" {
+    mkdir -p "$PROJECT_CONFIG_DIR" "$TEST_WORK/src"
+    PROTECTED_CONFIG_SOURCES=("$PROJECT_CONFIG_DIR")
+    QUIET=true
+    run collect_allowed_mount_paths
+    assert_success
+    assert_output "$TEST_WORK/src"
 }

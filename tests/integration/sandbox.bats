@@ -52,6 +52,30 @@ run_real_sandbox() {
     assert_file_not_exists .ai-agent-sandbox/x
 }
 
+@test "a read-write whitelisted parent leaves every project configuration read-only" {
+    local ws="$BATS_TEST_TMPDIR/ws"
+    mkdir -p "$ws/proj/.ai-agent-sandbox" "$ws/other/.ai-agent-sandbox" "$ws/repo/.git"
+    cd "$ws/proj"
+    # a whitelist flag would leave the generated user config without a whitelist
+    printf 'whitelist:\n  - "%s:rw"\n  - "%s:rw"\n' "$ws" "$ws/repo" > .ai-agent-sandbox/config.yaml
+    run_real_sandbox "touch .ai-agent-sandbox/x || echo own-ro
+touch $ws/other/.ai-agent-sandbox/x || echo other-ro
+touch $ws/repo/.ai-agent-sandbox/x || echo repo-ro
+touch $ws/other/file && echo other-rw"
+    assert_output --partial own-ro
+    assert_output --partial other-ro
+    assert_output --partial repo-ro
+    assert_output --partial other-rw
+    assert_file_not_exists .ai-agent-sandbox/x
+    assert_file_not_exists "$ws/other/.ai-agent-sandbox/x"
+}
+
+@test "the agent cannot create a project configuration in the working directory" {
+    run_real_sandbox 'touch .ai-agent-sandbox/config.yaml || echo create-refused'
+    assert_output --partial create-refused
+    assert_file_not_exists .ai-agent-sandbox/config.yaml
+}
+
 @test "--no-protect-project-config makes the project configuration writable" {
     mkdir .ai-agent-sandbox
     run_real_sandbox 'touch .ai-agent-sandbox/x && echo config-rw' --no-protect-project-config

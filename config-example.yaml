@@ -183,5 +183,7 @@ agent_args:
   - claude-sonnet-4-5
 
 # Only honoured in the user-level file (or via --no-protect-project-config):
-# mount .ai-agent-sandbox/ read-only so the agent cannot rewrite these rules.
+# mount every .ai-agent-sandbox/ in a writable mount (this project's and those of
+# read-write whitelisted projects) and the user-level configuration read-only so
+# the agent cannot rewrite these rules.
 # protect_project_config: true

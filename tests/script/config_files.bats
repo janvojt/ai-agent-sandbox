@@ -160,11 +160,109 @@ write_user_config() {
     assert_equal "${SANDBOX_COMMAND[*]}" "$STUB_DIR/claude --dangerously-skip-permissions --model x --print hi"
 }
 
+# Usage: last_index_of <word...>; prints the index of the last occurrence of
+# the consecutive words in BWRAP_RECORDED (-1 when absent)
+last_index_of() {
+    local i j n=$#
+    local -a words=("$@")
+    for ((i = ${#BWRAP_RECORDED[@]} - n; i >= 0; i--)); do
+        for ((j = 0; j < n; j++)); do
+            [[ "${BWRAP_RECORDED[i + j]}" == "${words[j]}" ]] || continue 2
+        done
+        echo "$i"
+        return
+    done
+    echo -1
+}
+
 @test "the project configuration directory is mounted read-only after the working directory" {
     write_config "$PROJECT_DIR/config.yaml" 'quiet: false'
     run_sandbox --dry-run
     assert_success
-    assert_args_contain BWRAP_RECORDED --bind "$TEST_WORK" "$TEST_WORK" --ro-bind "$PROJECT_DIR" "$PROJECT_DIR"
+    assert_args_contain BWRAP_RECORDED --bind "$TEST_WORK" "$TEST_WORK"
+    assert_args_contain BWRAP_RECORDED --ro-bind "$PROJECT_DIR" "$PROJECT_DIR"
+}
+
+@test "a read-write whitelisted parent does not make the project configuration writable" {
+    write_config "$PROJECT_DIR/config.yaml" 'quiet: false'
+    run_sandbox --dry-run --whitelist-path-rw "$BATS_TEST_TMPDIR"
+    assert_success
+    local parent protected
+    parent=$(last_index_of --bind "$BATS_TEST_TMPDIR" "$BATS_TEST_TMPDIR")
+    protected=$(last_index_of --ro-bind "$PROJECT_DIR" "$PROJECT_DIR")
+    assert [ "$parent" -ge 0 ]
+    assert [ "$protected" -gt "$parent" ]
+}
+
+@test "the configuration of another project in a read-write whitelist entry is read-only" {
+    local other="$BATS_TEST_TMPDIR/other"
+    write_config "$other/.ai-agent-sandbox/config.yaml" 'network: host'
+    mkdir -p "$other/deep/nested/.ai-agent-sandbox"
+    run_sandbox --dry-run --whitelist-path-rw "$other"
+    assert_success
+    assert_args_contain BWRAP_RECORDED --ro-bind "$other/.ai-agent-sandbox" "$other/.ai-agent-sandbox"
+    assert_args_contain BWRAP_RECORDED --ro-bind "$other/deep/nested/.ai-agent-sandbox" "$other/deep/nested/.ai-agent-sandbox"
+}
+
+@test "the configuration of a read-only whitelisted project gets no extra mount" {
+    local other="$BATS_TEST_TMPDIR/other"
+    write_config "$other/.ai-agent-sandbox/config.yaml" 'network: host'
+    run_sandbox --dry-run --whitelist-path "$other"
+    assert_success
+    refute_args_contain BWRAP_RECORDED --ro-bind "$other/.ai-agent-sandbox" "$other/.ai-agent-sandbox"
+}
+
+@test "a missing project configuration directory is created empty and mounted read-only" {
+    run_sandbox --dry-run
+    assert_success
+    assert_dir_exists "$PROJECT_DIR"
+    assert_args_contain BWRAP_RECORDED --ro-bind "$PROJECT_DIR" "$PROJECT_DIR"
+}
+
+@test "read-write whitelisted git roots get an empty configuration directory, other directories do not" {
+    local repo="$BATS_TEST_TMPDIR/repo" cache="$BATS_TEST_TMPDIR/cache"
+    mkdir -p "$repo/.git" "$cache"
+    run_sandbox --dry-run --whitelist-path-rw "$repo" --whitelist-path-rw "$cache"
+    assert_success
+    assert_dir_exists "$repo/.ai-agent-sandbox"
+    assert_args_contain BWRAP_RECORDED --ro-bind "$repo/.ai-agent-sandbox" "$repo/.ai-agent-sandbox"
+    assert_not_exist "$cache/.ai-agent-sandbox"
+}
+
+@test "the user-level configuration is read-only when a read-write whitelist entry exposes it" {
+    write_user_config 'quiet: false'
+    run_sandbox --dry-run --whitelist-path-rw "$TEST_HOME/.config"
+    assert_success
+    assert_args_contain BWRAP_RECORDED --ro-bind "$TEST_HOME/.config/ai-agent-sandbox" "$TEST_HOME/.config/ai-agent-sandbox"
+}
+
+@test "the user-level configuration gets no mount when it is not visible" {
+    write_user_config 'quiet: false'
+    run_sandbox --dry-run
+    assert_success
+    refute_args_contain BWRAP_RECORDED --ro-bind "$TEST_HOME/.config/ai-agent-sandbox" "$TEST_HOME/.config/ai-agent-sandbox"
+}
+
+@test "a symlinked user config file is protected at its target" {
+    local dotfiles="$BATS_TEST_TMPDIR/dotfiles"
+    write_config "$dotfiles/config.yaml" $'whitelist:\n  - /usr/bin'
+    mkdir -p "$(dirname "$USER_CONFIG")"
+    ln -s "$dotfiles/config.yaml" "$USER_CONFIG"
+    run_sandbox --dry-run --whitelist-path-rw "$dotfiles"
+    assert_success
+    assert_args_contain BWRAP_RECORDED --ro-bind "$dotfiles/config.yaml" "$dotfiles/config.yaml"
+}
+
+@test "a read-write whitelist override is followed by the protection again" {
+    local other="$BATS_TEST_TMPDIR/other"
+    mkdir -p "$other/.ai-agent-sandbox"
+    run_sandbox --dry-run --whitelist-path-rw "!$other"
+    assert_success
+    local override protected
+    override=$(last_index_of --bind "$other" "$other")
+    protected=$(last_index_of --ro-bind "$other/.ai-agent-sandbox" "$other/.ai-agent-sandbox")
+    assert [ "$override" -ge 0 ]
+    assert [ "$protected" -gt "$override" ]
 }
 
 @test "blacklisted files in the project configuration directory stay hidden" {
@@ -178,9 +276,18 @@ write_user_config() {
 
 @test "--no-protect-project-config leaves the project configuration writable" {
     write_config "$PROJECT_DIR/config.yaml" 'quiet: false'
-    run_sandbox --dry-run --no-protect-project-config
+    local other="$BATS_TEST_TMPDIR/other"
+    mkdir -p "$other/.ai-agent-sandbox"
+    run_sandbox --dry-run --no-protect-project-config --whitelist-path-rw "$other"
     assert_success
     refute_args_contain BWRAP_RECORDED --ro-bind "$PROJECT_DIR" "$PROJECT_DIR"
+    refute_args_contain BWRAP_RECORDED --ro-bind "$other/.ai-agent-sandbox" "$other/.ai-agent-sandbox"
+}
+
+@test "--no-protect-project-config creates no configuration directory" {
+    run_sandbox --dry-run --no-protect-project-config
+    assert_success
+    assert_not_exist "$PROJECT_DIR"
 }
 
 @test "protect_project_config: false in a project file is ignored" {

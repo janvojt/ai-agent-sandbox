@@ -44,6 +44,8 @@ ALLOW_HOME_WORKDIR=false
 VERSION_QUERY=false
 MIGRATE_PROJECT_CONFIG=false
 PROTECT_PROJECT_CONFIG=true
+# Host paths mounted read-only by protect_sandbox_config (refused by the Docker proxy)
+PROTECTED_CONFIG_SOURCES=()
 # Deprecated whitelist.txt / blacklist.txt / .env files still in use
 WHITELIST_FILES=()
 BLACKLIST_FILES=()
@@ -159,7 +161,8 @@ OPTIONS:
     --gpg-agent             Forward the host gpg-agent for GPG commit signing (public keys only)
     --no-gpg-agent          Do not forward the gpg-agent (overrides config files)
     --no-protect-project-config
-                            Mount .ai-agent-sandbox/ read-write instead of read-only
+                            Leave .ai-agent-sandbox/ directories and the user-level
+                            configuration writable (read-only by default)
     --docker-image IMAGE    Socket proxy image (default: ghcr.io/wollomatic/socket-proxy:1)
     --network MODE          Network access: isolated (default: internet only, host
                             loopback and private networks blocked), host (share the
@@ -1449,7 +1452,46 @@ collect_allowed_mount_paths() {
         ((i++))
     done
 
-    echo "$paths" | tr ',' '\n' | sed '/^$/d' | sort -u | tr '\n' ',' | sed 's/,$//'
+    # The proxy matches path prefixes, so a root containing protected sandbox
+    # configuration is replaced by its parts that do not contain any
+    local -a roots=()
+    mapfile -t roots < <(echo "$paths" | tr ',' '\n' | sed '/^$/d' | sort -u)
+    local root
+    for root in "${roots[@]}"; do
+        split_mount_root "$root" "${PROTECTED_CONFIG_SOURCES[@]}"
+    done | sort -u | tr '\n' ',' | sed 's/,$//'
+}
+
+# Usage: split_mount_root <root> [excluded...]
+# Print <root> when it contains none of the excluded paths, otherwise (for a
+# directory) recurse into its entries, skipping the excluded ones. Entries
+# created later in a split directory cannot be mounted.
+split_mount_root() {
+    local root="$1"
+    shift
+    local -a inside=()
+    local excluded
+    for excluded in "$@"; do
+        if [[ "$root" == "$excluded" || "$root" == "$excluded/"* ]]; then
+            log_info "${YELLOW}⚠${NC} Docker bind mounts refused: $root (sandbox configuration)"
+            return 0
+        fi
+        [[ "$excluded" == "$root/"* ]] && inside+=("$excluded")
+    done
+    if [[ ${#inside[@]} -eq 0 ]]; then
+        echo "$root"
+        return 0
+    fi
+    log_info "${YELLOW}⚠${NC} Docker bind mounts of $root refused (contains sandbox configuration), its other entries are allowed"
+    [[ -d "$root" && ! -L "$root" ]] || return 0
+    local restore child
+    restore="$(shopt -p nullglob dotglob || true)"
+    shopt -s nullglob dotglob
+    local -a children=("$root"/*)
+    eval "$restore"
+    for child in "${children[@]}"; do
+        split_mount_root "$child" "${inside[@]}"
+    done
 }
 
 start_socket_proxy() {
@@ -2403,14 +2445,141 @@ process_whitelist_entry() {
     fi
 }
 
-# Mount .ai-agent-sandbox/ read-only so the agent cannot rewrite the sandbox
-# configuration (profile, whitelist, env) that will apply to the next run.
-# Blacklist mounts are added later and nest on top of this bind.
-protect_project_config_dir() {
+# --- Sandbox configuration protection -----------------------------------------
+#
+# The agent must not rewrite sandbox configuration (profile, whitelist, network,
+# env) that applies to a later run, neither its own project's nor that of
+# another project visible through a read-write whitelist entry, nor the
+# user-level files. protect_sandbox_config mounts every such path that lies in
+# a read-write bind read-only. It runs after the whitelist (a whitelisted parent
+# directory would otherwise cover the binds) and before the blacklist (whose
+# mounts nest on top), and once more for the read-write `!` overrides, which are
+# applied after the blacklist. The protected host paths are recorded in
+# PROTECTED_CONFIG_SOURCES so the Docker proxy can refuse mounts containing them.
+
+# Print the .ai-agent-sandbox entries below <root> (the root itself included),
+# without descending into them or into .git directories
+find_project_config_dirs() {
+    local root="$1"
+    [[ -d "$root" ]] || return 0
+    find -H "$root" \( -name .git -prune \) -o \( -name .ai-agent-sandbox -prune -print \) 2>/dev/null
+}
+
+# Print the user-level configuration paths to protect: the directories of the
+# user-level files, or the existing files themselves when a directory is too
+# broad to mount read-only ($HOME, /, the working directory or a parent of it),
+# plus the resolved targets of symlinked files and directories (dotfiles repos)
+user_config_protect_paths() {
+    local file dir resolved
+    local -A dirs=()
+    for file in "$DEFAULT_CONFIG_FILE" "$DEFAULT_CONFIG_LOCAL_FILE" \
+        "$DEFAULT_WHITELIST_FILE" "$DEFAULT_BLACKLIST_FILE" \
+        "$DEFAULT_ENV_FILE" "$DEFAULT_ENV_LOCAL_FILE"; do
+        dir="$(dirname "$file")"
+        if [[ "$dir" == / || "$dir" == "$HOME" || "$WORKING_DIR" == "$dir" \
+            || "$WORKING_DIR" == "$dir/"* ]]; then
+            [[ -e "$file" ]] || continue
+            echo "$file"
+            resolved="$(readlink -f "$file" 2>/dev/null || true)"
+            [[ -n "$resolved" && "$resolved" != "$file" ]] && echo "$resolved"
+        elif [[ -d "$dir" && -z "${dirs[$dir]:-}" ]]; then
+            dirs["$dir"]=1
+            echo "$dir"
+            resolved="$(readlink -f "$dir" 2>/dev/null || true)"
+            [[ -n "$resolved" && "$resolved" != "$dir" ]] && echo "$resolved"
+        fi
+        if [[ -L "$file" ]]; then
+            resolved="$(readlink -f "$file" 2>/dev/null || true)"
+            [[ -n "$resolved" && -e "$resolved" ]] && echo "$resolved"
+        fi
+    done
+    return 0
+}
+
+# Create an empty .ai-agent-sandbox in the working directory and in read-write
+# bound git repository roots that have none, so the agent cannot create one with
+# its own configuration. A mount point has to exist on the host (bwrap would
+# create it there anyway); git does not track empty directories.
+create_missing_project_config_dirs() {
     [[ "$PROTECT_PROJECT_CONFIG" = true ]] || return 0
-    [[ -d "$PROJECT_CONFIG_DIR" ]] || return 0
-    BWRAP_ARGS+=(--ro-bind "$PROJECT_CONFIG_DIR" "$PROJECT_CONFIG_DIR")
-    log_info "${GREEN}✓${NC} Mounted .ai-agent-sandbox/ read-only (sandbox configuration protected)"
+    local -a roots=("$WORKING_DIR")
+    local i=0 root
+    while [[ $i -lt ${#BWRAP_ARGS[@]} ]]; do
+        if [[ "${BWRAP_ARGS[$i]}" == "--bind" && "${BWRAP_ARGS[$((i+1))]}" == "${BWRAP_ARGS[$((i+2))]}" ]]; then
+            root="${BWRAP_ARGS[$((i+1))]}"
+            [[ "$root" != "$WORKING_DIR" && -e "$root/.git" ]] && roots+=("$root")
+            ((i+=3))
+            continue
+        fi
+        ((i++)) || true
+    done
+    for root in "${roots[@]}"; do
+        [[ -d "$root" && ! -L "$root" ]] || continue
+        [[ -e "$root/.ai-agent-sandbox" || -L "$root/.ai-agent-sandbox" ]] && continue
+        if mkdir "$root/.ai-agent-sandbox" 2>/dev/null; then
+            log_info "${GREEN}✓${NC} Created empty $(display_path "$root/.ai-agent-sandbox")/ (prevents the agent from creating sandbox configuration)"
+        else
+            log_info "${YELLOW}⚠${NC} Could not create $(display_path "$root/.ai-agent-sandbox")/, the agent may create sandbox configuration there"
+        fi
+    done
+}
+
+# Usage: protect_sandbox_config <scan-array-name> [target-array-name]
+# Mount every sandbox configuration path inside a read-write --bind of the scan
+# array read-only (appended to the target array, default BWRAP_ARGS)
+protect_sandbox_config() {
+    [[ "$PROTECT_PROJECT_CONFIG" = true ]] || return 0
+    local -n protect_scan="$1"
+    local target_name="${2:-BWRAP_ARGS}"
+    local -a user_paths=()
+    mapfile -t user_paths < <(user_config_protect_paths)
+    local -A seen=()
+    local -a binds=()
+    local i=0 src dest path
+    # Collect first: the target array may be the scan array
+    while [[ $i -lt ${#protect_scan[@]} ]]; do
+        if [[ "${protect_scan[$i]}" == "--bind" ]]; then
+            binds+=("${protect_scan[$((i+1))]}" "${protect_scan[$((i+2))]}")
+            ((i+=3))
+            continue
+        fi
+        ((i++)) || true
+    done
+    for ((i = 0; i < ${#binds[@]}; i += 2)); do
+        src="${binds[i]}"
+        dest="${binds[i+1]}"
+        while IFS= read -r path; do
+            [[ -n "$path" ]] && protect_config_path "$path" "$dest${path#"$src"}" "$target_name" seen
+        done < <(find_project_config_dirs "$src")
+        for path in "${user_paths[@]}"; do
+            if [[ "$path" == "$dest" || "$path" == "$dest/"* ]]; then
+                protect_config_path "$src${path#"$dest"}" "$path" "$target_name" seen
+            fi
+        done
+    done
+}
+
+# Usage: protect_config_path <source> <destination> <target-array-name> <seen-assoc-name>
+protect_config_path() {
+    local src="$1" dest="$2"
+    local -n protect_target="$3"
+    local -n protect_seen="$4"
+    local resolved
+    [[ -n "${protect_seen["$dest"]:-}" ]] && return 0
+    protect_seen["$dest"]=1
+    if [[ -L "$src" ]]; then
+        # bwrap cannot mount over a symlink; protect its target when the
+        # sandbox can see it (the agent can still replace the link itself)
+        resolved="$(readlink -f "$src" 2>/dev/null || true)"
+        if [[ -n "$resolved" && -e "$resolved" ]] && is_path_bound "$resolved"; then
+            protect_config_path "$resolved" "$resolved" "$3" "$4"
+        fi
+        return 0
+    fi
+    [[ -e "$src" ]] || return 0
+    protect_target+=(--ro-bind "$src" "$dest")
+    PROTECTED_CONFIG_SOURCES+=("$src")
+    log_info "${GREEN}✓${NC} Mounted $(display_path "$dest") read-only (sandbox configuration protected)"
 }
 
 # Mount the main repository's git directory into a verified git worktree, see
@@ -3319,7 +3488,6 @@ BLACKLIST_SEARCH_ROOTS+=("$WORKING_DIR")
 
 # Bind working directory (after tmpfs home, so it's visible)
 BWRAP_ARGS+=(--bind "$WORKING_DIR" "$WORKING_DIR")
-protect_project_config_dir
 mount_git_linked_dirs
 
 # Forward gpg-agent before whitelist processing: bwrap does not change the mode
@@ -3389,6 +3557,12 @@ if [[ ${#WHITELIST_PATHS_RW[@]} -gt 0 ]]; then
     done
 fi
 
+# Mount sandbox configuration in read-write mounts read-only: after the
+# whitelist (a whitelisted parent would cover it), before the blacklist (which
+# nests on top)
+create_missing_project_config_dirs
+protect_sandbox_config BWRAP_ARGS
+
 # Process all blacklist files and hide patterns with tmpfs overlays
 if [[ ${#BLACKLIST_FILES[@]} -gt 0 ]]; then
     log_info "\n${YELLOW}Processing blacklist patterns:${NC}"
@@ -3425,6 +3599,7 @@ fi
 if [[ ${#WHITELIST_OVERRIDE_ARGS[@]} -gt 0 ]]; then
     log_info "\n${GREEN}Applying whitelist overrides (after blacklist):${NC}"
     BWRAP_ARGS+=("${WHITELIST_OVERRIDE_ARGS[@]}")
+    protect_sandbox_config WHITELIST_OVERRIDE_ARGS
 fi
 
 # Never expose other profiles' credentials, even when a whitelist entry covers
@@ -3660,7 +3835,7 @@ if [[ ${#GIT_LINKED_DIRS[@]} -gt 0 ]]; then
     log_info "Linked Git Directories: ${YELLOW}${GIT_LINKED_DIRS[*]}${NC}"
 fi
 if [[ "$PROTECT_PROJECT_CONFIG" = true ]]; then
-    log_info "Project Config Protection: ${YELLOW}enabled${NC} (.ai-agent-sandbox/ is read-only)"
+    log_info "Project Config Protection: ${YELLOW}enabled${NC} (.ai-agent-sandbox/ in writable mounts and the user configuration are read-only)"
 else
     log_info "Project Config Protection: ${YELLOW}disabled${NC}"
 fi
