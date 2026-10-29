@@ -539,8 +539,9 @@ blacklist:
 6. ✅ **Code execution through git** - Hooks and configuration of every git repository in a writable mount are read-only, so the agent cannot plant commands that git would run on the host
 7. ✅ **Self-modifying sandbox rules** - `.ai-agent-sandbox/` is mounted read-only so the agent cannot change the profile, whitelist or environment it runs with next time
 8. ✅ **OpenCode 2 background server** - OpenCode 2 is started with `--standalone`, so the server that executes its tools runs inside the sandbox instead of the shared per-user service on the host
-9. ✅ **Exploit-prone kernel interfaces** - A seccomp filter refuses keyrings, BPF, io_uring, userfaultfd, perf, module loading, terminal input injection, new user namespaces and mounts
-10. ✅ **Host services and LAN** - In the default `isolated` network mode the host's loopback and private networks are unreachable, so a prompt-injected agent cannot probe local databases, dashboards, routers or other machines; only the ports and hosts you list are exposed
+9. ✅ **Hardware and host details in /sys** - The sandbox gets an empty `/sys` with only CPU, NUMA and huge page information and its own cgroup, so disk serial numbers, MAC addresses, the host's network interfaces and the list of running applications (cgroup tree) stay hidden. Whitelist `/sys` or a subdirectory (e.g. `/sys/class/drm` for GPU tools) when a tool needs more
+10. ✅ **Exploit-prone kernel interfaces** - A seccomp filter refuses keyrings, BPF, io_uring, userfaultfd, perf, module loading, terminal input injection, new user namespaces and mounts
+11. ✅ **Host services and LAN** - In the default `isolated` network mode the host's loopback and private networks are unreachable, so a prompt-injected agent cannot probe local databases, dashboards, routers or other machines; only the ports and hosts you list are exposed
 
 ### Limitations and Considerations
 

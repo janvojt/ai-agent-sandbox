@@ -128,6 +128,11 @@ SECCOMP_FD=""
 # Run the sandbox in a new terminal session (bwrap --new-session): auto, true
 # or false, see resolve_new_session
 NEW_SESSION="auto"
+# The parts of /sys runtimes read (CPU count and topology, NUMA, huge pages,
+# see mount_minimal_sys); everything else in the host's /sys stays hidden
+SYSFS_SHARED_PATHS=(/sys/devices/system/cpu /sys/devices/system/node /sys/kernel/mm/transparent_hugepage)
+CGROUP_V2_ROOT="/sys/fs/cgroup"
+PROC_SELF_CGROUP="/proc/self/cgroup"
 NEW_SESSION_REASON=""
 LEGACY_TIOCSTI_SYSCTL="/proc/sys/dev/tty/legacy_tiocsti"
 SOCKET_PROXY_IMAGE="${AI_AGENT_SANDBOX_DOCKER_PROXY:-ghcr.io/wollomatic/socket-proxy:1}"
@@ -2159,6 +2164,43 @@ resolve_seccomp_level() {
     fi
 }
 
+# --- /sys ------------------------------------------------------------------------
+#
+# The host's /sys exposes disk serial numbers, MAC addresses and the hardware
+# model (a stable fingerprint of the machine), the host's network interfaces
+# (contradicting the sandbox's own network namespace) and the host's whole
+# cgroup tree (which applications and services are running). The sandbox gets
+# an empty /sys with only SYSFS_SHARED_PATHS and its own cgroup. Whitelisting
+# /sys or a subdirectory (/sys/class/drm for GPUs) mounts more on top.
+
+# Prints this process's cgroup v2 path, nothing on cgroup v1 or hybrid hosts
+own_cgroup_path() {
+    local line
+    [[ -f "$CGROUP_V2_ROOT/cgroup.controllers" && -r "$PROC_SELF_CGROUP" ]] || return 0
+    while IFS= read -r line; do
+        if [[ "$line" == 0::/* ]]; then
+            printf '%s\n' "${line#0::}"
+            return 0
+        fi
+    done < "$PROC_SELF_CGROUP"
+}
+
+# The sandbox runs in the script's cgroup, which becomes the root of its cgroup
+# namespace (/proc/self/cgroup reads 0::/ inside). Binding that cgroup at
+# /sys/fs/cgroup gives runtimes the matching view a container has, so the JVM,
+# Node and Go still find their memory and CPU limits.
+mount_minimal_sys() {
+    local path cgroup
+    BWRAP_ARGS+=(--tmpfs /sys)
+    for path in "${SYSFS_SHARED_PATHS[@]}"; do
+        BWRAP_ARGS+=(--ro-bind-try "$path" "$path")
+    done
+    cgroup="$(own_cgroup_path)"
+    if [[ -n "$cgroup" ]]; then
+        BWRAP_ARGS+=(--ro-bind-try "$CGROUP_V2_ROOT${cgroup%/}" /sys/fs/cgroup)
+    fi
+}
+
 # --- Terminal session -----------------------------------------------------------
 #
 # A process that shares the controlling terminal of the shell the sandbox was
@@ -4006,10 +4048,10 @@ BWRAP_ARGS=(
 
     # Tmp directories
     --tmpfs /tmp
-
-    # Make root readonly
-    --ro-bind /sys /sys
 )
+
+# A minimal /sys instead of the host's
+mount_minimal_sys
 
 if [[ "$NEW_SESSION" = true ]]; then
     BWRAP_ARGS+=(--new-session)

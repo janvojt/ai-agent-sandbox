@@ -236,6 +236,40 @@ git config core.fsmonitor 'touch pwned' || echo config-ro"
     assert_output ""
 }
 
+@test "/sys only shows CPU information and the sandbox's own cgroup" {
+    run_real_sandbox 'ls /sys | tr "\n" " "; echo
+ls /sys/class 2>/dev/null || echo no-class
+cat /sys/block/*/device/serial 2>/dev/null || echo no-serials
+cat /proc/self/cgroup
+test -r /sys/devices/system/cpu/online && echo cpu-ok
+nproc >/dev/null && echo nproc-ok
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then test -r /sys/fs/cgroup/memory.max -o -r /sys/fs/cgroup/cgroup.procs && echo cgroup-ok; else echo cgroup-ok; fi
+grep " /sys/fs/cgroup " /proc/self/mountinfo | cut -d" " -f4'
+    assert_success
+    assert_line no-class
+    assert_line no-serials
+    assert_line cpu-ok
+    assert_line nproc-ok
+    assert_line cgroup-ok
+    refute_output --partial "/.."
+}
+
+@test "runtimes start with the minimal /sys" {
+    local runtime found=false
+    for runtime in python3 node java; do
+        command -v "$runtime" >/dev/null && found=true
+    done
+    [[ "$found" = true ]] || skip "no python3, node or java installed"
+    run_real_sandbox 'for check in "python3 -I -c \"import os; assert os.cpu_count()\"" "node -e \"require(\\\"os\\\").cpus().length || process.exit(1)\"" "java -version"; do
+    set -- $check
+    command -v "$1" >/dev/null || continue
+    if eval "$check" >/dev/null 2>&1; then echo "$1 true"; else echo "$1 false"; fi
+done'
+    assert_success
+    refute_output --partial false
+    refute_output --partial Traceback
+}
+
 # Prints "<name> <errno name or ok>" for a few filtered calls. Skips without
 # python3 (the probe needs raw syscalls) or on a host without a filter.
 seccomp_probe='python3 -I -c "

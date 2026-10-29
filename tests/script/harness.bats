@@ -32,3 +32,12 @@ setup() {
     refute_args_contain BWRAP_RECORDED --new-session
     assert_output --partial "Terminal Session: shared (--no-new-session)"
 }
+
+@test "the host's /sys is not mounted, a whitelisted /sys path is" {
+    run_sandbox --dry-run
+    assert_success
+    refute_args_contain BWRAP_RECORDED --ro-bind /sys /sys
+    assert_args_contain BWRAP_RECORDED --tmpfs /sys
+    run_sandbox --dry-run --whitelist-path /sys/class
+    assert_args_contain BWRAP_RECORDED --ro-bind /sys/class /sys/class
+}
