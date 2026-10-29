@@ -167,6 +167,10 @@ SOCKET_PROXY_IMAGE="${AI_AGENT_SANDBOX_DOCKER_PROXY:-ghcr.io/wollomatic/socket-p
 PROXY_CONTAINER_NAME=""
 PROXY_SOCKET_PATH=""
 PROXY_SOCKET_DIR=""
+# Docker API filter in front of the socket proxy (see docker_filter_program)
+DOCKER_PRIVATE_DIR=""
+DOCKER_FILTER_PID=""
+DOCKER_ROOTLESS=false
 VENV_PATH=""
 VENV_BIN_DIR=""
 CLAUDE_HOST_BIN="$HOME/.local/bin/claude"
@@ -1339,6 +1343,16 @@ validate_docker() {
         exit 1
     fi
 
+    if ! command -v python3 &>/dev/null \
+        || ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then
+        echo -e "${RED}Error: --enable-docker needs python3 (3.8 or newer) on the host for the Docker API filter${NC}" >&2
+        exit 1
+    fi
+
+    if docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -qE 'name=(rootless|userns)'; then
+        DOCKER_ROOTLESS=true
+    fi
+
     if ! docker compose version &>/dev/null; then
         log_info "${YELLOW}Warning: Docker Compose is not available on the host Docker client; install the Compose plugin for 'docker compose' support${NC}"
     fi
@@ -1598,10 +1612,692 @@ split_mount_root() {
     done
 }
 
+# The Docker API filter (Python, run on the host). The socket proxy only
+# checks bind mount sources; this refuses privileged containers, host
+# namespaces, extra capabilities, devices, unconfined security profiles, volume
+# drivers mounting devices or network shares, other network drivers and
+# plugins/swarm, and limits every operation on existing containers, volumes and
+# networks to those labelled with this working directory. Kept in the script so
+# it stays a single file; tests/unit/docker_filter.bats tests it directly.
+docker_filter_program() {
+    cat <<'PYEOF'
+"""Docker API filter of ai-agent-sandbox (runs on the host, see start_docker_filter).
+
+Sits between the sandbox and the socket proxy (which checks bind mount sources)
+and refuses what the proxy lets through: privileged containers, host
+namespaces, added capabilities, devices, unconfined security profiles, volume
+drivers that mount host devices or network shares, other network drivers, and
+plugins/swarm. Containers, volumes and networks get an owner label with the
+sandbox's working directory, and every operation on an existing object
+requires that label, so the agent cannot inspect, exec into, copy into or
+remove containers it did not create (the user's databases, the socket proxy
+itself, which has the real Docker socket).
+
+Usage: python3 -I docker_filter.py LISTEN_SOCKET UPSTREAM_SOCKET OWNER
+"""
+import asyncio
+import json
+import os
+import re
+import sys
+import urllib.parse
+
+OWNER_LABEL = "ai-agent-sandbox.owner"
+MAX_BODY = 32 * 1024 * 1024
+DEFAULT_API = "/v1.41"
+# Docker's default capabilities plus a few that only act inside the container
+SAFE_CAPS = {
+    "AUDIT_WRITE", "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL",
+    "NET_BIND_SERVICE", "NET_RAW", "SETFCAP", "SETGID", "SETPCAP", "SETUID",
+    "SYS_CHROOT", "NET_ADMIN", "IPC_LOCK", "SYS_NICE", "SYS_PTRACE", "SYS_RESOURCE",
+}
+NAMESPACE_MODES = ("PidMode", "IpcMode", "UTSMode", "UsernsMode", "CgroupnsMode", "NetworkMode")
+PREDEFINED_NETWORKS = {"bridge", "default", "none"}
+RUNTIMES = {"", "runc", "runsc"}
+HIJACK_RE = re.compile(r"^/(containers/[^/]+/attach|exec/[^/]+/start|session|grpc)$")
+VERSION_RE = re.compile(r"^(/v[0-9]+(?:\.[0-9]+)?)(/.*)$")
+RAW_STREAM_TYPES = ("application/vnd.docker.raw-stream", "application/vnd.docker.multiplexed-stream")
+
+LISTEN = UPSTREAM = OWNER = ""
+
+
+class Deny(Exception):
+    pass
+
+
+# --- HTTP helpers -----------------------------------------------------------------
+
+class Message:
+    """A parsed request or response head."""
+
+    def __init__(self, raw):
+        lines = raw.decode("latin-1").split("\r\n")
+        self.start = lines[0]
+        self.headers = []
+        for line in lines[1:]:
+            if not line:
+                continue
+            if line[0] in " \t" or ":" not in line:
+                raise Deny("malformed header")
+            name, value = line.split(":", 1)
+            if name != name.strip() or not name:
+                raise Deny("malformed header")
+            self.headers.append((name, value.strip()))
+
+    def get(self, name):
+        values = [v for n, v in self.headers if n.lower() == name.lower()]
+        if len(values) > 1:
+            raise Deny("duplicate %s header" % name)
+        return values[0] if values else None
+
+    def set(self, name, value):
+        self.headers = [(n, v) for n, v in self.headers if n.lower() != name.lower()]
+        if value is not None:
+            self.headers.append((name, value))
+
+    def framing(self):
+        """'chunked', a content length or None (no body / until close)."""
+        te = self.get("Transfer-Encoding")
+        cl = self.get("Content-Length")
+        if te is not None:
+            if te.lower() != "chunked" or cl is not None:
+                raise Deny("unsupported transfer encoding")
+            return "chunked"
+        if cl is not None:
+            if not cl.isdigit():
+                raise Deny("invalid content length")
+            return int(cl)
+        return None
+
+    def encode(self):
+        return ("\r\n".join([self.start] + ["%s: %s" % h for h in self.headers]) + "\r\n\r\n").encode("latin-1")
+
+
+async def read_head(reader):
+    try:
+        return await reader.readuntil(b"\r\n\r\n")
+    except asyncio.IncompleteReadError as e:
+        if e.partial.strip():
+            raise Deny("incomplete request")
+        return None
+    except asyncio.LimitOverrunError:
+        raise Deny("request head too large")
+
+
+async def copy_chunked(reader, writer, collect=None):
+    """Copies (or collects) one chunked body, re-emitting exactly what was parsed."""
+    total = 0
+    while True:
+        line = await reader.readuntil(b"\r\n")
+        size_text = line[:-2].split(b";", 1)[0].strip()
+        if not re.fullmatch(rb"[0-9a-fA-F]+", size_text):
+            raise Deny("invalid chunk size")
+        size = int(size_text, 16)
+        data = await reader.readexactly(size + 2) if size else b""
+        if size and data[-2:] != b"\r\n":
+            raise Deny("invalid chunk")
+        if collect is not None:
+            total += size
+            if total > MAX_BODY:
+                raise Deny("request body too large")
+            collect.append(data[:-2])
+        elif writer is not None:
+            writer.write(b"%x\r\n" % size + data)
+            await writer.drain()
+        if size == 0:
+            # optional trailers, ended by an empty line
+            while True:
+                trailer = await reader.readuntil(b"\r\n")
+                if writer is not None and collect is None:
+                    writer.write(trailer)
+                if trailer == b"\r\n":
+                    if writer is not None and collect is None:
+                        await writer.drain()
+                    return
+
+
+async def copy_exact(reader, writer, length):
+    while length > 0:
+        data = await reader.read(min(length, 65536))
+        if not data:
+            raise ConnectionError("connection closed")
+        writer.write(data)
+        await writer.drain()
+        length -= len(data)
+
+
+async def copy_until_eof(reader, writer):
+    while True:
+        data = await reader.read(65536)
+        if not data:
+            return
+        writer.write(data)
+        await writer.drain()
+
+
+async def read_body(reader, framing):
+    if framing is None:
+        return b""
+    if framing == "chunked":
+        parts = []
+        await copy_chunked(reader, None, parts)
+        return b"".join(parts)
+    if framing > MAX_BODY:
+        raise Deny("request body too large")
+    return await reader.readexactly(framing)
+
+
+async def api(method, path, body=None):
+    """A request of the filter itself to the upstream; returns (status, JSON or None)."""
+    reader, writer = await asyncio.open_unix_connection(UPSTREAM)
+    try:
+        data = json.dumps(body).encode() if body is not None else b""
+        writer.write(("%s %s HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n"
+                      "Content-Type: application/json\r\nContent-Length: %d\r\n\r\n"
+                      % (method, path, len(data))).encode() + data)
+        await writer.drain()
+        head = Message(await reader.readuntil(b"\r\n\r\n"))
+        status = int(head.start.split()[1])
+        framing = head.framing()
+        if framing == "chunked":
+            parts = []
+            await copy_chunked(reader, None, parts)
+            payload = b"".join(parts)
+        elif framing is not None:
+            payload = await reader.readexactly(framing)
+        else:
+            payload = await reader.read()
+    finally:
+        writer.close()
+    try:
+        return status, json.loads(payload) if payload.strip() else None
+    except ValueError:
+        return status, None
+
+
+# --- Policy -------------------------------------------------------------------------
+
+class Request:
+    def __init__(self, head):
+        parts = head.start.split(" ")
+        if len(parts) != 3 or not parts[2].startswith("HTTP/1."):
+            raise Deny("malformed request line")
+        self.method, target, self.protocol = parts
+        url = urllib.parse.urlsplit(target)
+        if url.scheme or url.netloc:
+            raise Deny("absolute request target")
+        path = urllib.parse.unquote(url.path)
+        if "/../" in path + "/" or "/./" in path + "/" or "//" in path:
+            raise Deny("unnormalized path")
+        match = VERSION_RE.match(path)
+        self.version, self.path = (match.group(1), match.group(2)) if match else ("", path)
+        self.raw_path = url.path
+        self.query = urllib.parse.parse_qsl(url.query, keep_blank_values=True)
+        self.head = head
+        self.body = None
+        self.target_changed = False
+
+    @property
+    def api_prefix(self):
+        return self.version or DEFAULT_API
+
+    def param(self, name):
+        for key, value in self.query:
+            if key == name:
+                return value
+        return None
+
+    def add_owner_filter(self):
+        filters = {}
+        raw = self.param("filters")
+        if raw:
+            try:
+                filters = json.loads(raw)
+            except ValueError:
+                raise Deny("invalid filters")
+            if not isinstance(filters, dict):
+                raise Deny("invalid filters")
+        label = filters.get("label")
+        owner = "%s=%s" % (OWNER_LABEL, OWNER)
+        if label is None:
+            filters["label"] = {owner: True}
+        elif isinstance(label, dict):
+            label[owner] = True
+        elif isinstance(label, list):
+            label.append(owner)
+        else:
+            raise Deny("invalid filters")
+        self.query = [(k, v) for k, v in self.query if k != "filters"] + [("filters", json.dumps(filters))]
+        self.target_changed = True
+
+    def target(self):
+        query = urllib.parse.urlencode(self.query)
+        return self.raw_path + ("?" + query if query else "")
+
+
+def canonical(obj, fields, where):
+    """Go's JSON decoder matches field names case-insensitively, so the daemon
+    would honour {"hostconfig": {"privileged": true}}. Refuse every spelling of
+    an inspected field other than the canonical one."""
+    if obj is None:
+        return {}
+    if not isinstance(obj, dict):
+        raise Deny("invalid %s" % where)
+    folded = {f.casefold(): f for f in fields}
+    seen = set()
+    for key in obj:
+        fold = key.casefold().replace("\u212a", "k")
+        if fold in folded and key != folded[fold]:
+            raise Deny("field %s in %s must be spelled %s" % (key, where, folded[fold]))
+        if fold in seen:
+            raise Deny("duplicate field %s in %s" % (key, where))
+        seen.add(fold)
+    return obj
+
+
+CREATE_FIELDS = ("HostConfig", "NetworkingConfig", "Labels")
+HOST_FIELDS = ("Privileged", "CapAdd", "CapDrop", "Devices", "DeviceCgroupRules", "DeviceRequests",
+               "SecurityOpt", "CgroupParent", "Runtime", "MaskedPaths", "ReadonlyPaths", "VolumeDriver",
+               "VolumesFrom", "Binds", "Mounts") + NAMESPACE_MODES
+
+
+def quote(ref):
+    return urllib.parse.quote(ref, safe="")
+
+
+def owned(labels):
+    return isinstance(labels, dict) and labels.get(OWNER_LABEL) == OWNER
+
+
+async def ensure_container(req, ref):
+    if not ref:
+        raise Deny("missing container")
+    status, info = await api("GET", "%s/containers/%s/json" % (req.api_prefix, quote(ref)))
+    if status == 404:
+        return  # the daemon answers 404 itself
+    if status != 200 or not owned(((info or {}).get("Config") or {}).get("Labels")):
+        raise Deny("container %s was not created in this sandbox's project" % ref)
+
+
+async def ensure_exec(req, exec_id):
+    status, info = await api("GET", "%s/exec/%s/json" % (req.api_prefix, quote(exec_id)))
+    if status == 404:
+        return
+    if status != 200 or not (info or {}).get("ContainerID"):
+        raise Deny("unknown exec instance")
+    await ensure_container(req, info["ContainerID"])
+
+
+async def ensure_volume(req, name, create=False):
+    status, info = await api("GET", "%s/volumes/%s" % (req.api_prefix, quote(name)))
+    if status == 404:
+        if create:
+            # docker run -v name:/x would create it without a label
+            status, _ = await api("POST", "%s/volumes/create" % req.api_prefix,
+                                  {"Name": name, "Labels": {OWNER_LABEL: OWNER}})
+            if status not in (200, 201):
+                raise Deny("could not create volume %s" % name)
+        return
+    if status != 200 or not owned((info or {}).get("Labels")):
+        raise Deny("volume %s was not created in this sandbox's project" % name)
+
+
+async def ensure_network(req, ref):
+    if ref in PREDEFINED_NETWORKS:
+        return
+    if ref == "host":
+        raise Deny("the host network is not allowed")
+    status, info = await api("GET", "%s/networks/%s" % (req.api_prefix, quote(ref)))
+    if status == 404:
+        return
+    if status != 200:
+        raise Deny("network %s is not accessible" % ref)
+    if (info or {}).get("Name") in PREDEFINED_NETWORKS:
+        return
+    if (info or {}).get("Name") == "host":
+        raise Deny("the host network is not allowed")
+    if not owned((info or {}).get("Labels")):
+        raise Deny("network %s was not created in this sandbox's project" % ref)
+
+
+def check_driver_opts(opts):
+    if not opts:
+        return
+    if not isinstance(opts, dict):
+        raise Deny("invalid volume driver options")
+    kind = str(opts.get("type", "")).lower()
+    mount_opts = {o.strip().lower() for o in str(opts.get("o", "")).split(",")}
+    if kind == "tmpfs":
+        return
+    if kind in ("", "none") and mount_opts & {"bind", "rbind"}:
+        return  # a bind mount: the socket proxy checks the device path
+    raise Deny("volume driver options other than tmpfs and bind mounts (block devices, NFS, CIFS) are not allowed")
+
+
+def add_owner_label(body, key="Labels"):
+    labels = body.get(key)
+    if labels is None:
+        labels = body[key] = {}
+    if not isinstance(labels, dict):
+        raise Deny("invalid labels")
+    labels[OWNER_LABEL] = OWNER
+
+
+async def check_container_create(req, body):
+    canonical(body, CREATE_FIELDS, "the request")
+    host = canonical(body.get("HostConfig"), HOST_FIELDS, "HostConfig")
+    if host.get("Privileged"):
+        raise Deny("privileged containers are not allowed")
+    for cap in host.get("CapAdd") or []:
+        name = str(cap).upper()
+        name = name[4:] if name.startswith("CAP_") else name
+        if name not in SAFE_CAPS:
+            raise Deny("capability %s is not allowed" % cap)
+    # Device nodes created in a bind-mounted directory would be usable on the host
+    drop = host.get("CapDrop") or []
+    if not any(str(c).upper() in ("ALL", "MKNOD", "CAP_MKNOD") for c in drop):
+        host["CapDrop"] = list(drop) + ["MKNOD"]
+    for key in ("Devices", "DeviceCgroupRules", "DeviceRequests"):
+        if host.get(key):
+            raise Deny("%s are not allowed" % key)
+    for key in NAMESPACE_MODES:
+        mode = str(host.get(key) or "")
+        if mode == "host":
+            raise Deny("%s=host is not allowed" % key)
+        if mode.startswith("container:"):
+            await ensure_container(req, mode.split(":", 1)[1])
+        elif key == "NetworkMode" and mode:
+            await ensure_network(req, mode)
+    for opt in host.get("SecurityOpt") or []:
+        text = str(opt).lower()
+        if "unconfined" in text or text.replace(":", "=").startswith(("label=disable", "seccomp")):
+            raise Deny("security option %s is not allowed" % opt)
+    if host.get("CgroupParent"):
+        raise Deny("CgroupParent is not allowed")
+    if str(host.get("Runtime") or "") not in RUNTIMES:
+        raise Deny("runtime %s is not allowed" % host.get("Runtime"))
+    for key in ("MaskedPaths", "ReadonlyPaths"):
+        if host.get(key) is not None:
+            raise Deny("%s are not allowed" % key)
+    if str(host.get("VolumeDriver") or "local") != "local":
+        raise Deny("volume driver %s is not allowed" % host.get("VolumeDriver"))
+    for ref in host.get("VolumesFrom") or []:
+        await ensure_container(req, str(ref).split(":", 1)[0])
+    for bind in host.get("Binds") or []:
+        source = str(bind).split(":", 1)[0]
+        if source and not source.startswith("/"):
+            await ensure_volume(req, source, create=True)
+    for mount in host.get("Mounts") or []:
+        canonical(mount, ("Type", "Source", "VolumeOptions"), "Mounts")
+        kind = str(mount.get("Type") or "volume").lower()
+        if kind == "volume":
+            options = canonical(mount.get("VolumeOptions"), ("DriverConfig",), "VolumeOptions")
+            driver = canonical(options.get("DriverConfig"), ("Name", "Options"), "DriverConfig")
+            if driver.get("Name") not in (None, "", "local") or driver.get("Options"):
+                raise Deny("inline volume driver options are not allowed, create the volume first")
+            if mount.get("Source"):
+                await ensure_volume(req, str(mount["Source"]), create=True)
+        elif kind not in ("bind", "tmpfs", "image"):
+            raise Deny("mount type %s is not allowed" % kind)
+    networking = canonical(body.get("NetworkingConfig"), ("EndpointsConfig",), "NetworkingConfig")
+    endpoints = networking.get("EndpointsConfig") or {}
+    for name in endpoints:
+        await ensure_network(req, name)
+    body["HostConfig"] = host
+    add_owner_label(body)
+
+
+async def check_request(req, reader):
+    """Raises Deny, may set req.body (inspected and possibly rewritten)."""
+    method, path = req.method, req.path
+    parts = path.strip("/").split("/") if path.strip("/") else [""]
+    top = parts[0]
+
+    async def body():
+        data = await read_body(reader, req.head.framing())
+        try:
+            value = json.loads(data) if data.strip() else {}
+        except ValueError:
+            raise Deny("invalid JSON body")
+        if not isinstance(value, dict):
+            raise Deny("invalid JSON body")
+        return value
+
+    if method not in ("GET", "HEAD", "POST", "PUT", "DELETE"):
+        raise Deny("method %s is not allowed" % method)
+    if top in ("_ping", "version", "info", "auth", "distribution", "images"):
+        return
+    if top == "events" and len(parts) == 1:
+        req.add_owner_filter()
+        return
+    if top == "build":
+        if (req.param("networkmode") or "").lower() == "host":
+            raise Deny("builds on the host network are not allowed")
+        return
+    if top in ("session", "grpc") and len(parts) == 1:
+        return  # BuildKit
+    if top == "commit" and method == "POST":
+        await ensure_container(req, req.param("container") or "")
+        return
+    if top == "containers":
+        if len(parts) == 2 and parts[1] == "json" and method == "GET":
+            req.add_owner_filter()
+            return
+        if len(parts) == 2 and parts[1] == "create" and method == "POST":
+            req.body = await body()
+            await check_container_create(req, req.body)
+            return
+        if len(parts) == 2 and parts[1] == "prune" and method == "POST":
+            req.add_owner_filter()
+            return
+        if len(parts) >= 2 and parts[1]:
+            await ensure_container(req, parts[1])
+            if len(parts) == 3 and parts[2] == "exec" and method == "POST":
+                req.body = canonical(await body(), ("Privileged",), "the request")
+                if req.body.get("Privileged"):
+                    raise Deny("privileged exec is not allowed")
+            return
+    if top == "exec" and len(parts) >= 2:
+        await ensure_exec(req, parts[1])
+        return
+    if top == "volumes":
+        if len(parts) == 1 and method == "GET":
+            req.add_owner_filter()
+            return
+        if len(parts) == 2 and parts[1] == "create" and method == "POST":
+            req.body = canonical(await body(), ("Driver", "DriverOpts", "ClusterVolumeSpec", "Labels"), "the request")
+            if str(req.body.get("Driver") or "local") != "local":
+                raise Deny("volume driver %s is not allowed" % req.body.get("Driver"))
+            if req.body.get("ClusterVolumeSpec"):
+                raise Deny("cluster volumes are not allowed")
+            check_driver_opts(req.body.get("DriverOpts"))
+            add_owner_label(req.body)
+            return
+        if len(parts) == 2 and parts[1] == "prune" and method == "POST":
+            req.add_owner_filter()
+            return
+        if len(parts) == 2:
+            await ensure_volume(req, parts[1])
+            return
+    if top == "networks":
+        if len(parts) == 1 and method == "GET":
+            return  # predefined networks must stay listable
+        if len(parts) == 2 and parts[1] == "create" and method == "POST":
+            req.body = canonical(await body(), ("Driver", "Options", "ConfigFrom", "Ingress", "Labels"), "the request")
+            if str(req.body.get("Driver") or "bridge") != "bridge":
+                raise Deny("network driver %s is not allowed" % req.body.get("Driver"))
+            options = req.body.get("Options") or {}
+            if req.body.get("ConfigFrom") or req.body.get("Ingress") or "com.docker.network.bridge.name" in options:
+                raise Deny("these network options are not allowed")
+            add_owner_label(req.body)
+            return
+        if len(parts) == 2 and parts[1] == "prune" and method == "POST":
+            req.add_owner_filter()
+            return
+        if len(parts) == 2:
+            if method != "GET" or parts[1] not in PREDEFINED_NETWORKS | {"host"}:
+                await ensure_network(req, parts[1])
+            return
+        if len(parts) == 3 and parts[2] in ("connect", "disconnect") and method == "POST":
+            await ensure_network(req, parts[1])
+            req.body = canonical(await body(), ("Container",), "the request")
+            await ensure_container(req, str(req.body.get("Container") or ""))
+            return
+    if top in ("plugins", "swarm", "services", "nodes", "secrets", "configs", "tasks") and method in ("GET", "HEAD"):
+        return
+    raise Deny("%s %s is not allowed" % (method, path))
+
+
+# --- Connections ----------------------------------------------------------------------
+
+async def deny(writer, reason):
+    body = json.dumps({"message": "ai-agent-sandbox: " + reason}).encode()
+    writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n"
+                 b"Connection: close\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+    await writer.drain()
+    print("denied: %s" % reason, file=sys.stderr, flush=True)
+
+
+async def relay_response(req, up_reader, writer):
+    """Forwards one response; returns 'hijack', 'close' or 'keep'."""
+    while True:
+        raw = await up_reader.readuntil(b"\r\n\r\n")
+        head = Message(raw)
+        status = int(head.start.split()[1])
+        writer.write(raw)
+        await writer.drain()
+        if status != 100:
+            break
+    content_type = (head.get("Content-Type") or "").split(";")[0].strip()
+    # After 101 the daemon no longer parses HTTP on this connection; a raw
+    # stream answer to attach/exec start means the same
+    if status == 101 or (HIJACK_RE.match(req.path) and content_type in RAW_STREAM_TYPES):
+        return "hijack"
+    if req.method == "HEAD" or status in (204, 304) or 100 <= status < 200:
+        return "keep"
+    framing = head.framing()
+    if framing == "chunked":
+        await copy_chunked(up_reader, writer)
+        await writer.drain()
+    elif framing is not None:
+        await copy_exact(up_reader, writer, framing)
+    else:
+        await copy_until_eof(up_reader, writer)
+        return "close"
+    if (head.get("Connection") or "").lower() == "close":
+        return "close"
+    return "keep"
+
+
+async def pipe(reader, writer):
+    try:
+        await copy_until_eof(reader, writer)
+    finally:
+        try:
+            writer.write_eof()
+        except (OSError, RuntimeError):
+            pass
+
+
+async def handle(client_reader, client_writer):
+    up_reader = up_writer = None
+    try:
+        while True:
+            raw = await read_head(client_reader)
+            if raw is None:
+                return
+            try:
+                head = Message(raw)
+                req = Request(head)
+                if (head.get("Expect") or "").lower() == "100-continue":
+                    # the body is read here, before the upstream sees the request
+                    head.set("Expect", None)
+                    client_writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+                    await client_writer.drain()
+                await check_request(req, client_reader)
+                framing = head.framing()
+            except Deny as e:
+                await deny(client_writer, str(e))
+                return
+            if up_writer is None:
+                up_reader, up_writer = await asyncio.open_unix_connection(UPSTREAM)
+            if req.target_changed:
+                head.start = "%s %s %s" % (req.method, req.target(), req.protocol)
+            if req.body is not None:
+                data = json.dumps(req.body).encode()
+                head.set("Transfer-Encoding", None)
+                head.set("Content-Length", str(len(data)))
+                up_writer.write(head.encode() + data)
+            else:
+                up_writer.write(head.encode())
+                if framing == "chunked":
+                    await copy_chunked(client_reader, up_writer)
+                elif framing:
+                    await copy_exact(client_reader, up_writer, framing)
+            await up_writer.drain()
+            outcome = await relay_response(req, up_reader, client_writer)
+            if outcome == "hijack":
+                # The daemon took over the connection (attach, exec, BuildKit):
+                # from here on it carries a raw stream, no further API requests
+                await asyncio.gather(pipe(client_reader, up_writer), pipe(up_reader, client_writer))
+                return
+            if outcome == "close" or (head.get("Connection") or "").lower() == "close":
+                return
+    except (ConnectionError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, Deny):
+        return
+    finally:
+        for w in (client_writer, up_writer):
+            if w is not None:
+                w.close()
+
+
+async def watch_parent(parent):
+    # The script may be killed without running its cleanup: do not outlive it
+    while os.getppid() == parent:
+        await asyncio.sleep(2)
+    os._exit(0)
+
+
+async def main():
+    parent = os.getppid()
+    if os.path.exists(LISTEN):
+        os.unlink(LISTEN)
+    old_umask = os.umask(0o177)
+    server = await asyncio.start_unix_server(handle, path=LISTEN, limit=1024 * 1024)
+    os.umask(old_umask)
+    asyncio.ensure_future(watch_parent(parent))
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    LISTEN, UPSTREAM, OWNER = sys.argv[1:4]
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+PYEOF
+}
+
+# Proxy containers of earlier runs whose script is gone (killed without its
+# cleanup): they still hold the real Docker socket
+remove_stale_socket_proxies() {
+    local name pid
+    while IFS= read -r name; do
+        pid="${name##*-}"
+        [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
+        if ! kill -0 "$pid" 2>/dev/null; then
+            docker rm -f "$name" >/dev/null 2>&1 && log_info "${YELLOW}Removed stale socket proxy $name${NC}"
+        fi
+    done < <(docker ps -a --filter 'name=^ai-agent-sandbox-proxy-' --format '{{.Names}}' 2>/dev/null)
+    return 0
+}
+
 start_socket_proxy() {
     PROXY_CONTAINER_NAME="ai-agent-sandbox-proxy-$$"
     PROXY_SOCKET_DIR="$WORKING_DIR/.docker-proxy"
     PROXY_SOCKET_PATH="$PROXY_SOCKET_DIR/docker.sock"
+    local upstream_dir upstream_socket filter_program
     local docker_group_gid=""
     local proxy_group_args=()
 
@@ -1615,9 +2311,21 @@ start_socket_proxy() {
         [[ -n "$p" ]] && log_info "  ${GREEN}✓${NC} $p"
     done
 
+    remove_stale_socket_proxies
+
+    # The sandbox only sees the filter's socket (mode 0600 in .docker-proxy);
+    # the proxy's own socket lives in a private directory outside it. The
+    # proxy container writes into upstream/ (0777 for user namespace remapped
+    # daemons), which nobody else can reach through the 0700 parent.
     mkdir -p "$PROXY_SOCKET_DIR"
-    chmod 0777 "$PROXY_SOCKET_DIR" 2>/dev/null || true
+    chmod 0700 "$PROXY_SOCKET_DIR" 2>/dev/null || true
     rm -f "$PROXY_SOCKET_PATH"
+    DOCKER_PRIVATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ai-agent-sandbox-docker.XXXXXX")" || exit 1
+    upstream_dir="$DOCKER_PRIVATE_DIR/upstream"
+    upstream_socket="$upstream_dir/docker.sock"
+    filter_program="$DOCKER_PRIVATE_DIR/docker_filter.py"
+    mkdir -m 0777 "$upstream_dir" && chmod 0777 "$upstream_dir"
+    docker_filter_program > "$filter_program"
 
     docker_group_gid=$(getent group docker | cut -d: -f3 2>/dev/null || true)
 
@@ -1632,14 +2340,14 @@ start_socket_proxy() {
         --user 0:0 \
         "${proxy_group_args[@]}" \
         -v /var/run/docker.sock:/var/run/docker.sock:ro \
-        -v "$PROXY_SOCKET_DIR:/proxy" \
+        -v "$upstream_dir:/proxy" \
         "$SOCKET_PROXY_IMAGE" \
         -proxysocketendpoint=/proxy/docker.sock \
         -proxysocketendpointfilemode=0666 \
         -allowbindmountfrom="$allowed_paths" \
         -allowGET='/v1\..{1,2}/.*' \
         -allowHEAD='/_ping' \
-        -allowPOST='/v1\..{1,2}/.*' \
+        -allowPOST='/(v1\..{1,2}/.*|session|grpc)' \
         -allowPUT='/v1\..{1,2}/.*' \
         -allowDELETE='/v1\..{1,2}/(containers|images|networks|volumes)/.*' \
         >/dev/null; then
@@ -1648,13 +2356,29 @@ start_socket_proxy() {
     fi
 
     local timeout=20
-    while [[ ! -S "$PROXY_SOCKET_PATH" ]] && [[ $timeout -gt 0 ]]; do
+    while [[ ! -S "$upstream_socket" ]] && [[ $timeout -gt 0 ]]; do
         sleep 0.5
         ((timeout--))
     done
 
+    if [[ -S "$upstream_socket" ]]; then
+        # Not a child of the sandbox: the agent cannot stop it. It exits on its
+        # own when this script is gone.
+        python3 -I "$filter_program" "$PROXY_SOCKET_PATH" "$upstream_socket" "$WORKING_DIR" \
+            </dev/null 2>>"$DOCKER_PRIVATE_DIR/filter.log" &
+        DOCKER_FILTER_PID=$!
+        timeout=20
+        while [[ ! -S "$PROXY_SOCKET_PATH" ]] && [[ $timeout -gt 0 ]] && kill -0 "$DOCKER_FILTER_PID" 2>/dev/null; do
+            sleep 0.1
+            ((timeout--)) || true
+        done
+    fi
+
     if [[ ! -S "$PROXY_SOCKET_PATH" ]]; then
         echo -e "${RED}Error: Socket proxy failed to create socket${NC}" >&2
+        if [[ -s "$DOCKER_PRIVATE_DIR/filter.log" ]]; then
+            cat "$DOCKER_PRIVATE_DIR/filter.log" >&2
+        fi
         if docker ps -a --format '{{.Names}}' | grep -q "^${PROXY_CONTAINER_NAME}$"; then
             echo -e "${YELLOW}Socket proxy logs:${NC}" >&2
             docker logs "$PROXY_CONTAINER_NAME" >&2 || true
@@ -1667,12 +2391,19 @@ start_socket_proxy() {
         echo -e "${YELLOW}Warning: Socket proxy may not be fully functional${NC}" >&2
     fi
 
-    log_info "${GREEN}✓${NC} Socket proxy started successfully"
+    log_info "${GREEN}✓${NC} Socket proxy and Docker API filter started (privileged containers, host namespaces, devices and other projects' containers refused)"
     log_info "${GREEN}✓${NC} Proxy socket: $PROXY_SOCKET_PATH"
+    if [[ "$DOCKER_ROOTLESS" = false ]]; then
+        log_info "${YELLOW}⚠${NC} Docker is not rootless: containers run as root on the host and can leave root-owned setuid files in mounted directories (see README)"
+    fi
     log_info "${GREEN}========================================${NC}\n"
 }
 
 cleanup_socket_proxy() {
+    if [[ -n "${DOCKER_FILTER_PID:-}" ]]; then
+        kill "$DOCKER_FILTER_PID" 2>/dev/null || true
+        DOCKER_FILTER_PID=""
+    fi
     if [[ -n "${PROXY_CONTAINER_NAME:-}" ]]; then
         local container_name="$PROXY_CONTAINER_NAME"
         PROXY_CONTAINER_NAME=""
@@ -1685,6 +2416,10 @@ cleanup_socket_proxy() {
     fi
     if [[ -n "${PROXY_SOCKET_DIR:-}" ]] && [[ -d "$PROXY_SOCKET_DIR" ]]; then
         rmdir "$PROXY_SOCKET_DIR" 2>/dev/null || true
+    fi
+    if [[ -n "${DOCKER_PRIVATE_DIR:-}" ]] && [[ -d "$DOCKER_PRIVATE_DIR" ]]; then
+        rm -rf "$DOCKER_PRIVATE_DIR" 2>/dev/null || true
+        DOCKER_PRIVATE_DIR=""
     fi
 }
 

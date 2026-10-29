@@ -24,6 +24,7 @@ A secure bubblewrap-based sandboxing solution for running AI coding agents with 
   - Debian/Ubuntu: `sudo apt install passt`
   - Fedora: `sudo dnf install passt`
   - Arch: `sudo pacman -S passt`
+- **python3** (3.8 or newer, only for `--enable-docker`: runs the Docker API filter on the host)
 - **An AI coding agent** - Claude Code or OpenCode are currently supported
 
 ## Installation
@@ -238,7 +239,22 @@ With `--agent opencode` the arguments go to the `opencode` binary in the same wa
   --whitelist-path-rw ~/.gradle/caches
 ```
 
-Docker access is provided through a per-run socket proxy created at `.docker-proxy/docker.sock` in the working directory. The proxy only allows bind mounts from paths already accessible inside the sandbox (working directory and any read-write mounts). Paths containing sandbox or git configuration (see *Project config protection* and *Git config protection*) are refused, because a container would see the host directory without the sandbox's read-only mounts: with protection on, the working directory itself cannot be mounted (`-v "$PWD:/app"`), mount its subdirectories instead (`-v "$PWD/src:/app/src"`). Entries created in such a directory after the sandbox started cannot be mounted either.
+Docker access goes through two layers started for each run. The sandbox only sees `.docker-proxy/docker.sock` in the working directory (mode 0600). The script serves that socket from a **Docker API filter** on the host, which forwards to a socket proxy container ([wollomatic/socket-proxy](https://github.com/wollomatic/socket-proxy)) holding the real Docker socket. Access to the Docker daemon is root on the host, so the filter refuses everything that would give a container access to the host:
+
+- privileged containers, host PID/IPC/network/UTS/user/cgroup namespaces, added capabilities other than those acting only inside the container (`NET_ADMIN`, `SYS_PTRACE`, `IPC_LOCK`, `SYS_NICE`, …), devices and GPU requests, `seccomp`/`apparmor`/`systempaths=unconfined` and `label=disable`, other runtimes and cgroup parents;
+- privileged `docker exec`;
+- volumes that mount host block devices or network shares (only `tmpfs` and bind options, whose paths the proxy checks), volume drivers and network drivers other than `local`/`bridge` (no `macvlan`/`ipvlan` on your LAN);
+- plugins and swarm, host-network builds, and API endpoints it does not know.
+
+Containers, volumes and networks created through the sandbox get the label `ai-agent-sandbox.owner=<working directory>`. Every operation on an existing object (inspect, exec, attach, copy, logs, stop, remove, joining its network or namespaces, mounting its volume) requires that label, and lists, prunes and events only show labelled objects. So the agent cannot read the environment of your other containers, exec into them, delete your databases' volumes or reach the socket proxy itself. A named volume that does not exist yet is created with the label. `MKNOD` is dropped from every container, so no device nodes appear in mounted directories.
+
+Builds use the daemon's built-in BuildKit (`/session` and `/grpc`). A buildx builder with the `docker-container` driver runs BuildKit in a privileged container and is therefore refused: use the default `docker` driver.
+
+Limits:
+- Containers run on Docker's bridge networks, outside the sandbox's network namespace: they can reach your LAN and host services listening on the Docker bridge, so `--network isolated` does not apply to them (nor to builds).
+- With a rootful Docker daemon, root in a container is root on the host. A container can leave root-owned setuid binaries in a mounted directory, which run as root when you execute them on the host (for example through a project script). Rootless Docker or `userns-remap` removes that; the startup log warns when neither is in use.
+
+The proxy only allows bind mounts from paths already accessible inside the sandbox (working directory and any read-write mounts). Paths containing sandbox or git configuration (see *Project config protection* and *Git config protection*) are refused, because a container would see the host directory without the sandbox's read-only mounts: with protection on, the working directory itself cannot be mounted (`-v "$PWD:/app"`), mount its subdirectories instead (`-v "$PWD/src:/app/src"`). Entries created in such a directory after the sandbox started cannot be mounted either.
 
 When Docker is enabled, the sandbox also mounts Docker CLI plugin directories from common host locations so `docker compose` works when the host Docker client has the Compose plugin installed. If `docker compose version` fails on the host, install Docker Compose on the host first.
 
@@ -569,9 +585,10 @@ blacklist:
 6. ✅ **Code execution through git** - Hooks and configuration of every git repository in a writable mount are read-only, so the agent cannot plant commands that git would run on the host
 7. ✅ **Self-modifying sandbox rules** - `.ai-agent-sandbox/` is mounted read-only so the agent cannot change the profile, whitelist or environment it runs with next time
 8. ✅ **OpenCode 2 background server** - OpenCode 2 is started with `--standalone`, so the server that executes its tools runs inside the sandbox instead of the shared per-user service on the host
-9. ✅ **Hardware and host details in /sys** - The sandbox gets an empty `/sys` with only CPU, NUMA and huge page information and its own cgroup, so disk serial numbers, MAC addresses, the host's network interfaces and the list of running applications (cgroup tree) stay hidden. Whitelist `/sys` or a subdirectory (e.g. `/sys/class/drm` for GPU tools) when a tool needs more
-10. ✅ **Exploit-prone kernel interfaces** - A seccomp filter refuses keyrings, BPF, io_uring, userfaultfd, perf, module loading, terminal input injection, new user namespaces and mounts
-11. ✅ **Host services and LAN** - In the default `isolated` network mode the host's loopback and private networks are unreachable, so a prompt-injected agent cannot probe local databases, dashboards, routers or other machines; only the ports and hosts you list are exposed
+9. ✅ **Docker as a way out** - With `--enable-docker`, a filter refuses privileged containers, host namespaces, devices and other projects' containers, see [Docker support](#docker-support-testcontainers)
+10. ✅ **Hardware and host details in /sys** - The sandbox gets an empty `/sys` with only CPU, NUMA and huge page information and its own cgroup, so disk serial numbers, MAC addresses, the host's network interfaces and the list of running applications (cgroup tree) stay hidden. Whitelist `/sys` or a subdirectory (e.g. `/sys/class/drm` for GPU tools) when a tool needs more
+11. ✅ **Exploit-prone kernel interfaces** - A seccomp filter refuses keyrings, BPF, io_uring, userfaultfd, perf, module loading, terminal input injection, new user namespaces and mounts
+12. ✅ **Host services and LAN** - In the default `isolated` network mode the host's loopback and private networks are unreachable, so a prompt-injected agent cannot probe local databases, dashboards, routers or other machines; only the ports and hosts you list are exposed
 
 ### Limitations and Considerations
 
