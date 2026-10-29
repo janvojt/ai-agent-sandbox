@@ -38,8 +38,9 @@ setup() {
     assert_success
     refute_args_contain BWRAP_RECORDED --ro-bind /sys /sys
     assert_args_contain BWRAP_RECORDED --tmpfs /sys
-    run_sandbox --dry-run --whitelist-path /sys/class
-    assert_args_contain BWRAP_RECORDED --ro-bind /sys/class /sys/class
+    # /sys/devices exists both on a host and inside the minimal /sys
+    run_sandbox --dry-run --whitelist-path /sys/devices
+    assert_args_contain BWRAP_RECORDED --ro-bind /sys/devices /sys/devices
 }
 
 @test "only allowed host variables reach bwrap and the hidden ones are named" {
