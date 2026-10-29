@@ -227,3 +227,59 @@ setup() {
     assert_success
     assert_output --partial "Skipping invalid environment entry from the test"
 }
+
+# --- Host environment allow-list ---------------------------------------------------
+
+@test "host_env_allowed accepts the listed names and prefixes only" {
+    local name
+    for name in USER LANG LC_ALL TZ HTTPS_PROXY JAVA_HOME ANTHROPIC_API_KEY \
+        CLAUDE_CODE_OAUTH_TOKEN CLAUDECODE OPENCODE_CONFIG T3CODE_THREAD_ID \
+        MAX_THINKING_TOKENS GIT_AUTHOR_EMAIL; do
+        host_env_allowed "$name" || fail "$name should be allowed"
+    done
+    for name in GITHUB_TOKEN AWS_SECRET_ACCESS_KEY NPM_TOKEN DATABASE_URL \
+        DBUS_SESSION_BUS_ADDRESS DISPLAY WAYLAND_DISPLAY XAUTHORITY SSH_AUTH_SOCK \
+        LD_PRELOAD LD_LIBRARY_PATH GIT_SSH_COMMAND GIT_ASKPASS TMPDIR DOCKER_HOST \
+        PATHX CLAUDE XLANG; do
+        if host_env_allowed "$name"; then fail "$name should be hidden"; fi
+    done
+}
+
+@test "filter_host_environment removes every hidden exported variable" {
+    export GITHUB_TOKEN=secret DISPLAY=:0 ANTHROPIC_API_KEY=key LANG=C.UTF-8
+    exported_test_function() { echo hi; }
+    export -f exported_test_function
+    run bash -c 'source "$1"; set +eu; e=$(command -v env); filter_host_environment; "$e"' _ "$SANDBOX_SCRIPT"
+    assert_success
+    refute_line --partial GITHUB_TOKEN=
+    refute_line --partial DISPLAY=
+    refute_line --regexp '^PATH='
+    refute_line --partial BASH_FUNC_
+    assert_line ANTHROPIC_API_KEY=key
+    assert_line LANG=C.UTF-8
+}
+
+@test "hidden_host_env_names lists names only" {
+    export GITHUB_TOKEN=very-secret-value
+    run hidden_host_env_names
+    assert_line GITHUB_TOKEN
+    refute_output --partial very-secret-value
+}
+
+@test "env: in a project file cannot expand hidden host variables" {
+    export GITHUB_TOKEN=secret LANG=C.UTF-8
+    BWRAP_ARGS=()
+    run set_sandbox_env 'TOKEN=$GITHUB_TOKEN-${LANG}' "$PROJECT_CONFIG_DIR/config.yaml"
+    assert_output --partial "Not expanding \$GITHUB_TOKEN in $PROJECT_CONFIG_DIR/config.yaml"
+    set_sandbox_env 'TOKEN=$GITHUB_TOKEN-${LANG}' "$PROJECT_CONFIG_DIR/config.yaml" 2>/dev/null
+    assert_equal "${SANDBOX_ENV[TOKEN]}" "-C.UTF-8"
+}
+
+@test "env: in a user-level file and --env may expand any host variable" {
+    export GITHUB_TOKEN=secret
+    BWRAP_ARGS=()
+    set_sandbox_env 'A=$GITHUB_TOKEN' "$DEFAULT_CONFIG_FILE"
+    set_sandbox_env 'B=$GITHUB_TOKEN' --env
+    assert_equal "${SANDBOX_ENV[A]}" secret
+    assert_equal "${SANDBOX_ENV[B]}" secret
+}

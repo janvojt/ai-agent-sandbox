@@ -20,6 +20,7 @@ setup_test_env() {
     TEST_WORK="$BATS_TEST_TMPDIR/work"
     STUB_DIR="$BATS_TEST_TMPDIR/stubs"
     BWRAP_ARGS_FILE="$BATS_TEST_TMPDIR/bwrap.args"
+    BWRAP_ENV_FILE="$BATS_TEST_TMPDIR/bwrap.env"
     mkdir -p "$TEST_HOME" "$TEST_WORK" "$STUB_DIR"
     # Physical paths without subshells (every command is slow under bats);
     # ends in TEST_WORK
@@ -55,12 +56,14 @@ stub_command() {
 }
 
 # Stub bwrap that advertises overlay support and records its arguments, one
-# per line, in BWRAP_ARGS_FILE instead of starting a sandbox. Exits with
-# STUB_BWRAP_STATUS (default 0).
+# per line, in BWRAP_ARGS_FILE, and its environment in BWRAP_ENV_FILE, instead
+# of starting a sandbox. Exits with STUB_BWRAP_STATUS (default 0), read when
+# the stub is created: the script hides such variables from bwrap.
 stub_bwrap() {
     stub_command bwrap "if [[ \"\${1:-}\" == --help ]]; then echo '--overlay-src'; exit 0; fi
 printf '%s\n' \"\$@\" > '$BWRAP_ARGS_FILE'
-exit \${STUB_BWRAP_STATUS:-0}"
+env > '$BWRAP_ENV_FILE'
+exit ${STUB_BWRAP_STATUS:-0}"
 }
 
 # Usage: run_sandbox [args...]

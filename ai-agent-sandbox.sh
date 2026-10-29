@@ -64,6 +64,34 @@ WHITELIST_PATHS_RO=()
 WHITELIST_PATHS_RW=()
 BLACKLIST_PATHS=()
 ENV_VARS=()
+# Where each ENV_VARS entry came from (a config file or --env), see expand_env_value
+ENV_VAR_SOURCES=()
+ENV_EXPAND_SOURCE=""
+# Host environment variables the sandbox inherits (see filter_host_environment);
+# every other variable is removed before bwrap starts. Not configurable on
+# purpose: tokens and passwords in the launching shell's environment must not
+# reach the agent. Values the agent needs on top go through env: / --env.
+HOST_ENV_ALLOWED=(
+    # Session basics (HOME, PATH, PWD and TERM are set by the script)
+    USER LOGNAME SHELL LANG LANGUAGE TZ
+    COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION NO_COLOR FORCE_COLOR CLICOLOR CLICOLOR_FORCE
+    EDITOR VISUAL PAGER GIT_EDITOR
+    GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+    # Network: the agent has to reach its provider through a corporate proxy
+    HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy
+    SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE CURL_CA_BUNDLE
+    # Toolchain locations
+    JAVA_HOME GRADLE_USER_HOME MAVEN_HOME M2_HOME ANDROID_HOME ANDROID_SDK_ROOT
+    GOPATH GOROOT GOBIN CARGO_HOME RUSTUP_HOME
+    NVM_DIR PNPM_HOME BUN_INSTALL DENO_INSTALL VOLTA_HOME SDKMAN_DIR PYENV_ROOT
+    # The agents and orchestrators; Claude Code settings without a prefix
+    CLAUDECODE AI_AGENT
+    MAX_THINKING_TOKENS MAX_MCP_OUTPUT_TOKENS MCP_TIMEOUT MCP_TOOL_TIMEOUT
+    BASH_DEFAULT_TIMEOUT_MS BASH_MAX_TIMEOUT_MS BASH_MAX_OUTPUT_LENGTH USE_BUILTIN_RIPGREP
+    DISABLE_TELEMETRY DISABLE_ERROR_REPORTING DISABLE_AUTOUPDATER DISABLE_BUG_COMMAND
+    DISABLE_COST_WARNINGS DISABLE_NON_ESSENTIAL_MODEL_CALLS CLOUD_ML_REGION
+)
+HOST_ENV_ALLOWED_PREFIXES=(LC_ ANTHROPIC_ CLAUDE_ OPENCODE_ T3CODE_ VERTEX_REGION_ DISABLE_PROMPT_CACHING)
 declare -A SANDBOX_ENV=()
 BLACKLISTED_DIRS=()
 BLACKLIST_SEARCH_ROOTS=()
@@ -594,6 +622,7 @@ apply_config_env_item() {
     fi
 
     ENV_VARS+=("$key=$raw")
+    ENV_VAR_SOURCES+=("$file")
 }
 
 # Flow sequence: key: [a, b, c]. Items may not contain commas.
@@ -1935,6 +1964,51 @@ setup_isolated_network() {
     return 0
 }
 
+# --- Host environment ------------------------------------------------------------
+#
+# The sandbox would inherit the environment of whatever launched it: a shell
+# with GITHUB_TOKEN, AWS_* or database URLs exported, a desktop session's bus
+# and display addresses. Only HOST_ENV_ALLOWED and HOST_ENV_ALLOWED_PREFIXES
+# survive; the variables are removed in the subshell that executes bwrap, so
+# values never end up on a command line (bwrap --setenv arguments are readable
+# in /proc/<pid>/cmdline).
+
+host_env_allowed() {
+    local name="$1" item
+    for item in "${HOST_ENV_ALLOWED[@]}"; do
+        [[ "$name" == "$item" ]] && return 0
+    done
+    for item in "${HOST_ENV_ALLOWED_PREFIXES[@]}"; do
+        [[ "$name" == "$item"* ]] && return 0
+    done
+    return 1
+}
+
+# Prints the names of the exported variables the sandbox does not get
+hidden_host_env_names() {
+    local name
+    while IFS= read -r name; do
+        host_env_allowed "$name" || printf '%s\n' "$name"
+    done < <(compgen -e)
+}
+
+# Unsets every exported variable that is not allowed, and every exported
+# function (BASH_FUNC_<name>%% in the environment: code a bash inside would
+# import). Run in the subshell that executes bwrap.
+filter_host_environment() {
+    local name line
+    local -a hidden=() functions=()
+    # Pure bash: PATH is one of the removed variables
+    mapfile -t functions < <(declare -Fx)
+    for line in "${functions[@]}"; do
+        unset -f "${line#declare -fx }" 2>/dev/null || true
+    done
+    mapfile -t hidden < <(hidden_host_env_names)
+    for name in "${hidden[@]}"; do
+        unset "$name" 2>/dev/null || true
+    done
+}
+
 # --- Syscall filter (seccomp) ---------------------------------------------------
 #
 # bwrap installs a classic BPF program read from --seccomp <fd> right before it
@@ -2344,7 +2418,12 @@ run_in_sandbox() {
         fi
         bwrap_extra+=(--seccomp "$SECCOMP_FD")
     fi
-    "$BWRAP_BIN" "${BWRAP_ARGS[@]}" "${bwrap_extra[@]}" -- "$@" <&0 &
+    # The subshell drops the hidden host variables and becomes bwrap (exec),
+    # so $! is bwrap's pid
+    {
+        filter_host_environment
+        exec "$BWRAP_BIN" "${BWRAP_ARGS[@]}" "${bwrap_extra[@]}" -- "$@"
+    } <&0 &
     SANDBOX_PID=$!
     if [[ -n "$SECCOMP_FD" ]]; then
         exec {SECCOMP_FD}<&-
@@ -2424,6 +2503,11 @@ expand_env_value() {
             var_name="${BASH_REMATCH[1]}"
             if [[ -v "SANDBOX_ENV[$var_name]" ]]; then
                 output+="${SANDBOX_ENV[$var_name]}"
+            elif [[ -n "$ENV_EXPAND_SOURCE" ]] && is_project_config_file "$ENV_EXPAND_SOURCE" \
+                && ! host_env_allowed "$var_name"; then
+                # A repository must not pull hidden host variables (tokens)
+                # into the sandbox; user-level files and --env may
+                log_info "${YELLOW}⚠${NC} Not expanding \$$var_name in $ENV_EXPAND_SOURCE: hidden host variables are only available to user-level config files and --env"
             else
                 output+="$(printenv "$var_name" || true)"
             fi
@@ -2500,6 +2584,7 @@ set_sandbox_env() {
     local source_label="$2"
     local key=""
     local value=""
+    local ENV_EXPAND_SOURCE="$source_label"
 
     if ! parse_env_assignment "$assignment" key value; then
         log_info "${YELLOW}⚠${NC} Skipping invalid environment entry from $source_label"
@@ -3610,6 +3695,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --env|-e)
             ENV_VARS+=("$2")
+            ENV_VAR_SOURCES+=("--env")
             shift 2
             ;;
         --blacklist-path)
@@ -4347,8 +4433,8 @@ fi
 
 if [[ ${#ENV_VARS[@]} -gt 0 ]]; then
     log_info "\n${GREEN}Processing direct environment variables:${NC}"
-    for env_var in "${ENV_VARS[@]}"; do
-        set_sandbox_env "$env_var" "--env"
+    for i in "${!ENV_VARS[@]}"; do
+        set_sandbox_env "${ENV_VARS[$i]}" "${ENV_VAR_SOURCES[$i]:---env}"
     done
 fi
 
@@ -4460,6 +4546,10 @@ if [[ ${#LEGACY_FILES_IN_USE[@]} -gt 0 ]]; then
     done
 fi
 log_info "Direct Environment Variables: ${YELLOW}${#ENV_VARS[@]}${NC}"
+mapfile -t HIDDEN_HOST_ENV < <(hidden_host_env_names)
+if [[ ${#HIDDEN_HOST_ENV[@]} -gt 0 ]]; then
+    log_info "Hidden Host Environment Variables (${#HIDDEN_HOST_ENV[@]}): ${YELLOW}${HIDDEN_HOST_ENV[*]}${NC}"
+fi
 log_info "${GREEN}=============================================${NC}\n"
 
 # Start socket proxy if Docker is enabled

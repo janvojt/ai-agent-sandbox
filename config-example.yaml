@@ -180,7 +180,12 @@ blacklist:
   - "**/wallet.dat"
 
 # Environment variables inside the sandbox. Double quotes and unquoted values
-# expand $VAR and ~, single quotes are literal.
+# expand $VAR and ~, single quotes are literal. The host environment itself is
+# not inherited (only a fixed allow-list: locale, proxies, toolchain paths,
+# ANTHROPIC_*/CLAUDE_*/OPENCODE_*), so a credential the agent needs is passed
+# here. In user-level files $VAR may reference any host variable
+# (OPENROUTER_API_KEY: $OPENROUTER_API_KEY); in project files only allowed
+# ones, so a repository cannot pull host secrets into the sandbox.
 env:
   NODE_OPTIONS: "--max-old-space-size=4096"
   TOOL_HOME: "~/tools"

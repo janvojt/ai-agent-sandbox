@@ -270,6 +270,17 @@ done'
     refute_output --partial Traceback
 }
 
+@test "hidden host variables do not reach the sandbox, allowed and configured ones do" {
+    export GITHUB_TOKEN=leaked-token ANTHROPIC_API_KEY=provider-key LC_ALL=C
+    run_real_sandbox 'echo "hidden=$(env | grep -c ^GITHUB_TOKEN=)"
+echo "key=$ANTHROPIC_API_KEY lc=$LC_ALL gh=${GH:-unset}"
+echo "cmdline=$(tr "\0" " " < /proc/1/cmdline | grep -c provider-key)"' --env 'GH=$GITHUB_TOKEN'
+    assert_success
+    assert_line hidden=0
+    assert_line "key=provider-key lc=C gh=leaked-token"
+    assert_line cmdline=0
+}
+
 # Prints "<name> <errno name or ok>" for a few filtered calls. Skips without
 # python3 (the probe needs raw syscalls) or on a host without a filter.
 seccomp_probe='python3 -I -c "

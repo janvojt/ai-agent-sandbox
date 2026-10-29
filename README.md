@@ -413,6 +413,19 @@ All files are merged together, allowing you to:
 
 ### Environment Variables
 
+**The host environment is not inherited.** Whatever launched the sandbox (your shell, a desktop session, an orchestrator) may have tokens, passwords or database URLs exported, so only a fixed allow-list reaches the agent: the session basics (`USER`, `SHELL`, `LANG`, `LC_*`, `TZ`, terminal and editor settings, `GIT_AUTHOR_*`/`GIT_COMMITTER_*`), proxy and CA certificate settings (the agent must reach its provider), toolchain locations (`JAVA_HOME`, `GOPATH`, `CARGO_HOME`, `NVM_DIR`, …) and the agents' own variables (`ANTHROPIC_*`, `CLAUDE_*`, `CLAUDECODE`, `OPENCODE_*`, `T3CODE_*` and Claude Code's settings such as `MAX_THINKING_TOKENS`). Everything else is removed, including the display and session bus addresses, `SSH_AUTH_SOCK`, `LD_PRELOAD`/`LD_LIBRARY_PATH`, `TMPDIR` and exported shell functions. `PATH`, `HOME`, `PWD` and `TERM` are set by the script. The list is deliberately not configurable; the startup summary names the hidden variables (names only, never values). See `HOST_ENV_ALLOWED` in the script for the full list.
+
+The agent can read every variable it receives, so pass secrets deliberately and only those it needs. Credentials outside the allow-list, such as AWS credentials for Claude Code on Bedrock, `GOOGLE_APPLICATION_CREDENTIALS` for Vertex or provider keys for OpenCode (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, …), go into `env:` of your **user-level** config, with a reference to the host value:
+
+```yaml
+# ~/.config/ai-agent-sandbox/config.yaml
+env:
+  AWS_PROFILE: $AWS_PROFILE
+  OPENROUTER_API_KEY: $OPENROUTER_API_KEY
+```
+
+Only user-level files and `--env` can reference hidden host variables. In project files (`.ai-agent-sandbox/`), `$VAR` resolves only to allowed host variables and earlier `env:` entries; other references stay empty with a warning, so a repository cannot pull `$GITHUB_TOKEN` into the sandbox.
+
 The `env:` mapping sets variables inside the sandbox:
 
 ```yaml
@@ -435,7 +448,7 @@ env:
 
 **Variable expansion:**
 - `$VAR` and `${VAR}` references are expanded in unquoted and double-quoted values.
-- References resolve against the sandbox environment first (values set by earlier env entries or by the script itself, such as `PATH` and `HOME`), then fall back to the host environment; undefined variables expand to empty.
+- References resolve against the sandbox environment first (values set by earlier env entries or by the script itself, such as `PATH` and `HOME`), then fall back to the host environment (in project files only to allowed host variables, see above); undefined variables expand to empty.
 - A leading `~` (and `~` after `:` in PATH-style lists) expands to `$HOME`.
 - Single-quoted values are taken literally with no expansion.
 - Use `\$` for a literal dollar sign in expanded values.
@@ -533,7 +546,7 @@ blacklist:
 
 1. ✅ **Filesystem access outside working directory** - Only whitelisted system paths are readable
 2. ✅ **Sensitive files in working directory** - Blacklisted patterns are hidden
-3. ✅ **SSH agent access** - SSH_AUTH_SOCK is removed from environment
+3. ✅ **Secrets in the environment** - Only an allow-list of host environment variables reaches the agent (session basics, proxies, toolchain paths, the agents' own variables), so tokens exported in your shell stay outside; the SSH agent socket, display and session bus addresses are removed as well
 4. ✅ **Home directory access** - Only minimal agent-specific config is exposed; starting the sandbox in the home directory itself (or a parent such as `/`) is refused unless `--allow-home-workdir` is given
 5. ✅ **Credential separation** - With profiles, a project only sees the login, settings and memory of its own profile; the profile store itself is never visible inside the sandbox
 6. ✅ **Code execution through git** - Hooks and configuration of every git repository in a writable mount are read-only, so the agent cannot plant commands that git would run on the host
