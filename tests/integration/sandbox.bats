@@ -127,6 +127,47 @@ touch $ws/other/file && echo other-rw"
     assert_line inside
 }
 
+@test "git hooks and configuration are read-only while commits still work" {
+    command -v git >/dev/null || skip "git is not installed"
+    git init -q .
+    git -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    run_real_sandbox 'touch .git/hooks/post-checkout || echo hooks-ro
+git config core.fsmonitor "touch pwned" || echo config-ro
+mv .git .git-moved || echo gitdir-fixed
+rm -rf .git/hooks || echo hooks-fixed
+git -c user.name=t -c user.email=t@t commit -q --allow-empty -m inside && echo committed'
+    assert_line hooks-ro
+    assert_line config-ro
+    assert_line gitdir-fixed
+    assert_line hooks-fixed
+    assert_line committed
+    assert_file_not_exists .git/hooks/post-checkout
+    assert_dir_exists .git
+    run git config core.fsmonitor
+    assert_output ""
+    run git log --format=%s
+    assert_line inside
+}
+
+@test "a git worktree's link and the main repository's configuration are read-only" {
+    command -v git >/dev/null || skip "git is not installed"
+    local repo="$BATS_TEST_TMPDIR/repo"
+    git init -q "$repo"
+    git -C "$repo" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    git -C "$repo" worktree add -q "$BATS_TEST_TMPDIR/wt" -b feature
+    cd "$BATS_TEST_TMPDIR/wt"
+    run_real_sandbox "echo 'gitdir: /tmp/evil' > .git || echo link-ro
+echo /tmp/evil > $repo/.git/worktrees/wt/commondir || echo commondir-ro
+touch $repo/.git/hooks/pre-commit || echo hooks-ro
+git config core.fsmonitor 'touch pwned' || echo config-ro"
+    assert_line link-ro
+    assert_line commondir-ro
+    assert_line hooks-ro
+    assert_line config-ro
+    run git -C "$BATS_TEST_TMPDIR/wt" status --short
+    assert_success
+}
+
 @test "a forged .git link does not expose the target directory" {
     mkdir -p "$BATS_TEST_TMPDIR/private"
     printf 'secret\n' > "$BATS_TEST_TMPDIR/private/data"

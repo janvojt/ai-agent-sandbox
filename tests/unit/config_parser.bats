@@ -214,6 +214,7 @@ assert_no_config_warnings() {
     apply_config_scalar shared_skills no f.yaml false
     apply_config_scalar quiet true f.yaml false
     apply_config_scalar protect_project_config false "$DEFAULT_CONFIG_FILE" false
+    apply_config_scalar protect_git_config false "$DEFAULT_CONFIG_FILE" false
     assert_equal "$ENABLE_DOCKER" true
     assert_equal "$ENABLE_VENV" true
     assert_equal "$ENABLE_GPG_AGENT" true
@@ -221,6 +222,7 @@ assert_no_config_warnings() {
     assert_equal "$SHARE_SKILLS" false
     assert_equal "$QUIET" true
     assert_equal "$PROTECT_PROJECT_CONFIG" false
+    assert_equal "$PROTECT_GIT_CONFIG" false
 }
 
 @test "apply_config_scalar leaves a boolean unchanged when the value is null" {
@@ -281,6 +283,12 @@ assert_no_config_warnings() {
     apply_config_scalar protect_project_config false "$PROJECT_CONFIG_FILE" false
     assert_equal "$PROTECT_PROJECT_CONFIG" true
     assert_config_warning "Ignoring 'protect_project_config' in $PROJECT_CONFIG_FILE"
+}
+
+@test "apply_config_scalar ignores protect_git_config from a project file" {
+    apply_config_scalar protect_git_config false "$PROJECT_CONFIG_FILE" false
+    assert_equal "$PROTECT_GIT_CONFIG" true
+    assert_config_warning "Ignoring 'protect_git_config' in $PROJECT_CONFIG_FILE"
 }
 
 @test "apply_config_scalar accepts a single scalar for a list key" {

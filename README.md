@@ -236,7 +236,7 @@ With `--agent opencode` the arguments go to the `opencode` binary in the same wa
   --whitelist-path-rw ~/.gradle/caches
 ```
 
-Docker access is provided through a per-run socket proxy created at `.docker-proxy/docker.sock` in the working directory. The proxy only allows bind mounts from paths already accessible inside the sandbox (working directory and any read-write mounts). Paths containing sandbox configuration (see *Project config protection*) are refused, because a container would see the host directory without the sandbox's read-only mounts: with protection on, the working directory itself cannot be mounted (`-v "$PWD:/app"`), mount its subdirectories instead (`-v "$PWD/src:/app/src"`). Entries created in such a directory after the sandbox started cannot be mounted either.
+Docker access is provided through a per-run socket proxy created at `.docker-proxy/docker.sock` in the working directory. The proxy only allows bind mounts from paths already accessible inside the sandbox (working directory and any read-write mounts). Paths containing sandbox or git configuration (see *Project config protection* and *Git config protection*) are refused, because a container would see the host directory without the sandbox's read-only mounts: with protection on, the working directory itself cannot be mounted (`-v "$PWD:/app"`), mount its subdirectories instead (`-v "$PWD/src:/app/src"`). Entries created in such a directory after the sandbox started cannot be mounted either.
 
 When Docker is enabled, the sandbox also mounts Docker CLI plugin directories from common host locations so `docker compose` works when the host Docker client has the Compose plugin installed. If `docker compose version` fails on the host, install Docker Compose on the host first.
 
@@ -380,6 +380,7 @@ See [`config-example.yaml`](config-example.yaml) for a commented example of ever
 | `env` | mapping | `--env KEY=VALUE`; values follow the [environment file rules](#environment-variables) |
 | `agent_args` | list | arguments always passed to the agent, before anything given after `--` |
 | `protect_project_config` | bool | `--no-protect-project-config`; only honoured in the user-level file |
+| `protect_git_config` | bool | `--protect-git-config` / `--no-protect-git-config`; only honoured in the user-level file |
 
 **Precedence:** `~/.config/ai-agent-sandbox/config.yaml` < `~/.config/ai-agent-sandbox/config.local.yaml` < `.ai-agent-sandbox/config.yaml` < `.ai-agent-sandbox/config.local.yaml` < `AI_AGENT_SANDBOX_PROFILE` < command-line flags. Scalars from a later source override earlier ones; lists are merged. Relative paths are resolved against the working directory. Exception: a `profile` from a project file is not overridden by a different `AI_AGENT_SANDBOX_PROFILE`, that is an error (see [Profiles](#profiles)).
 
@@ -391,6 +392,16 @@ See [`config-example.yaml`](config-example.yaml) for a commented example of ever
 - Nested mappings (other than `env`), anchors, multi-line strings and unknown keys are reported as warnings and ignored.
 
 **Project config protection.** Because `.ai-agent-sandbox/` lives inside the read-write working directory, an agent could otherwise edit its own sandbox rules (switch to the host profile, whitelist `~/.ssh`, change `ANTHROPIC_BASE_URL`) to take effect on the next run. The same applies to other projects reachable through a read-write whitelist entry and to the user-level configuration. By default every `.ai-agent-sandbox/` inside a read-write mount (at any depth) and the user-level configuration directory (`~/.config/ai-agent-sandbox`, or the files and their symlink targets when `AI_AGENT_SANDBOX_CONFIG*` point elsewhere) are therefore mounted read-only, also when a whitelisted parent directory would otherwise make them writable. So the agent cannot create one either, an empty `.ai-agent-sandbox/` is created on the host in the working directory and in read-write whitelisted git repository roots that have none (git does not track empty directories). Deeper directories without one stay a gap: review a new `.ai-agent-sandbox/` that you did not create before running a sandbox there. Disable all of this with `--no-protect-project-config` or `protect_project_config: false` in the user-level config; the setting is deliberately ignored in project files. The resolved profile and its source are printed in the startup summary.
+
+**Git config protection.** Git runs code from a repository's hooks and from settings such as `core.fsmonitor`, `core.hooksPath`, `core.sshCommand`, filter drivers and aliases, and it does so whenever *you* use git there on the host: a commit, an IDE refreshing its status, a shell prompt showing the branch, T3 Code checkpointing after every turn. An agent that may write `.git/config` or `.git/hooks/` can therefore run commands outside the sandbox. By default every git repository inside a read-write mount (the working directory, nested repositories, submodules, a linked worktree's main repository, whitelisted repositories) gets:
+
+- `config`, `config.worktree` and `hooks/` mounted read-only (a missing `hooks/` is created on the host first);
+- the git directory mounted onto itself, so it cannot be renamed or replaced by a forged one;
+- for linked worktrees, the `.git` file and the main repository's `worktrees/<name>/commondir` and `gitdir` read-only, so the worktree cannot be pointed at another repository.
+
+Commits, branches, rebases, stashes, fetches and merges keep working. Commands that write the repository configuration fail inside the sandbox: `git config` without `--global`, `git remote add`, `git branch --set-upstream-to`, `git push -u`, `git submodule init`, `git lfs install` and hook managers that set `core.hooksPath` (husky, lefthook; their install step typically reports an error). Run them on the host, or pass the identity per command (`git -c user.email=… commit`). Changes made on the host to `.git/config` while a sandbox runs are only visible inside after a restart (the read-only mount keeps the file it started with). Disable with `--no-protect-git-config` or `protect_git_config: false` in the user-level config; project files cannot switch it off.
+
+Not covered: code that lives in the working tree itself and runs when you use the project (hooks managed in the tree such as `.husky/`, `Makefile`, `package.json` scripts, `.envrc`, `.vscode/tasks.json`, a virtualenv's `activate`). Those are project files the agent is meant to edit, so review the diff before running them, as you would review any change it makes. Neither are git repositories the agent creates during the session: a new `.git` below the working directory (a nested clone, `git init`) is writable, so do not run git in such a directory on the host without looking at its `.git/config` first.
 
 All files are merged together, allowing you to:
 - Maintain a base configuration in the user-level file
@@ -523,10 +534,11 @@ blacklist:
 3. ✅ **SSH agent access** - SSH_AUTH_SOCK is removed from environment
 4. ✅ **Home directory access** - Only minimal agent-specific config is exposed; starting the sandbox in the home directory itself (or a parent such as `/`) is refused unless `--allow-home-workdir` is given
 5. ✅ **Credential separation** - With profiles, a project only sees the login, settings and memory of its own profile; the profile store itself is never visible inside the sandbox
-6. ✅ **Self-modifying sandbox rules** - `.ai-agent-sandbox/` is mounted read-only so the agent cannot change the profile, whitelist or environment it runs with next time
-7. ✅ **OpenCode 2 background server** - OpenCode 2 is started with `--standalone`, so the server that executes its tools runs inside the sandbox instead of the shared per-user service on the host
-8. ✅ **Exploit-prone kernel interfaces** - A seccomp filter refuses keyrings, BPF, io_uring, userfaultfd, perf, module loading, terminal input injection, new user namespaces and mounts
-9. ✅ **Host services and LAN** - In the default `isolated` network mode the host's loopback and private networks are unreachable, so a prompt-injected agent cannot probe local databases, dashboards, routers or other machines; only the ports and hosts you list are exposed
+6. ✅ **Code execution through git** - Hooks and configuration of every git repository in a writable mount are read-only, so the agent cannot plant commands that git would run on the host
+7. ✅ **Self-modifying sandbox rules** - `.ai-agent-sandbox/` is mounted read-only so the agent cannot change the profile, whitelist or environment it runs with next time
+8. ✅ **OpenCode 2 background server** - OpenCode 2 is started with `--standalone`, so the server that executes its tools runs inside the sandbox instead of the shared per-user service on the host
+9. ✅ **Exploit-prone kernel interfaces** - A seccomp filter refuses keyrings, BPF, io_uring, userfaultfd, perf, module loading, terminal input injection, new user namespaces and mounts
+10. ✅ **Host services and LAN** - In the default `isolated` network mode the host's loopback and private networks are unreachable, so a prompt-injected agent cannot probe local databases, dashboards, routers or other machines; only the ports and hosts you list are exposed
 
 ### Limitations and Considerations
 

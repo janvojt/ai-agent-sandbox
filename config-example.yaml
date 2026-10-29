@@ -196,3 +196,11 @@ agent_args:
 # read-write whitelisted projects) and the user-level configuration read-only so
 # the agent cannot rewrite these rules.
 # protect_project_config: true
+
+# Only honoured in the user-level file (or via --no-protect-git-config /
+# --protect-git-config): mount the hooks and configuration (config,
+# config.worktree, hooks/, worktree links) of every git repository in a writable
+# mount read-only, because git runs them on the host. Inside the sandbox,
+# commands that write .git/config (git config, git remote add, git push -u)
+# fail while this is on.
+# protect_git_config: true

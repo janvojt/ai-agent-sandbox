@@ -49,6 +49,11 @@ ACP_COMMAND=false
 NO_PROJECT_WORKDIR=false
 MIGRATE_PROJECT_CONFIG=false
 PROTECT_PROJECT_CONFIG=true
+# Hooks and configuration of git repositories in read-write mounts are mounted
+# read-only (see protect_git_dir): git runs them on the host later
+PROTECT_GIT_CONFIG=true
+# Git directories protected by protect_git_dir (destinations, for the summary)
+PROTECTED_GIT_DIRS=()
 # Host paths mounted read-only by protect_sandbox_config (refused by the Docker proxy)
 PROTECTED_CONFIG_SOURCES=()
 # Deprecated whitelist.txt / blacklist.txt / .env files still in use
@@ -176,6 +181,9 @@ OPTIONS:
     --no-protect-project-config
                             Leave .ai-agent-sandbox/ directories and the user-level
                             configuration writable (read-only by default)
+    --no-protect-git-config Leave the hooks and configuration of git repositories in
+                            writable mounts writable (read-only by default: git runs
+                            them on the host); --protect-git-config switches it back on
     --docker-image IMAGE    Socket proxy image (default: ghcr.io/wollomatic/socket-proxy:1)
     --network MODE          Network access: isolated (default: internet only, host
                             loopback and private networks blocked), host (share the
@@ -220,7 +228,7 @@ DEPRECATED LEGACY FILES:
 CONFIGURATION FILE FORMAT:
     Config:    YAML (flat subset). Keys: profile, agent, network, seccomp, docker, docker_image, venv,
                 gitconfig, shared_skills, gpg_agent, quiet,
-                protect_project_config (user-level only),
+                protect_project_config, protect_git_config (user-level only),
                 whitelist, blacklist, host_ports, allow_hosts, agent_args (lists),
                 env (KEY: VALUE mapping)
     whitelist: Absolute or relative paths/patterns that the agent can read
@@ -511,7 +519,7 @@ apply_config_scalar() {
                 SECCOMP_SOURCE="$file"
             fi
             ;;
-        docker|venv|gpg_agent|gitconfig|shared_skills|quiet|protect_project_config)
+        docker|venv|gpg_agent|gitconfig|shared_skills|quiet|protect_project_config|protect_git_config)
             [[ "$is_null" = true ]] && return 0
             bool=$(parse_yaml_bool "$value" "$key" "$file") || exit 1
             case "$key" in
@@ -521,13 +529,15 @@ apply_config_scalar() {
                 gitconfig) MOUNT_GITCONFIG="$bool" ;;
                 shared_skills) SHARE_SKILLS="$bool" ;;
                 quiet) QUIET="$bool" ;;
-                protect_project_config)
+                protect_project_config|protect_git_config)
                     # The project itself must not be able to switch off the
-                    # protection of its own sandbox configuration
+                    # protection of its own configuration
                     if is_project_config_file "$file"; then
                         config_warn "Ignoring '$key' in $file (only allowed in user-level config files or on the command line)"
-                    else
+                    elif [[ "$key" = protect_project_config ]]; then
                         PROTECT_PROJECT_CONFIG="$bool"
+                    else
+                        PROTECT_GIT_CONFIG="$bool"
                     fi
                     ;;
             esac
@@ -1523,7 +1533,7 @@ split_mount_root() {
     local excluded
     for excluded in "$@"; do
         if [[ "$root" == "$excluded" || "$root" == "$excluded/"* ]]; then
-            log_info "${YELLOW}⚠${NC} Docker bind mounts refused: $root (sandbox configuration)"
+            log_info "${YELLOW}⚠${NC} Docker bind mounts refused: $root (protected configuration)"
             return 0
         fi
         [[ "$excluded" == "$root/"* ]] && inside+=("$excluded")
@@ -1532,7 +1542,7 @@ split_mount_root() {
         echo "$root"
         return 0
     fi
-    log_info "${YELLOW}⚠${NC} Docker bind mounts of $root refused (contains sandbox configuration), its other entries are allowed"
+    log_info "${YELLOW}⚠${NC} Docker bind mounts of $root refused (contains protected configuration), its other entries are allowed"
     [[ -d "$root" && ! -L "$root" ]] || return 0
     local restore child
     restore="$(shopt -p nullglob dotglob || true)"
@@ -2763,13 +2773,98 @@ process_whitelist_entry() {
 # mounts nest on top), and once more for the read-write `!` overrides, which are
 # applied after the blacklist. The protected host paths are recorded in
 # PROTECTED_CONFIG_SOURCES so the Docker proxy can refuse mounts containing them.
+#
+# The same applies to git: hooks and settings such as core.fsmonitor,
+# core.hooksPath or an alias run code whenever git is used on the host in that
+# repository (by the user, an IDE, a shell prompt, T3 Code after every turn).
+# protect_git_dir mounts the configuration and hooks of every git directory in
+# a read-write bind read-only, and the git directory itself onto itself, so it
+# becomes a mount point that cannot be renamed or replaced by a forged one.
 
-# Print the .ai-agent-sandbox entries below <root> (the root itself included),
-# without descending into them or into .git directories
+# Print the .ai-agent-sandbox and .git entries below <root> (the root itself
+# included), without descending into them
 find_project_config_dirs() {
     local root="$1"
     [[ -d "$root" ]] || return 0
-    find -H "$root" \( -name .git -prune \) -o \( -name .ai-agent-sandbox -prune -print \) 2>/dev/null
+    find -H "$root" \( -name .git -prune -print \) -o \( -name .ai-agent-sandbox -prune -print \) 2>/dev/null
+}
+
+# A directory git would use as a repository: HEAD plus an object store or, for
+# a linked worktree's per-worktree directory, a commondir file
+is_git_dir() {
+    local dir="$1"
+    [[ -d "$dir" && ! -L "$dir" ]] || return 1
+    [[ -f "$dir/HEAD" || -L "$dir/HEAD" ]] || return 1
+    [[ -d "$dir/objects" || -f "$dir/commondir" ]]
+}
+
+# Usage: protect_git_entry <source> <destination> <target-array-name> <seen-assoc-name>
+# A .git found in a read-write bind: a directory is protected as a git
+# directory, a file (worktree or submodule link) is mounted read-only so the
+# agent cannot point it at a repository of its own
+protect_git_entry() {
+    local src="$1" dest="$2" resolved
+    if [[ -L "$src" ]]; then
+        resolved="$(readlink -f "$src" 2>/dev/null || true)"
+        if [[ -n "$resolved" ]] && is_git_dir "$resolved" && is_path_bound "$resolved"; then
+            protect_git_dir "$resolved" "$resolved" "$3" "$4"
+        fi
+    elif [[ -f "$src" ]]; then
+        protect_config_path "$src" "$dest" "$3" "$4" -
+    else
+        protect_git_dir "$src" "$dest" "$3" "$4"
+    fi
+}
+
+# Usage: protect_git_dir <source> <destination> <target-array-name> <seen-assoc-name>
+protect_git_dir() {
+    local src="$1" dest="$2" target_name="$3" seen_name="$4"
+    local -n pg_target="$target_name"
+    local -n pg_seen="$seen_name"
+    local worktree_config=false wt module
+    is_git_dir "$src" || return 0
+    [[ -n "${pg_seen["git:$dest"]:-}" ]] && return 0
+    pg_seen["git:$dest"]=1
+    # Its own mount point: rename() and rmdir() refuse mount points
+    pg_target+=(--bind "$src" "$dest")
+    PROTECTED_GIT_DIRS+=("$dest")
+    # A missing hooks directory could be created inside; git creates it anyway
+    [[ -e "$src/hooks" || -L "$src/hooks" ]] || mkdir "$src/hooks" 2>/dev/null || true
+    if [[ -f "$src/config" ]] && grep -qiE '^[[:space:]]*worktreeconfig[[:space:]]*=[[:space:]]*(true|yes|on|1)[[:space:]]*$' "$src/config" 2>/dev/null; then
+        worktree_config=true
+    fi
+    protect_git_file "$src/config" "$dest/config" false
+    protect_git_file "$src/hooks" "$dest/hooks" false
+    protect_git_file "$src/config.worktree" "$dest/config.worktree" "$worktree_config"
+    # Per-worktree directories of linked worktrees: commondir and gitdir decide
+    # which repository (and therefore which hooks and config) git uses there
+    for wt in "$src"/worktrees/*; do
+        [[ -d "$wt" && ! -L "$wt" ]] || continue
+        pg_target+=(--bind "$wt" "$dest${wt#"$src"}")
+        protect_git_file "$wt/commondir" "$dest${wt#"$src"}/commondir" false
+        protect_git_file "$wt/gitdir" "$dest${wt#"$src"}/gitdir" false
+        protect_git_file "$wt/config.worktree" "$dest${wt#"$src"}/config.worktree" "$worktree_config"
+    done
+    # Submodule repositories (nested ones included)
+    if [[ -d "$src/modules" ]]; then
+        while IFS= read -r module; do
+            module="${module%/HEAD}"
+            [[ "$module" != "$src" ]] && is_git_dir "$module" \
+                && protect_git_dir "$module" "$dest${module#"$src"}" "$target_name" "$seen_name"
+        done < <(find "$src/modules" \( -name objects -o -name refs -o -name logs \) -prune -o -name HEAD -print 2>/dev/null)
+    fi
+    log_info "${GREEN}✓${NC} Protected git directory $(display_path "$dest") (hooks and configuration read-only)"
+}
+
+# Usage: protect_git_file <source> <destination> <create-if-missing>
+# (called from protect_git_dir, uses its pg_target and seen array names)
+protect_git_file() {
+    local src="$1" dest="$2" create="$3"
+    if [[ ! -e "$src" && ! -L "$src" ]]; then
+        [[ "$create" = true ]] || return 0
+        : > "$src" 2>/dev/null || return 0
+    fi
+    protect_config_path "$src" "$dest" "$target_name" "$seen_name" -
 }
 
 # Print the user-level configuration paths to protect: the directories of the
@@ -2836,11 +2931,13 @@ create_missing_project_config_dirs() {
 # Mount every sandbox configuration path inside a read-write --bind of the scan
 # array read-only (appended to the target array, default BWRAP_ARGS)
 protect_sandbox_config() {
-    [[ "$PROTECT_PROJECT_CONFIG" = true ]] || return 0
+    [[ "$PROTECT_PROJECT_CONFIG" = true || "$PROTECT_GIT_CONFIG" = true ]] || return 0
     local -n protect_scan="$1"
     local target_name="${2:-BWRAP_ARGS}"
     local -a user_paths=()
-    mapfile -t user_paths < <(user_config_protect_paths)
+    if [[ "$PROTECT_PROJECT_CONFIG" = true ]]; then
+        mapfile -t user_paths < <(user_config_protect_paths)
+    fi
     local -A seen=()
     local -a binds=()
     local i=0 src dest path
@@ -2856,8 +2953,24 @@ protect_sandbox_config() {
     for ((i = 0; i < ${#binds[@]}; i += 2)); do
         src="${binds[i]}"
         dest="${binds[i+1]}"
+        # A bound git directory itself (a linked worktree's common dir, a
+        # whitelisted bare repository); one named .git is found below
+        if [[ "$PROTECT_GIT_CONFIG" = true && "${src##*/}" != .git ]] && is_git_dir "$src"; then
+            protect_git_dir "$src" "$dest" "$target_name" seen
+        fi
         while IFS= read -r path; do
-            [[ -n "$path" ]] && protect_config_path "$path" "$dest${path#"$src"}" "$target_name" seen
+            case "${path##*/}" in
+                .ai-agent-sandbox)
+                    if [[ "$PROTECT_PROJECT_CONFIG" = true ]]; then
+                        protect_config_path "$path" "$dest${path#"$src"}" "$target_name" seen
+                    fi
+                    ;;
+                .git)
+                    if [[ "$PROTECT_GIT_CONFIG" = true ]]; then
+                        protect_git_entry "$path" "$dest${path#"$src"}" "$target_name" seen
+                    fi
+                    ;;
+            esac
         done < <(find_project_config_dirs "$src")
         for path in "${user_paths[@]}"; do
             if [[ "$path" == "$dest" || "$path" == "$dest/"* ]]; then
@@ -2867,9 +2980,10 @@ protect_sandbox_config() {
     done
 }
 
-# Usage: protect_config_path <source> <destination> <target-array-name> <seen-assoc-name>
+# Usage: protect_config_path <source> <destination> <target-array-name> <seen-assoc-name> [-]
+# A fifth argument "-" suppresses the log line (git files are logged per directory)
 protect_config_path() {
-    local src="$1" dest="$2"
+    local src="$1" dest="$2" quiet="${5:-}"
     local -n protect_target="$3"
     local -n protect_seen="$4"
     local resolved
@@ -2880,14 +2994,14 @@ protect_config_path() {
         # sandbox can see it (the agent can still replace the link itself)
         resolved="$(readlink -f "$src" 2>/dev/null || true)"
         if [[ -n "$resolved" && -e "$resolved" ]] && is_path_bound "$resolved"; then
-            protect_config_path "$resolved" "$resolved" "$3" "$4"
+            protect_config_path "$resolved" "$resolved" "$3" "$4" "$quiet"
         fi
         return 0
     fi
     [[ -e "$src" ]] || return 0
     protect_target+=(--ro-bind "$src" "$dest")
     PROTECTED_CONFIG_SOURCES+=("$src")
-    log_info "${GREEN}✓${NC} Mounted $(display_path "$dest") read-only (sandbox configuration protected)"
+    [[ "$quiet" = - ]] || log_info "${GREEN}✓${NC} Mounted $(display_path "$dest") read-only (sandbox configuration protected)"
 }
 
 # Mount the main repository's git directory into a verified git worktree, see
@@ -3381,6 +3495,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-protect-project-config)
             PROTECT_PROJECT_CONFIG=false
+            shift
+            ;;
+        --protect-git-config)
+            PROTECT_GIT_CONFIG=true
+            shift
+            ;;
+        --no-protect-git-config)
+            PROTECT_GIT_CONFIG=false
             shift
             ;;
         --env|-e)
@@ -4186,6 +4308,11 @@ if [[ "$PROTECT_PROJECT_CONFIG" = true ]]; then
     log_info "Project Config Protection: ${YELLOW}enabled${NC} (.ai-agent-sandbox/ in writable mounts and the user configuration are read-only)"
 else
     log_info "Project Config Protection: ${YELLOW}disabled${NC}"
+fi
+if [[ "$PROTECT_GIT_CONFIG" = false ]]; then
+    log_info "Git Config Protection: ${YELLOW}disabled${NC}"
+elif [[ ${#PROTECTED_GIT_DIRS[@]} -gt 0 ]]; then
+    log_info "Git Config Protection: ${YELLOW}enabled${NC} (hooks and configuration read-only in ${#PROTECTED_GIT_DIRS[@]} git director$([[ ${#PROTECTED_GIT_DIRS[@]} -eq 1 ]] && echo y || echo ies))"
 fi
 if [[ "$ENABLE_VENV" = true ]]; then
     log_info "Virtual Environment: ${YELLOW}$VENV_PATH${NC}"

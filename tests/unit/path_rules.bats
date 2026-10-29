@@ -506,6 +506,141 @@ assert_matches() {
         "--bind $TEST_WORK $TEST_WORK --ro-bind $PROJECT_CONFIG_DIR $PROJECT_CONFIG_DIR --ro-bind /dev/null $PROJECT_CONFIG_DIR/secret.env"
 }
 
+# --- git configuration protection ---------------------------------------------------
+
+# Usage: make_git_dir <dir>; the files git needs to treat <dir> as a repository
+make_git_dir() {
+    mkdir -p "$1/objects" "$1/refs"
+    printf 'ref: refs/heads/main\n' > "$1/HEAD"
+    printf '[core]\n\tbare = false\n' > "$1/config"
+}
+
+@test "protect_git_dir: the working directory's .git becomes a mount point with read-only config and hooks" {
+    make_git_dir "$TEST_WORK/.git"
+    mkdir "$TEST_WORK/.git/hooks"
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
+    assert_args_contain BWRAP_ARGS --bind "$TEST_WORK/.git" "$TEST_WORK/.git" \
+        --ro-bind "$TEST_WORK/.git/config" "$TEST_WORK/.git/config" \
+        --ro-bind "$TEST_WORK/.git/hooks" "$TEST_WORK/.git/hooks"
+    assert_equal "${PROTECTED_GIT_DIRS[*]}" "$TEST_WORK/.git"
+    assert_equal "${PROTECTED_CONFIG_SOURCES[*]}" "$TEST_WORK/.git/config $TEST_WORK/.git/hooks"
+}
+
+@test "protect_git_dir: a missing hooks directory is created on the host and protected" {
+    make_git_dir "$TEST_WORK/.git"
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
+    assert_dir_exists "$TEST_WORK/.git/hooks"
+    assert_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/.git/hooks" "$TEST_WORK/.git/hooks"
+}
+
+@test "protect_git_dir: a .git directory that is no repository is left alone" {
+    mkdir -p "$TEST_WORK/.git"
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
+    refute_args_contain BWRAP_ARGS --bind "$TEST_WORK/.git" "$TEST_WORK/.git"
+    assert_not_exist "$TEST_WORK/.git/hooks"
+}
+
+@test "protect_git_dir: nested repositories and submodule repositories are protected" {
+    make_git_dir "$TEST_WORK/.git"
+    make_git_dir "$TEST_WORK/vendor/lib/.git"
+    make_git_dir "$TEST_WORK/.git/modules/a/b"
+    make_git_dir "$TEST_WORK/.git/modules/a/b/modules/c"
+    # refs/remotes/origin/HEAD is no repository
+    mkdir -p "$TEST_WORK/.git/modules/a/b/refs/remotes/origin"
+    : > "$TEST_WORK/.git/modules/a/b/refs/remotes/origin/HEAD"
+    mkdir -p "$TEST_WORK/sub"
+    printf 'gitdir: ../.git/modules/a/b\n' > "$TEST_WORK/sub/.git"
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
+    assert_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/vendor/lib/.git/config" "$TEST_WORK/vendor/lib/.git/config"
+    assert_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/.git/modules/a/b/config" "$TEST_WORK/.git/modules/a/b/config"
+    assert_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/.git/modules/a/b/modules/c/hooks" "$TEST_WORK/.git/modules/a/b/modules/c/hooks"
+    assert_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/sub/.git" "$TEST_WORK/sub/.git"
+    refute_args_contain BWRAP_ARGS --bind "$TEST_WORK/.git/modules/a/b/refs/remotes/origin" "$TEST_WORK/.git/modules/a/b/refs/remotes/origin"
+    assert_equal "${#PROTECTED_GIT_DIRS[@]}" 4
+}
+
+@test "protect_git_dir: a linked worktree's .git file and the common dir's worktree entries are protected" {
+    local common="$BATS_TEST_TMPDIR/main/.git"
+    make_git_dir "$common"
+    mkdir -p "$common/worktrees/wt"
+    printf 'ref: refs/heads/wt\n' > "$common/worktrees/wt/HEAD"
+    printf '../..\n' > "$common/worktrees/wt/commondir"
+    printf '%s\n' "$TEST_WORK/.git" > "$common/worktrees/wt/gitdir"
+    printf 'gitdir: %s\n' "$common/worktrees/wt" > "$TEST_WORK/.git"
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK" --bind "$common" "$common")
+    protect_sandbox_config BWRAP_ARGS
+    assert_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/.git" "$TEST_WORK/.git"
+    assert_args_contain BWRAP_ARGS --bind "$common" "$common"
+    assert_args_contain BWRAP_ARGS --ro-bind "$common/config" "$common/config"
+    assert_args_contain BWRAP_ARGS --bind "$common/worktrees/wt" "$common/worktrees/wt" \
+        --ro-bind "$common/worktrees/wt/commondir" "$common/worktrees/wt/commondir" \
+        --ro-bind "$common/worktrees/wt/gitdir" "$common/worktrees/wt/gitdir"
+    # the common dir is a bind root and also found as .git below itself: once
+    assert_equal "${#PROTECTED_GIT_DIRS[@]}" 1
+}
+
+@test "protect_git_dir: config.worktree is protected, and created when worktreeConfig is on" {
+    make_git_dir "$TEST_WORK/.git"
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
+    assert_not_exist "$TEST_WORK/.git/config.worktree"
+
+    printf '[extensions]\n\tworktreeConfig = true\n' >> "$TEST_WORK/.git/config"
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
+    assert_file_exists "$TEST_WORK/.git/config.worktree"
+    assert_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/.git/config.worktree" "$TEST_WORK/.git/config.worktree"
+}
+
+@test "protect_git_dir: a whitelisted bare repository is protected" {
+    local bare="$BATS_TEST_TMPDIR/repo.git"
+    make_git_dir "$bare"
+    BWRAP_ARGS=(--bind "$bare" "$bare")
+    protect_sandbox_config BWRAP_ARGS
+    assert_args_contain BWRAP_ARGS --ro-bind "$bare/config" "$bare/config"
+}
+
+@test "protect_git_dir: read-only binds and mapped destinations" {
+    local src="$BATS_TEST_TMPDIR/src" ro="$BATS_TEST_TMPDIR/ro"
+    make_git_dir "$src/.git"
+    make_git_dir "$ro/.git"
+    BWRAP_ARGS=(--bind "$src" /mnt/dest --ro-bind "$ro" "$ro")
+    protect_sandbox_config BWRAP_ARGS
+    assert_args_contain BWRAP_ARGS --bind "$src/.git" /mnt/dest/.git --ro-bind "$src/.git/config" /mnt/dest/.git/config
+    refute_args_contain BWRAP_ARGS --ro-bind "$ro/.git/config" "$ro/.git/config"
+}
+
+@test "protect_git_dir: switched off on its own, and independent of the project config protection" {
+    make_git_dir "$TEST_WORK/.git"
+    mkdir -p "$PROJECT_CONFIG_DIR"
+    PROTECT_GIT_CONFIG=false
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
+    refute_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/.git/config" "$TEST_WORK/.git/config"
+    assert_args_contain BWRAP_ARGS --ro-bind "$PROJECT_CONFIG_DIR" "$PROJECT_CONFIG_DIR"
+
+    PROTECT_GIT_CONFIG=true PROTECT_PROJECT_CONFIG=false
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
+    assert_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/.git/config" "$TEST_WORK/.git/config"
+    refute_args_contain BWRAP_ARGS --ro-bind "$PROJECT_CONFIG_DIR" "$PROJECT_CONFIG_DIR"
+}
+
+@test "split_mount_root: a git directory is split around its configuration and hooks" {
+    make_git_dir "$TEST_WORK/.git"
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
+    run split_mount_root "$TEST_WORK/.git" "${PROTECTED_CONFIG_SOURCES[@]}"
+    assert_line "$TEST_WORK/.git/objects"
+    refute_line "$TEST_WORK/.git/config"
+    refute_line "$TEST_WORK/.git/hooks"
+    refute_line "$TEST_WORK/.git"
+}
+
 # --- create_missing_project_config_dirs -------------------------------------------
 
 @test "create_missing_project_config_dirs: creates the working directory's and git roots' directory" {

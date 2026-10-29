@@ -297,6 +297,44 @@ last_index_of() {
     assert_args_contain BWRAP_RECORDED --ro-bind "$PROJECT_DIR" "$PROJECT_DIR"
 }
 
+@test "git configuration in the working directory is read-only by default" {
+    mkdir -p .git/objects
+    printf 'ref: refs/heads/main\n' > .git/HEAD
+    : > .git/config
+    run_sandbox --dry-run
+    assert_success
+    assert_args_contain BWRAP_RECORDED --bind "$TEST_WORK/.git" "$TEST_WORK/.git"
+    assert_args_contain BWRAP_RECORDED --ro-bind "$TEST_WORK/.git/config" "$TEST_WORK/.git/config"
+    assert_output --partial "Git Config Protection: enabled (hooks and configuration read-only in 1 git directory)"
+}
+
+@test "--no-protect-git-config and protect_git_config: false leave git configuration writable" {
+    mkdir -p .git/objects
+    printf 'ref: refs/heads/main\n' > .git/HEAD
+    : > .git/config
+    run_sandbox --dry-run --no-protect-git-config
+    assert_success
+    refute_args_contain BWRAP_RECORDED --ro-bind "$TEST_WORK/.git/config" "$TEST_WORK/.git/config"
+    assert_output --partial "Git Config Protection: disabled"
+
+    write_user_config 'protect_git_config: false'
+    run_sandbox --dry-run
+    refute_args_contain BWRAP_RECORDED --ro-bind "$TEST_WORK/.git/config" "$TEST_WORK/.git/config"
+    run_sandbox --dry-run --protect-git-config
+    assert_args_contain BWRAP_RECORDED --ro-bind "$TEST_WORK/.git/config" "$TEST_WORK/.git/config"
+}
+
+@test "protect_git_config: false in a project file is ignored" {
+    mkdir -p .git/objects
+    printf 'ref: refs/heads/main\n' > .git/HEAD
+    : > .git/config
+    write_config "$PROJECT_DIR/config.yaml" 'protect_git_config: false'
+    run_sandbox --dry-run
+    assert_success
+    assert_output --partial "Ignoring 'protect_git_config'"
+    assert_args_contain BWRAP_RECORDED --ro-bind "$TEST_WORK/.git/config" "$TEST_WORK/.git/config"
+}
+
 @test "protect_project_config: false in the user config is honoured" {
     write_user_config 'protect_project_config: false'
     write_config "$PROJECT_DIR/config.yaml" 'quiet: false'
