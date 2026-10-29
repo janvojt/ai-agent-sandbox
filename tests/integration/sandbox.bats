@@ -180,3 +180,68 @@ touch $ws/other/file && echo other-rw"
     run find "$TMPDIR" -name 'ai-agent-sandbox-net.*'
     assert_output ""
 }
+
+# Prints "<name> <errno name or ok>" for a few filtered calls. Skips without
+# python3 (the probe needs raw syscalls) or on a host without a filter.
+seccomp_probe='python3 -I -c "
+import ctypes, errno, fcntl, os, termios
+libc = ctypes.CDLL(None, use_errno=True)
+nr = {\"x86_64\": {\"keyctl\": 250, \"io_uring_setup\": 425}, \"aarch64\": {\"keyctl\": 219, \"io_uring_setup\": 425}}[os.uname().machine]
+for name in (\"keyctl\", \"io_uring_setup\"):
+    r = libc.syscall(nr[name], 0, 0)
+    print(name, errno.errorcode.get(ctypes.get_errno()) if r < 0 else \"ok\")
+try:
+    fcntl.ioctl(os.open(\"/dev/null\", os.O_RDWR), termios.TIOCSTI, b\"x\")
+except OSError as e:
+    print(\"TIOCSTI\", errno.errorcode[e.errno])
+"'
+
+require_seccomp_probe() {
+    command -v python3 >/dev/null || skip "python3 is not installed"
+    case "$(uname -m)" in
+        x86_64|aarch64) ;;
+        *) skip "no syscall filter for $(uname -m)" ;;
+    esac
+}
+
+@test "the default syscall filter refuses keyctl, io_uring and TIOCSTI but allows user namespaces" {
+    require_seccomp_probe
+    run_real_sandbox "$seccomp_probe
+unshare --user true && echo userns-ok"
+    assert_success
+    assert_line "keyctl EPERM"
+    assert_line "io_uring_setup ENOSYS"
+    assert_line "TIOCSTI EPERM"
+    assert_line userns-ok
+}
+
+@test "--seccomp off reaches the kernel" {
+    require_seccomp_probe
+    run_real_sandbox "$seccomp_probe" --seccomp off
+    assert_success
+    refute_line "keyctl EPERM"
+    refute_line "io_uring_setup ENOSYS"
+    refute_line "TIOCSTI EPERM"
+}
+
+@test "the strict syscall filter refuses new user namespaces and nested sandboxes" {
+    require_seccomp_probe
+    run_real_sandbox "$seccomp_probe
+unshare --user true || echo unshare-refused
+bwrap --ro-bind / / true || echo bwrap-refused
+sh -c 'echo fork-ok'" --seccomp strict
+    assert_line "keyctl EPERM"
+    assert_line unshare-refused
+    assert_line bwrap-refused
+    assert_line fork-ok
+}
+
+@test "the syscall filter also applies in isolated mode" {
+    require_seccomp_probe
+    stub_command pasta
+    AI_AGENT_SANDBOX_NETWORK=isolated run_real_sandbox "$seccomp_probe
+unshare --user true || echo unshare-refused" --seccomp strict
+    assert_success
+    assert_line "keyctl EPERM"
+    assert_line unshare-refused
+}

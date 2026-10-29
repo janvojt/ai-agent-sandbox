@@ -7,6 +7,7 @@ A secure bubblewrap-based sandboxing solution for running AI coding agents with 
 - ✅ **Whitelist-based filesystem access** - Only explicitly allowed paths are readable
 - ✅ **Blacklist protection** - Block sensitive files within working directory
 - ✅ **Network isolation** - Internet access through user-mode networking, while the host's loopback services and private networks stay hidden (`--network host` for full access)
+- ✅ **Syscall filter** - A seccomp deny list keeps rarely needed, exploit-prone kernel interfaces (keyrings, BPF, io_uring, terminal injection) away from the agent; `--seccomp strict` also forbids new user namespaces and mounts
 - ✅ **Configurable environment** - Variables from `config.yaml` or the command line, no SSH agent access
 - ✅ **Virtualenv support** - Optionally expose the active Python virtual environment
 - ✅ **Working directory isolation** - Full read-write only in current directory
@@ -117,6 +118,25 @@ The same settings exist as config keys (`network`, `host_ports`, `allow_hosts`) 
 Requirements: `pasta` (package `passt`), `nsenter` and `unshare --map-user` (util-linux 2.38 or newer, e.g. Ubuntu 24.04) and `ip` (iproute2) on the host. Without them the default mode falls back to the host network with a warning; an explicitly requested `isolated` mode fails instead.
 
 Limits: LAN machines with public IP addresses on subnets the host is not directly attached to are indistinguishable from the internet. Blocking the internet itself is pointless, the agent talks to its LLM provider anyway. With `--enable-docker`, containers' published ports live on the host loopback, so list them in `host_ports` (or use `--network host`); the `172.17.x` bridge addresses are blocked.
+
+### Syscall filter:
+
+The agent shares the host kernel, so every kernel bug it can reach is a way out. The sandbox therefore installs a seccomp filter (assembled by the script itself, no libseccomp needed) with a deny list of syscalls that coding agents do not need and that keep showing up in kernel exploits:
+
+| Level | Refused |
+|---|---|
+| `default` | kernel keyrings (`keyctl`, `add_key`, `request_key`), `bpf`, `userfaultfd`, `perf_event_open`, module and kexec loading, NUMA page migration, `syslog`, `acct`, `quotactl`, `open_by_handle_at`, `modify_ldt`/`vm86`, `ioctl(TIOCSTI/TIOCLINUX)` (typing commands into the terminal the agent was started from) and exotic `personality` flags; `io_uring` reports "not implemented" so runtimes fall back to their normal I/O |
+| `strict` | additionally new user namespaces (`unshare`, `setns`, `clone` with `CLONE_NEWUSER`; `clone3` reports "not implemented", glibc then uses `clone`) and every mount syscall. Closes the netfilter/nf_tables class of exploits that need namespace root, but nested sandboxes (bwrap, rootless Podman, Flatpak, Claude Code's own sandbox, this project's integration tests) stop working |
+| `off` | nothing |
+
+```bash
+./ai-agent-sandbox.sh --seccomp strict
+AI_AGENT_SANDBOX_SECCOMP=off ./ai-agent-sandbox.sh
+```
+
+The config key is `seccomp`. A project file may only **tighten** the level (`seccomp: strict` in a repository works, `seccomp: off` is ignored with a warning); user-level files, the environment variable and the flag can set any level. 32-bit x86 programs are filtered with their own syscall numbers; x32 and 32-bit ARM programs cannot run under the filter. Supported architectures are x86_64 and aarch64; elsewhere the default switches the filter off with a warning, an explicit level fails. `perf`, `bpftrace` and other tools that need the refused syscalls work with `--seccomp off`.
+
+It is a deny list, not an allow list: bugs in ordinary syscalls (file systems, networking, memory management) are still reachable. Only a VM separates the agent from the host kernel.
 
 ### Git configuration:
 
@@ -344,6 +364,7 @@ See [`config-example.yaml`](config-example.yaml) for a commented example of ever
 | `profile` | string | `--profile NAME` (`default` = host configuration) |
 | `agent` | string | `--agent claudecode\|opencode` |
 | `network` | string | `--network isolated\|host\|none` (default: `isolated`, see [Network isolation](#network-isolation)) |
+| `seccomp` | string | `--seccomp default\|strict\|off` (default: `default`, project files may only tighten it, see [Syscall filter](#syscall-filter)) |
 | `host_ports` | list | `--host-port PORT` (host loopback TCP ports or ranges `a-b` reachable at localhost inside) |
 | `allow_hosts` | list | `--allow-host ADDR` (IPs, CIDR ranges or hostnames exempt from the private-network block) |
 | `docker` | bool | `--enable-docker` / `--no-docker` |
@@ -503,7 +524,8 @@ blacklist:
 5. ✅ **Credential separation** - With profiles, a project only sees the login, settings and memory of its own profile; the profile store itself is never visible inside the sandbox
 6. ✅ **Self-modifying sandbox rules** - `.ai-agent-sandbox/` is mounted read-only so the agent cannot change the profile, whitelist or environment it runs with next time
 7. ✅ **OpenCode 2 background server** - OpenCode 2 is started with `--standalone`, so the server that executes its tools runs inside the sandbox instead of the shared per-user service on the host
-8. ✅ **Host services and LAN** - In the default `isolated` network mode the host's loopback and private networks are unreachable, so a prompt-injected agent cannot probe local databases, dashboards, routers or other machines; only the ports and hosts you list are exposed
+8. ✅ **Exploit-prone kernel interfaces** - A seccomp filter refuses keyrings, BPF, io_uring, userfaultfd, perf, module loading and terminal input injection; `--seccomp strict` also new user namespaces and mounts
+9. ✅ **Host services and LAN** - In the default `isolated` network mode the host's loopback and private networks are unreachable, so a prompt-injected agent cannot probe local databases, dashboards, routers or other machines; only the ports and hosts you list are exposed
 
 ### Limitations and Considerations
 
@@ -515,7 +537,7 @@ blacklist:
 
 3. ⚠️ **Working directory is still read-write** - The agent has full access to create/modify/delete files in the working directory (except blacklisted ones). This is necessary for coding agents to function.
 
-4. ⚠️ **No process isolation** - While filesystem is isolated, agent processes run on the host system (though in separate namespaces).
+4. ⚠️ **Shared kernel** - Agent processes run in their own PID, IPC, UTS, cgroup and (by default) network namespaces without capabilities and behind a syscall filter, but on the host kernel: a kernel exploit in a syscall the filter allows is an escape. Use a VM for untrusted code that may carry such exploits.
 
 ### Recommended Additional Hardening
 

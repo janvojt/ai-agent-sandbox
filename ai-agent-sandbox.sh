@@ -112,6 +112,13 @@ NETWORK_BLOCKED_V6=(fc00::/7 fe80::/10)
 # Route metrics: an allow route must beat a block route of the same prefix
 NETWORK_ALLOW_METRIC=10
 NETWORK_BLOCK_METRIC=100
+# Syscall filter (see build_seccomp_filter): off, default (rarely needed,
+# exploit-prone syscalls) or strict (also user namespaces and mounts)
+SECCOMP_LEVEL=""
+SECCOMP_SOURCE="default"
+SECCOMP_LEVEL_DEFAULT="default"
+SECCOMP_ARCHES=()
+SECCOMP_FD=""
 SOCKET_PROXY_IMAGE="${AI_AGENT_SANDBOX_DOCKER_PROXY:-ghcr.io/wollomatic/socket-proxy:1}"
 PROXY_CONTAINER_NAME=""
 PROXY_SOCKET_PATH=""
@@ -176,6 +183,10 @@ OPTIONS:
                             at localhost inside the sandbox (isolated mode, repeatable)
     --allow-host ADDR       Allow an IP, CIDR range or hostname that would otherwise be
                             blocked as a private network (isolated mode, repeatable)
+    --seccomp LEVEL         Syscall filter: default (blocks rarely needed, exploit-prone
+                            syscalls such as keyctl, bpf, io_uring, TIOCSTI), strict
+                            (also user namespaces and mounts: no nested sandboxes)
+                            or off; project files may only tighten it
     --dry-run              Start bash shell instead of agent (for testing)
     --quiet, -q            Suppress informational output (faster startup)
     --verbose, -v          Show detailed output (default)
@@ -205,7 +216,7 @@ DEPRECATED LEGACY FILES:
     project-level files are migrated with --migrate-project-conf.
 
 CONFIGURATION FILE FORMAT:
-    Config:    YAML (flat subset). Keys: profile, agent, network, docker, docker_image, venv,
+    Config:    YAML (flat subset). Keys: profile, agent, network, seccomp, docker, docker_image, venv,
                 gitconfig, shared_skills, gpg_agent, quiet,
                 protect_project_config (user-level only),
                 whitelist, blacklist, host_ports, allow_hosts, agent_args (lists),
@@ -257,6 +268,7 @@ EXAMPLES:
     $0 --venv
     $0 --gpg-agent
     $0 --network host
+    $0 --seccomp strict
     $0 --host-port 5432 --allow-host 192.168.1.50
     $0 -- --model claude-sonnet-4-5
     $0 -a opencode -- run -m deepseek/deepseek-chat "Explain this repository"
@@ -284,6 +296,16 @@ validate_network_mode() {
         isolated|host|none) return 0 ;;
     esac
     return 1
+}
+
+# Prints 0/1/2 for off/default/strict; fails for anything else
+seccomp_level_rank() {
+    case "$1" in
+        off) echo 0 ;;
+        default) echo 1 ;;
+        strict) echo 2 ;;
+        *) return 1 ;;
+    esac
 }
 
 # A TCP port or an inclusive range first-last, as pasta accepts it
@@ -464,6 +486,27 @@ apply_config_scalar() {
                 validate_network_mode "$value" || config_error "Invalid value for 'network' in $file: '$value' (expected isolated, host or none)"
                 NETWORK_MODE="$value"
                 NETWORK_MODE_SOURCE="$file"
+            fi
+            ;;
+        seccomp)
+            if [[ "$is_null" != true ]]; then
+                seccomp_level_rank "$value" >/dev/null || config_error "Invalid value for 'seccomp' in $file: '$value' (expected off, default or strict)"
+            fi
+            # Unlike the network mode, the filter protects the host kernel: a
+            # repository may tighten it but not loosen it
+            if is_project_config_file "$file"; then
+                if [[ "$is_null" = true ]] \
+                    || (( $(seccomp_level_rank "$value") < $(seccomp_level_rank "${SECCOMP_LEVEL:-$SECCOMP_LEVEL_DEFAULT}") )); then
+                    config_warn "Ignoring 'seccomp: ${value:-~}' in $file (project files may only tighten the syscall filter)"
+                    return 0
+                fi
+            fi
+            if [[ "$is_null" = true ]]; then
+                SECCOMP_LEVEL=""
+                SECCOMP_SOURCE="default"
+            else
+                SECCOMP_LEVEL="$value"
+                SECCOMP_SOURCE="$file"
             fi
             ;;
         docker|venv|gpg_agent|gitconfig|shared_skills|quiet|protect_project_config)
@@ -1865,6 +1908,248 @@ setup_isolated_network() {
     return 0
 }
 
+# --- Syscall filter (seccomp) ---------------------------------------------------
+#
+# bwrap installs a classic BPF program read from --seccomp <fd> right before it
+# executes the command. The program is assembled here in pure bash: a deny list
+# of syscalls an agent does not need and that are frequent sources of kernel
+# exploits. Everything else is allowed, so this shrinks the attack surface but
+# is no allow-list. Syscalls of a foreign ABI (x32, 32-bit ARM) are refused as a
+# whole because their numbers differ; i386 has its own table.
+#
+# default: kernel keyrings, BPF, userfaultfd, perf, module/kexec loading, NUMA
+#   page migration, TIOCSTI/TIOCLINUX (typing into the terminal the agent was
+#   started from), exotic personalities; io_uring gets ENOSYS so runtimes fall
+#   back to epoll/threads
+# strict: also new user namespaces (unshare, setns, clone with CLONE_NEWUSER;
+#   clone3 gets ENOSYS because its flags are behind a pointer, glibc then uses
+#   clone) and every mount syscall. Nested sandboxes (bwrap, rootless Podman,
+#   this project's integration tests) stop working
+
+# AUDIT_ARCH_* values, as found in seccomp_data.arch
+declare -gA SECCOMP_AUDIT_ARCH=([x86_64]=0xc000003e [i386]=0x40000003 [aarch64]=0xc00000b7)
+# Syscall numbers per ABI (verified against libseccomp's tables, see the tests)
+# shellcheck disable=SC2034 # used through the nameref in build_seccomp_filter
+declare -gA SECCOMP_NR_x86_64=(
+    [syslog]=103 [uselib]=134 [acct]=163 [quotactl]=179 [quotactl_fd]=443
+    [add_key]=248 [keyctl]=250 [request_key]=249 [bpf]=321 [userfaultfd]=323
+    [perf_event_open]=298 [kexec_load]=246 [kexec_file_load]=320 [init_module]=175
+    [finit_module]=313 [delete_module]=176 [open_by_handle_at]=304 [modify_ldt]=154
+    [move_pages]=279 [mbind]=237 [migrate_pages]=256 [set_mempolicy]=238
+    [set_mempolicy_home_node]=450 [io_uring_setup]=425 [io_uring_enter]=426
+    [io_uring_register]=427 [ioctl]=16 [personality]=135 [unshare]=272 [setns]=308
+    [clone]=56 [clone3]=435 [mount]=165 [umount2]=166 [pivot_root]=155 [chroot]=161
+    [open_tree]=428 [move_mount]=429 [fsopen]=430 [fsconfig]=431 [fsmount]=432
+    [fspick]=433 [mount_setattr]=442 [open_tree_attr]=467
+)
+# shellcheck disable=SC2034
+declare -gA SECCOMP_NR_i386=(
+    [syslog]=103 [uselib]=86 [acct]=51 [quotactl]=131 [quotactl_fd]=443
+    [add_key]=286 [keyctl]=288 [request_key]=287 [bpf]=357 [userfaultfd]=374
+    [perf_event_open]=336 [kexec_load]=283 [init_module]=128
+    [finit_module]=350 [delete_module]=129 [open_by_handle_at]=342 [modify_ldt]=123
+    [vm86]=166 [vm86old]=113 [move_pages]=317 [mbind]=274 [migrate_pages]=294
+    [set_mempolicy]=276 [set_mempolicy_home_node]=450 [io_uring_setup]=425
+    [io_uring_enter]=426 [io_uring_register]=427 [ioctl]=54 [personality]=136
+    [unshare]=310 [setns]=346 [clone]=120 [clone3]=435 [mount]=21 [umount]=22
+    [umount2]=52 [pivot_root]=217 [chroot]=61 [open_tree]=428 [move_mount]=429
+    [fsopen]=430 [fsconfig]=431 [fsmount]=432 [fspick]=433 [mount_setattr]=442
+    [open_tree_attr]=467
+)
+# shellcheck disable=SC2034
+declare -gA SECCOMP_NR_aarch64=(
+    [syslog]=116 [acct]=89 [quotactl]=60 [quotactl_fd]=443
+    [add_key]=217 [keyctl]=219 [request_key]=218 [bpf]=280 [userfaultfd]=282
+    [perf_event_open]=241 [kexec_load]=104 [kexec_file_load]=294 [init_module]=105
+    [finit_module]=273 [delete_module]=106 [open_by_handle_at]=265
+    [move_pages]=239 [mbind]=235 [migrate_pages]=238 [set_mempolicy]=237
+    [set_mempolicy_home_node]=450 [io_uring_setup]=425 [io_uring_enter]=426
+    [io_uring_register]=427 [ioctl]=29 [personality]=92 [unshare]=97 [setns]=268
+    [clone]=220 [clone3]=435 [mount]=40 [umount2]=39 [pivot_root]=41 [chroot]=51
+    [open_tree]=428 [move_mount]=429 [fsopen]=430 [fsconfig]=431 [fsmount]=432
+    [fspick]=433 [mount_setattr]=442 [open_tree_attr]=467
+)
+# Names missing from an ABI's table do not exist there and are skipped
+SECCOMP_EPERM_DEFAULT=(syslog uselib acct quotactl quotactl_fd add_key keyctl
+    request_key bpf userfaultfd perf_event_open kexec_load kexec_file_load
+    init_module finit_module delete_module open_by_handle_at modify_ldt vm86
+    vm86old move_pages mbind migrate_pages set_mempolicy set_mempolicy_home_node)
+SECCOMP_ENOSYS_DEFAULT=(io_uring_setup io_uring_enter io_uring_register)
+SECCOMP_EPERM_STRICT=(unshare setns mount umount umount2 pivot_root chroot
+    open_tree open_tree_attr move_mount fsopen fsconfig fsmount fspick mount_setattr)
+SECCOMP_ENOSYS_STRICT=(clone3)
+SECCOMP_TIOCSTI=0x5412
+SECCOMP_TIOCLINUX=0x541c
+SECCOMP_CLONE_NEWUSER=0x10000000
+# personality(2) values that stay allowed (PER_LINUX, PER_LINUX32, UNAME26
+# variants and the 0xffffffff query), as in Docker's default profile
+SECCOMP_PERSONALITY_ALLOWED=(0x0 0x8 0x20000 0x20008 0xffffffff)
+SECCOMP_RET_ALLOW=0x7fff0000
+SECCOMP_RET_EPERM=$((0x50000 | 1))
+SECCOMP_RET_ENOSYS=$((0x50000 | 38))
+# seccomp_data offsets: nr, arch, then the arguments as 64-bit values (the low
+# halves are compared, little-endian hosts only)
+SECCOMP_OFF_NR=0
+SECCOMP_OFF_ARCH=4
+SECCOMP_OFF_ARG0=16
+SECCOMP_OFF_ARG1=24
+
+# ABIs filtered on this host (fails when the architecture is not supported)
+seccomp_host_arches() {
+    case "$(uname -m)" in
+        x86_64) echo "x86_64 i386" ;;
+        aarch64) echo "aarch64" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Tiny assembler: instructions are collected with symbolic jump targets and
+# resolved by seccomp_asm_write. A target is a label name or "-" (next).
+seccomp_asm() {
+    _SECCOMP_PROG+=("$1 $2 $3 $4")
+}
+
+seccomp_asm_label() {
+    _SECCOMP_LABELS[$1]=${#_SECCOMP_PROG[@]}
+}
+
+seccomp_asm_write() {
+    local file="$1" i code jt jf k fmt="" target offset
+    local -a ins offsets
+    for ((i = 0; i < ${#_SECCOMP_PROG[@]}; i++)); do
+        read -r -a ins <<< "${_SECCOMP_PROG[$i]}"
+        code=$((ins[0])) k=$((ins[3]))
+        offsets=()
+        for target in "${ins[1]}" "${ins[2]}"; do
+            if [[ "$target" = - ]]; then
+                offsets+=(0)
+                continue
+            fi
+            [[ -n "${_SECCOMP_LABELS[$target]:-}" ]] || { echo "seccomp: unknown label $target" >&2; return 1; }
+            offset=$((_SECCOMP_LABELS[$target] - i - 1))
+            (( offset >= 0 && offset <= 255 )) || { echo "seccomp: jump to $target out of range" >&2; return 1; }
+            offsets+=("$offset")
+        done
+        jt=${offsets[0]} jf=${offsets[1]}
+        printf -v fmt '%s\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x' "$fmt" \
+            $((code & 255)) $((code >> 8 & 255)) "$jt" "$jf" \
+            $((k & 255)) $((k >> 8 & 255)) $((k >> 16 & 255)) $((k >> 24 & 255))
+    done
+    # shellcheck disable=SC2059 # the format only consists of \x escapes
+    printf "$fmt" > "$file"
+}
+
+# Usage: build_seccomp_filter <default|strict> <file> <abi...>
+# Writes the BPF program for the given ABIs (the first is the native one).
+build_seccomp_filter() {
+    local level="$1" file="$2" abi name value
+    shift 2
+    local -a eperm=("${SECCOMP_EPERM_DEFAULT[@]}") enosys=("${SECCOMP_ENOSYS_DEFAULT[@]}")
+    if [[ "$level" = strict ]]; then
+        eperm+=("${SECCOMP_EPERM_STRICT[@]}")
+        enosys+=("${SECCOMP_ENOSYS_STRICT[@]}")
+    fi
+    local -a _SECCOMP_PROG=()
+    local -A _SECCOMP_LABELS=()
+    local LD=0x20 JEQ=0x15 JGE=0x35 JSET=0x45 RET=0x06
+
+    seccomp_asm $LD - - $SECCOMP_OFF_ARCH
+    for abi in "$@"; do
+        seccomp_asm $JEQ "abi_$abi" - "${SECCOMP_AUDIT_ARCH[$abi]}"
+    done
+    seccomp_asm $RET - - $SECCOMP_RET_EPERM
+    for abi in "$@"; do
+        local -n nr="SECCOMP_NR_$abi"
+        seccomp_asm_label "abi_$abi"
+        seccomp_asm $LD - - $SECCOMP_OFF_NR
+        # x32 shares x86_64's arch value and sets bit 30 in the number
+        if [[ "$abi" = x86_64 ]]; then
+            seccomp_asm $JGE eperm - 0x40000000
+        fi
+        for name in "${eperm[@]}"; do
+            if [[ -n "${nr[$name]:-}" ]]; then
+                seccomp_asm $JEQ eperm - "${nr[$name]}"
+            fi
+        done
+        for name in "${enosys[@]}"; do
+            if [[ -n "${nr[$name]:-}" ]]; then
+                seccomp_asm $JEQ enosys - "${nr[$name]}"
+            fi
+        done
+        seccomp_asm $JEQ "ioctl_$abi" - "${nr[ioctl]}"
+        seccomp_asm $JEQ "personality_$abi" - "${nr[personality]}"
+        if [[ "$level" = strict ]]; then
+            seccomp_asm $JEQ "clone_$abi" - "${nr[clone]}"
+        fi
+        seccomp_asm $RET - - $SECCOMP_RET_ALLOW
+
+        seccomp_asm_label "ioctl_$abi"
+        seccomp_asm $LD - - $SECCOMP_OFF_ARG1
+        seccomp_asm $JEQ eperm - $SECCOMP_TIOCSTI
+        seccomp_asm $JEQ eperm - $SECCOMP_TIOCLINUX
+        seccomp_asm $RET - - $SECCOMP_RET_ALLOW
+
+        seccomp_asm_label "personality_$abi"
+        seccomp_asm $LD - - $SECCOMP_OFF_ARG0
+        for value in "${SECCOMP_PERSONALITY_ALLOWED[@]}"; do
+            seccomp_asm $JEQ allow - "$value"
+        done
+        seccomp_asm $RET - - $SECCOMP_RET_EPERM
+
+        if [[ "$level" = strict ]]; then
+            seccomp_asm_label "clone_$abi"
+            seccomp_asm $LD - - $SECCOMP_OFF_ARG0
+            seccomp_asm $JSET eperm - $SECCOMP_CLONE_NEWUSER
+            seccomp_asm $RET - - $SECCOMP_RET_ALLOW
+        fi
+        unset -n nr
+    done
+    seccomp_asm_label allow
+    seccomp_asm $RET - - $SECCOMP_RET_ALLOW
+    seccomp_asm_label eperm
+    seccomp_asm $RET - - $SECCOMP_RET_EPERM
+    seccomp_asm_label enosys
+    seccomp_asm $RET - - $SECCOMP_RET_ENOSYS
+    seccomp_asm_write "$file"
+}
+
+# Fills in the default level and the ABIs. Without support for the host
+# architecture an implicit default is switched off with a warning, an explicit
+# request is fatal (like the network mode).
+resolve_seccomp_level() {
+    local arches
+    if [[ -z "$SECCOMP_LEVEL" ]]; then
+        SECCOMP_LEVEL="$SECCOMP_LEVEL_DEFAULT"
+        SECCOMP_SOURCE="default"
+    fi
+    [[ "$SECCOMP_LEVEL" = off ]] && return 0
+    if arches=$(seccomp_host_arches); then
+        read -r -a SECCOMP_ARCHES <<< "$arches"
+        return 0
+    fi
+    if [[ "$SECCOMP_SOURCE" = default ]]; then
+        SECCOMP_LEVEL="off"
+        SECCOMP_SOURCE="fallback"
+        echo -e "${YELLOW}⚠ No syscall filter for architecture $(uname -m); running without seccomp. Set 'seccomp: off' to silence this warning${NC}" >&2
+    else
+        echo -e "${RED}Error: the syscall filter (from $SECCOMP_SOURCE) is not available for architecture $(uname -m)${NC}" >&2
+        exit 1
+    fi
+}
+
+# Writes the filter to an unlinked temporary file and leaves it open on
+# SECCOMP_FD for bwrap --seccomp
+open_seccomp_filter() {
+    local file
+    file=$(mktemp "${TMPDIR:-/tmp}/ai-agent-sandbox-seccomp.XXXXXX") || return 1
+    if ! build_seccomp_filter "$SECCOMP_LEVEL" "$file" "${SECCOMP_ARCHES[@]}" \
+        || ! exec {SECCOMP_FD}<"$file"; then
+        rm -f "$file"
+        return 1
+    fi
+    rm -f "$file"
+}
+
 cleanup_network() {
     if [[ -n "${NETWORK_TMP_DIR:-}" ]] && [[ -d "$NETWORK_TMP_DIR" ]]; then
         rm -rf "$NETWORK_TMP_DIR" 2>/dev/null || true
@@ -1937,8 +2222,19 @@ run_in_sandbox() {
     # would otherwise read from /dev/null (agents driven over stdin need it).
     # Job control stays off so bwrap remains in our process group, which
     # orchestrators signal as a whole.
+    if [[ "$SECCOMP_LEVEL" != off ]]; then
+        if ! open_seccomp_filter; then
+            echo -e "${RED}Error: could not create the syscall filter${NC}" >&2
+            return 1
+        fi
+        bwrap_extra+=(--seccomp "$SECCOMP_FD")
+    fi
     "$BWRAP_BIN" "${BWRAP_ARGS[@]}" "${bwrap_extra[@]}" -- "$@" <&0 &
     SANDBOX_PID=$!
+    if [[ -n "$SECCOMP_FD" ]]; then
+        exec {SECCOMP_FD}<&-
+        SECCOMP_FD=""
+    fi
     if [[ "$NETWORK_MODE" = isolated ]]; then
         SANDBOX_CHILD_PID=""
         while read -r -t 15 -u "$NETWORK_INFO_FD" line; do
@@ -3029,6 +3325,12 @@ if [[ -n "${AI_AGENT_SANDBOX_NETWORK:-}" ]]; then
     NETWORK_MODE_SOURCE="AI_AGENT_SANDBOX_NETWORK"
 fi
 
+if [[ -n "${AI_AGENT_SANDBOX_SECCOMP:-}" ]]; then
+    seccomp_level_rank "$AI_AGENT_SANDBOX_SECCOMP" >/dev/null || { echo -e "${RED}Error: invalid AI_AGENT_SANDBOX_SECCOMP '$AI_AGENT_SANDBOX_SECCOMP' (expected off, default or strict)${NC}" >&2; exit 1; }
+    SECCOMP_LEVEL="$AI_AGENT_SANDBOX_SECCOMP"
+    SECCOMP_SOURCE="AI_AGENT_SANDBOX_SECCOMP"
+fi
+
 # Parse command line arguments (kept for the restart after a config migration)
 ORIGINAL_ARGS=("$@")
 AGENT_ARGS=()
@@ -3130,6 +3432,12 @@ while [[ $# -gt 0 ]]; do
             validate_network_mode "$2" || { echo -e "${RED}Error: invalid --network mode '$2' (expected isolated, host or none)${NC}" >&2; exit 1; }
             NETWORK_MODE="$2"
             NETWORK_MODE_SOURCE="--network"
+            shift 2
+            ;;
+        --seccomp)
+            seccomp_level_rank "${2:-}" >/dev/null || { echo -e "${RED}Error: invalid --seccomp level '${2:-}' (expected off, default or strict)${NC}" >&2; exit 1; }
+            SECCOMP_LEVEL="$2"
+            SECCOMP_SOURCE="--seccomp"
             shift 2
             ;;
         --host-port)
@@ -3379,6 +3687,7 @@ if [[ -z "$BWRAP_BIN" ]]; then
 fi
 
 resolve_network_mode
+resolve_seccomp_level
 
 # Create a default user-level config.yaml on first run: no user-level
 # configuration of either kind exists and the whitelist or blacklist was not
@@ -3862,6 +4171,11 @@ case "$NETWORK_MODE" in
     none)
         log_info "Network: ${YELLOW}none${NC} (from $NETWORK_MODE_SOURCE)"
         ;;
+esac
+case "$SECCOMP_LEVEL" in
+    off) log_info "Syscall Filter: ${YELLOW}off${NC} (from $SECCOMP_SOURCE)" ;;
+    default) log_info "Syscall Filter: ${YELLOW}default${NC} (from $SECCOMP_SOURCE; ${SECCOMP_ARCHES[*]})" ;;
+    strict) log_info "Syscall Filter: ${YELLOW}strict${NC} (no user namespaces or mounts, from $SECCOMP_SOURCE; ${SECCOMP_ARCHES[*]})" ;;
 esac
 if [[ ${#GIT_LINKED_DIRS[@]} -gt 0 ]]; then
     log_info "Linked Git Directories: ${YELLOW}${GIT_LINKED_DIRS[*]}${NC}"
