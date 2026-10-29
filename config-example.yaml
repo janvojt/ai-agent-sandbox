@@ -39,13 +39,14 @@ profile: work
 # --network, environment variable: AI_AGENT_SANDBOX_NETWORK.
 # network: isolated
 
-# Syscall filter: default, strict or off. "default" refuses rarely needed,
-# exploit-prone syscalls (keyrings, bpf, io_uring, userfaultfd, perf, module
-# loading, TIOCSTI); "strict" also new user namespaces and mounts, so nested
-# sandboxes (bwrap, rootless Podman) stop working. Project files may only
-# tighten the level. Equivalent flag: --seccomp, environment variable:
-# AI_AGENT_SANDBOX_SECCOMP.
-# seccomp: default
+# Syscall filter: strict (default), default or off. "default" refuses rarely
+# needed, exploit-prone syscalls (keyrings, bpf, io_uring, userfaultfd, perf,
+# module loading, TIOCSTI); "strict" also new user namespaces and mounts, so
+# nested sandboxes (bwrap, rootless Podman, Chromium's sandbox) do not work.
+# Project files may only tighten the level, so set "default" here in the
+# user-level file when you need nested sandboxes. Equivalent flag: --seccomp,
+# environment variable: AI_AGENT_SANDBOX_SECCOMP.
+# seccomp: strict
 
 # Host loopback TCP ports (or ranges a-b) reachable at localhost inside the
 # sandbox in isolated mode, e.g. T3 Code's server or a database published by

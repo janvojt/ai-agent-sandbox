@@ -26,13 +26,13 @@ done
 exit 0"
 }
 
-@test "the default filter is passed to bwrap and named in the summary" {
+@test "the strict filter is the default, passed to bwrap and named in the summary" {
     stub_bwrap_reading_seccomp
     export TMPDIR="$BATS_TEST_TMPDIR/tmp"
     mkdir -p "$TMPDIR"
     run_sandbox --dry-run
     assert_success
-    assert_output --partial "Syscall Filter: default (from default;"
+    assert_output --partial "Syscall Filter: strict (no user namespaces or mounts, from default;"
     assert_args_contain BWRAP_RECORDED --seccomp
     assert_file_exists "$SECCOMP_COPY"
     # starts with "ld [arch]"
@@ -60,22 +60,25 @@ exit 0"
 @test "a project file can tighten the filter" {
     mkdir -p "$PROJECT_DIR"
     printf 'seccomp: strict\n' > "$PROJECT_DIR/config.yaml"
+    AI_AGENT_SANDBOX_CONFIG="$BATS_TEST_TMPDIR/user.yaml"
+    printf 'seccomp: default\nwhitelist:\n  - /usr\n' > "$AI_AGENT_SANDBOX_CONFIG"
+    export AI_AGENT_SANDBOX_CONFIG
     run_sandbox --dry-run
     assert_success
     assert_output --partial "Syscall Filter: strict (no user namespaces or mounts, from $PROJECT_DIR/config.yaml"
 }
 
-@test "a project file cannot switch the filter off" {
+@test "a project file cannot loosen the filter" {
     mkdir -p "$PROJECT_DIR"
-    printf 'seccomp: off\n' > "$PROJECT_DIR/config.yaml"
+    printf 'seccomp: default\n' > "$PROJECT_DIR/config.yaml"
     run_sandbox --dry-run
     assert_success
     assert_output --partial "project files may only tighten the syscall filter"
-    assert_output --partial "Syscall Filter: default (from default;"
+    assert_output --partial "Syscall Filter: strict (no user namespaces or mounts, from default;"
     assert_args_contain BWRAP_RECORDED --seccomp
 }
 
-@test "a user-level file can switch the filter off" {
+@test "a user-level file can loosen the filter" {
     mkdir -p "$(dirname "$TEST_HOME/.config/ai-agent-sandbox/config.yaml")"
     printf 'seccomp: off\nwhitelist:\n  - /usr\n' > "$TEST_HOME/.config/ai-agent-sandbox/config.yaml"
     run_sandbox --dry-run

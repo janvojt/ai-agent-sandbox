@@ -7,7 +7,7 @@ A secure bubblewrap-based sandboxing solution for running AI coding agents with 
 - ✅ **Whitelist-based filesystem access** - Only explicitly allowed paths are readable
 - ✅ **Blacklist protection** - Block sensitive files within working directory
 - ✅ **Network isolation** - Internet access through user-mode networking, while the host's loopback services and private networks stay hidden (`--network host` for full access)
-- ✅ **Syscall filter** - A seccomp deny list keeps rarely needed, exploit-prone kernel interfaces (keyrings, BPF, io_uring, terminal injection) away from the agent; `--seccomp strict` also forbids new user namespaces and mounts
+- ✅ **Syscall filter** - A seccomp deny list keeps rarely needed, exploit-prone kernel interfaces (keyrings, BPF, io_uring, terminal injection, new user namespaces, mounts) away from the agent; `--seccomp default` allows namespaces again for nested sandboxes
 - ✅ **Configurable environment** - Variables from `config.yaml` or the command line, no SSH agent access
 - ✅ **Virtualenv support** - Optionally expose the active Python virtual environment
 - ✅ **Working directory isolation** - Full read-write only in current directory
@@ -126,15 +126,16 @@ The agent shares the host kernel, so every kernel bug it can reach is a way out.
 | Level | Refused |
 |---|---|
 | `default` | kernel keyrings (`keyctl`, `add_key`, `request_key`), `bpf`, `userfaultfd`, `perf_event_open`, module and kexec loading, NUMA page migration, `syslog`, `acct`, `quotactl`, `open_by_handle_at`, `modify_ldt`/`vm86`, `ioctl(TIOCSTI/TIOCLINUX)` (typing commands into the terminal the agent was started from) and exotic `personality` flags; `io_uring` reports "not implemented" so runtimes fall back to their normal I/O |
-| `strict` | additionally new user namespaces (`unshare`, `setns`, `clone` with `CLONE_NEWUSER`; `clone3` reports "not implemented", glibc then uses `clone`) and every mount syscall. Closes the netfilter/nf_tables class of exploits that need namespace root, but nested sandboxes (bwrap, rootless Podman, Flatpak, Claude Code's own sandbox, this project's integration tests) stop working |
+| `strict` (used unless configured otherwise) | everything from `default`, plus new user namespaces (`unshare`, `setns`, `clone` with `CLONE_NEWUSER`; `clone3` reports "not implemented", glibc then uses `clone`) and every mount syscall. Closes the netfilter/nf_tables class of exploits that need namespace root, but nested sandboxes stop working: bwrap, rootless Podman, Flatpak, Claude Code's own sandbox, Chromium's sandbox (Puppeteer needs `--no-sandbox`; Playwright already passes it) and this project's integration tests. Docker through `--enable-docker` is not affected, the daemon runs on the host |
 | `off` | nothing |
 
 ```bash
-./ai-agent-sandbox.sh --seccomp strict
+# Allow nested sandboxes (rootless Podman, bwrap) for this run
+./ai-agent-sandbox.sh --seccomp default
 AI_AGENT_SANDBOX_SECCOMP=off ./ai-agent-sandbox.sh
 ```
 
-The config key is `seccomp`. A project file may only **tighten** the level (`seccomp: strict` in a repository works, `seccomp: off` is ignored with a warning); user-level files, the environment variable and the flag can set any level. 32-bit x86 programs are filtered with their own syscall numbers; x32 and 32-bit ARM programs cannot run under the filter. Supported architectures are x86_64 and aarch64; elsewhere the default switches the filter off with a warning, an explicit level fails. `perf`, `bpftrace` and other tools that need the refused syscalls work with `--seccomp off`.
+The config key is `seccomp`. A project file may only **tighten** the level: with the default `strict`, `seccomp: default` or `seccomp: off` in a repository is ignored with a warning. To use nested sandboxes in a project, set `seccomp: default` in your user-level `config.yaml`/`config.local.yaml` or pass the flag (for example in an orchestrator wrapper); the environment variable works as well. 32-bit x86 programs are filtered with their own syscall numbers; x32 and 32-bit ARM programs cannot run under the filter. Supported architectures are x86_64 and aarch64; elsewhere the default switches the filter off with a warning, an explicit level fails. `perf`, `bpftrace` and other tools that need the refused syscalls work with `--seccomp off`.
 
 It is a deny list, not an allow list: bugs in ordinary syscalls (file systems, networking, memory management) are still reachable. Only a VM separates the agent from the host kernel.
 
@@ -364,7 +365,7 @@ See [`config-example.yaml`](config-example.yaml) for a commented example of ever
 | `profile` | string | `--profile NAME` (`default` = host configuration) |
 | `agent` | string | `--agent claudecode\|opencode` |
 | `network` | string | `--network isolated\|host\|none` (default: `isolated`, see [Network isolation](#network-isolation)) |
-| `seccomp` | string | `--seccomp default\|strict\|off` (default: `default`, project files may only tighten it, see [Syscall filter](#syscall-filter)) |
+| `seccomp` | string | `--seccomp strict\|default\|off` (default: `strict`, project files may only tighten it, see [Syscall filter](#syscall-filter)) |
 | `host_ports` | list | `--host-port PORT` (host loopback TCP ports or ranges `a-b` reachable at localhost inside) |
 | `allow_hosts` | list | `--allow-host ADDR` (IPs, CIDR ranges or hostnames exempt from the private-network block) |
 | `docker` | bool | `--enable-docker` / `--no-docker` |
@@ -524,7 +525,7 @@ blacklist:
 5. ✅ **Credential separation** - With profiles, a project only sees the login, settings and memory of its own profile; the profile store itself is never visible inside the sandbox
 6. ✅ **Self-modifying sandbox rules** - `.ai-agent-sandbox/` is mounted read-only so the agent cannot change the profile, whitelist or environment it runs with next time
 7. ✅ **OpenCode 2 background server** - OpenCode 2 is started with `--standalone`, so the server that executes its tools runs inside the sandbox instead of the shared per-user service on the host
-8. ✅ **Exploit-prone kernel interfaces** - A seccomp filter refuses keyrings, BPF, io_uring, userfaultfd, perf, module loading and terminal input injection; `--seccomp strict` also new user namespaces and mounts
+8. ✅ **Exploit-prone kernel interfaces** - A seccomp filter refuses keyrings, BPF, io_uring, userfaultfd, perf, module loading, terminal input injection, new user namespaces and mounts
 9. ✅ **Host services and LAN** - In the default `isolated` network mode the host's loopback and private networks are unreachable, so a prompt-injected agent cannot probe local databases, dashboards, routers or other machines; only the ports and hosts you list are exposed
 
 ### Limitations and Considerations

@@ -6,11 +6,25 @@
 # only run by `tests/run.sh --integration`. The network tests use a stub pasta
 # that exits 0: the user namespaces, routes and the capability drop are real,
 # the connectivity through pasta (needs /dev/net/tun) is not tested here.
+#
+# Inside a sandbox with the default strict syscall filter no bwrap can start
+# (new user namespaces are refused), so the whole file is skipped there; the
+# tests run on the host and in CI.
+
+setup_file() {
+    INTEGRATION_SKIP=""
+    if ! command -v bwrap >/dev/null; then
+        INTEGRATION_SKIP="bwrap is not installed"
+    elif ! bwrap --ro-bind / / --unshare-all true 2>/dev/null; then
+        INTEGRATION_SKIP="bwrap cannot create namespaces here (inside a sandbox with the strict syscall filter, or no unprivileged user namespaces); run the integration tests on the host or in CI"
+    fi
+    export INTEGRATION_SKIP
+}
 
 setup() {
+    [[ -z "$INTEGRATION_SKIP" ]] || skip "$INTEGRATION_SKIP"
     load ../test_helper/common
     setup_test_env
-    command -v bwrap >/dev/null || skip "bwrap is not installed"
     stub_command claude
 }
 
@@ -207,7 +221,7 @@ require_seccomp_probe() {
 @test "the default syscall filter refuses keyctl, io_uring and TIOCSTI but allows user namespaces" {
     require_seccomp_probe
     run_real_sandbox "$seccomp_probe
-unshare --user true && echo userns-ok"
+unshare --user true && echo userns-ok" --seccomp default
     assert_success
     assert_line "keyctl EPERM"
     assert_line "io_uring_setup ENOSYS"
@@ -224,12 +238,12 @@ unshare --user true && echo userns-ok"
     refute_line "TIOCSTI EPERM"
 }
 
-@test "the strict syscall filter refuses new user namespaces and nested sandboxes" {
+@test "the strict syscall filter is the default and refuses new user namespaces and nested sandboxes" {
     require_seccomp_probe
     run_real_sandbox "$seccomp_probe
 unshare --user true || echo unshare-refused
 bwrap --ro-bind / / true || echo bwrap-refused
-sh -c 'echo fork-ok'" --seccomp strict
+sh -c 'echo fork-ok'"
     assert_line "keyctl EPERM"
     assert_line unshare-refused
     assert_line bwrap-refused

@@ -261,12 +261,15 @@ for line in sys.stdin.read().split("\n"):
 }
 
 @test "a project file may tighten the filter" {
+    apply_config_scalar seccomp default "$DEFAULT_CONFIG_FILE" false
     apply_config_scalar seccomp strict "$PROJECT_CONFIG_DIR/config.yaml" false
     assert_equal "$SECCOMP_LEVEL" strict
     assert_equal "$SECCOMP_SOURCE" "$PROJECT_CONFIG_DIR/config.yaml"
 }
 
 @test "a project file cannot loosen the filter" {
+    apply_config_scalar seccomp default "$PROJECT_CONFIG_DIR/config.yaml" false
+    assert_equal "$SECCOMP_LEVEL" ""
     apply_config_scalar seccomp off "$PROJECT_CONFIG_DIR/config.yaml" false
     assert_equal "$SECCOMP_LEVEL" ""
     assert_equal "$SECCOMP_SOURCE" default
@@ -287,10 +290,10 @@ for line in sys.stdin.read().split("\n"):
 
 # --- resolve_seccomp_level --------------------------------------------------------------
 
-@test "the default level is filled in with the host's ABIs" {
+@test "the default level is strict, filled in with the host's ABIs" {
     stub_command uname 'echo x86_64'
     resolve_seccomp_level
-    assert_equal "$SECCOMP_LEVEL" default
+    assert_equal "$SECCOMP_LEVEL" strict
     assert_equal "${SECCOMP_ARCHES[*]}" "x86_64 i386"
 }
 

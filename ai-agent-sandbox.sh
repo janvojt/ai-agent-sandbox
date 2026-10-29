@@ -113,10 +113,11 @@ NETWORK_BLOCKED_V6=(fc00::/7 fe80::/10)
 NETWORK_ALLOW_METRIC=10
 NETWORK_BLOCK_METRIC=100
 # Syscall filter (see build_seccomp_filter): off, default (rarely needed,
-# exploit-prone syscalls) or strict (also user namespaces and mounts)
+# exploit-prone syscalls) or strict (also user namespaces and mounts). Nested
+# sandboxes need "default", which a user-level file or the flag can select.
 SECCOMP_LEVEL=""
 SECCOMP_SOURCE="default"
-SECCOMP_LEVEL_DEFAULT="default"
+SECCOMP_LEVEL_DEFAULT="strict"
 SECCOMP_ARCHES=()
 SECCOMP_FD=""
 SOCKET_PROXY_IMAGE="${AI_AGENT_SANDBOX_DOCKER_PROXY:-ghcr.io/wollomatic/socket-proxy:1}"
@@ -183,10 +184,11 @@ OPTIONS:
                             at localhost inside the sandbox (isolated mode, repeatable)
     --allow-host ADDR       Allow an IP, CIDR range or hostname that would otherwise be
                             blocked as a private network (isolated mode, repeatable)
-    --seccomp LEVEL         Syscall filter: default (blocks rarely needed, exploit-prone
-                            syscalls such as keyctl, bpf, io_uring, TIOCSTI), strict
-                            (also user namespaces and mounts: no nested sandboxes)
-                            or off; project files may only tighten it
+    --seccomp LEVEL         Syscall filter: strict (default: blocks rarely needed,
+                            exploit-prone syscalls such as keyctl, bpf, io_uring and
+                            TIOCSTI, plus new user namespaces and mounts), default (the
+                            same without the namespace/mount block, for nested
+                            sandboxes) or off; project files may only tighten it
     --dry-run              Start bash shell instead of agent (for testing)
     --quiet, -q            Suppress informational output (faster startup)
     --verbose, -v          Show detailed output (default)
@@ -268,7 +270,7 @@ EXAMPLES:
     $0 --venv
     $0 --gpg-agent
     $0 --network host
-    $0 --seccomp strict
+    $0 --seccomp default
     $0 --host-port 5432 --allow-host 192.168.1.50
     $0 -- --model claude-sonnet-4-5
     $0 -a opencode -- run -m deepseek/deepseek-chat "Explain this repository"
@@ -1917,14 +1919,14 @@ setup_isolated_network() {
 # is no allow-list. Syscalls of a foreign ABI (x32, 32-bit ARM) are refused as a
 # whole because their numbers differ; i386 has its own table.
 #
-# default: kernel keyrings, BPF, userfaultfd, perf, module/kexec loading, NUMA
+# default (the level's name, the script's default is strict): kernel keyrings, BPF, userfaultfd, perf, module/kexec loading, NUMA
 #   page migration, TIOCSTI/TIOCLINUX (typing into the terminal the agent was
 #   started from), exotic personalities; io_uring gets ENOSYS so runtimes fall
 #   back to epoll/threads
 # strict: also new user namespaces (unshare, setns, clone with CLONE_NEWUSER;
 #   clone3 gets ENOSYS because its flags are behind a pointer, glibc then uses
 #   clone) and every mount syscall. Nested sandboxes (bwrap, rootless Podman,
-#   this project's integration tests) stop working
+#   Chromium's own sandbox, this project's integration tests) stop working
 
 # AUDIT_ARCH_* values, as found in seccomp_data.arch
 declare -gA SECCOMP_AUDIT_ARCH=([x86_64]=0xc000003e [i386]=0x40000003 [aarch64]=0xc00000b7)
