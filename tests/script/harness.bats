@@ -18,3 +18,17 @@ setup() {
     run_sandbox --dry-run -q
     assert_equal "$status" 42
 }
+
+@test "without a terminal the sandbox runs in a new session" {
+    run_sandbox --dry-run
+    assert_success
+    assert_args_contain BWRAP_RECORDED --new-session
+    assert_output --partial "Terminal Session: new (no terminal attached)"
+}
+
+@test "--no-new-session keeps the terminal session" {
+    run_sandbox --dry-run --no-new-session
+    assert_success
+    refute_args_contain BWRAP_RECORDED --new-session
+    assert_output --partial "Terminal Session: shared (--no-new-session)"
+}

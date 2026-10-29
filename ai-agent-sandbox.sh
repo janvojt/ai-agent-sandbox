@@ -125,6 +125,11 @@ SECCOMP_SOURCE="default"
 SECCOMP_LEVEL_DEFAULT="strict"
 SECCOMP_ARCHES=()
 SECCOMP_FD=""
+# Run the sandbox in a new terminal session (bwrap --new-session): auto, true
+# or false, see resolve_new_session
+NEW_SESSION="auto"
+NEW_SESSION_REASON=""
+LEGACY_TIOCSTI_SYSCTL="/proc/sys/dev/tty/legacy_tiocsti"
 SOCKET_PROXY_IMAGE="${AI_AGENT_SANDBOX_DOCKER_PROXY:-ghcr.io/wollomatic/socket-proxy:1}"
 PROXY_CONTAINER_NAME=""
 PROXY_SOCKET_PATH=""
@@ -197,6 +202,11 @@ OPTIONS:
                             TIOCSTI, plus new user namespaces and mounts), default (the
                             same without the namespace/mount block, for nested
                             sandboxes) or off; project files may only tighten it
+    --new-session           Always detach the sandbox from the terminal (setsid), so it
+                            cannot inject input with TIOCSTI. By default this happens
+                            when no terminal is attached or nothing else blocks TIOCSTI
+    --no-new-session        Never detach (keeps window resizes and Ctrl+C working
+                            with --seccomp off on old kernels)
     --dry-run              Start bash shell instead of agent (for testing)
     --quiet, -q            Suppress informational output (faster startup)
     --verbose, -v          Show detailed output (default)
@@ -2149,6 +2159,57 @@ resolve_seccomp_level() {
     fi
 }
 
+# --- Terminal session -----------------------------------------------------------
+#
+# A process that shares the controlling terminal of the shell the sandbox was
+# started from can push input into it with ioctl(TIOCSTI), which the shell
+# executes after the sandbox exits. bwrap --new-session (setsid) detaches the
+# sandbox from that terminal, at a price for interactive use: window size
+# changes (SIGWINCH) and terminal signals such as Ctrl+C go to the terminal's
+# foreground process group, which the sandbox then is no longer part of
+# (full-screen agents use raw mode and read Ctrl+C as input). So in
+# auto mode the new session is only used when it costs nothing (no terminal on
+# stdin, stdout or stderr) or when nothing else blocks TIOCSTI: the syscall
+# filter refuses it, and kernels since 6.2 refuse it to unprivileged processes
+# when dev.tty.legacy_tiocsti is 0.
+
+stdio_is_terminal() {
+    [[ -t 0 || -t 1 || -t 2 ]]
+}
+
+# True when TIOCSTI would work inside the sandbox without a new session
+tiocsti_allowed() {
+    [[ "$SECCOMP_LEVEL" = off ]] || return 1
+    # Without the sysctl (kernels before 6.2) TIOCSTI is always allowed
+    [[ -r "$LEGACY_TIOCSTI_SYSCTL" ]] || return 0
+    [[ "$(cat "$LEGACY_TIOCSTI_SYSCTL" 2>/dev/null)" != 0 ]]
+}
+
+# Sets NEW_SESSION to true or false and NEW_SESSION_REASON for the summary
+# (needs the resolved syscall filter level)
+resolve_new_session() {
+    case "$NEW_SESSION" in
+        true) NEW_SESSION_REASON="--new-session" ;;
+        false) NEW_SESSION_REASON="--no-new-session" ;;
+        *)
+            if ! stdio_is_terminal; then
+                NEW_SESSION=true
+                NEW_SESSION_REASON="no terminal attached"
+            elif tiocsti_allowed; then
+                NEW_SESSION=true
+                NEW_SESSION_REASON="TIOCSTI is not blocked otherwise"
+            else
+                NEW_SESSION=false
+                if [[ "$SECCOMP_LEVEL" != off ]]; then
+                    NEW_SESSION_REASON="TIOCSTI is blocked by the syscall filter"
+                else
+                    NEW_SESSION_REASON="TIOCSTI is blocked by the kernel"
+                fi
+            fi
+            ;;
+    esac
+}
+
 # Writes the filter to an unlinked temporary file and leaves it open on
 # SECCOMP_FD for bwrap --seccomp
 open_seccomp_filter() {
@@ -3564,6 +3625,14 @@ while [[ $# -gt 0 ]]; do
             SECCOMP_SOURCE="--seccomp"
             shift 2
             ;;
+        --new-session)
+            NEW_SESSION=true
+            shift
+            ;;
+        --no-new-session)
+            NEW_SESSION=false
+            shift
+            ;;
         --host-port)
             validate_host_port "$2" || { echo -e "${RED}Error: invalid --host-port '$2' (expected a TCP port or range a-b)${NC}" >&2; exit 1; }
             NETWORK_HOST_PORTS+=("$2")
@@ -3812,6 +3881,7 @@ fi
 
 resolve_network_mode
 resolve_seccomp_level
+resolve_new_session
 
 # Create a default user-level config.yaml on first run: no user-level
 # configuration of either kind exists and the whitelist or blacklist was not
@@ -3940,6 +4010,10 @@ BWRAP_ARGS=(
     # Make root readonly
     --ro-bind /sys /sys
 )
+
+if [[ "$NEW_SESSION" = true ]]; then
+    BWRAP_ARGS+=(--new-session)
+fi
 
 # Setup minimal home directory using tmpfs
 BWRAP_ARGS+=(--tmpfs "$HOME")
@@ -4301,6 +4375,14 @@ case "$SECCOMP_LEVEL" in
     default) log_info "Syscall Filter: ${YELLOW}default${NC} (from $SECCOMP_SOURCE; ${SECCOMP_ARCHES[*]})" ;;
     strict) log_info "Syscall Filter: ${YELLOW}strict${NC} (no user namespaces or mounts, from $SECCOMP_SOURCE; ${SECCOMP_ARCHES[*]})" ;;
 esac
+if [[ "$NEW_SESSION" = true ]]; then
+    log_info "Terminal Session: ${YELLOW}new${NC} ($NEW_SESSION_REASON)"
+    if stdio_is_terminal; then
+        log_info "  ${YELLOW}⚠${NC} Window resizes (and Ctrl+C in programs that do not read it as input) do not reach the sandbox; --no-new-session keeps them"
+    fi
+else
+    log_info "Terminal Session: ${YELLOW}shared${NC} ($NEW_SESSION_REASON)"
+fi
 if [[ ${#GIT_LINKED_DIRS[@]} -gt 0 ]]; then
     log_info "Linked Git Directories: ${YELLOW}${GIT_LINKED_DIRS[*]}${NC}"
 fi
