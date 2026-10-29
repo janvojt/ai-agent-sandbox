@@ -7,7 +7,7 @@ A secure bubblewrap-based sandboxing solution for running AI coding agents with 
 - ✅ **Whitelist-based filesystem access** - Only explicitly allowed paths are readable
 - ✅ **Blacklist protection** - Block sensitive files within working directory
 - ✅ **Network isolation** - Internet access through user-mode networking, while the host's loopback services and private networks stay hidden (`--network host` for full access)
-- ✅ **Syscall filter** - A seccomp deny list keeps rarely needed, exploit-prone kernel interfaces (keyrings, BPF, io_uring, terminal injection, new user namespaces, mounts) away from the agent; `--seccomp default` allows namespaces again for nested sandboxes
+- ✅ **Syscall filter** - A seccomp deny list keeps rarely needed, exploit-prone kernel interfaces (keyrings, BPF, io_uring, terminal injection, new user namespaces, mounts) away from the agent; `--seccomp nested` allows namespaces again for nested sandboxes
 - ✅ **Configurable environment** - Variables from `config.yaml` or the command line, no SSH agent access
 - ✅ **Virtualenv support** - Optionally expose the active Python virtual environment
 - ✅ **Working directory isolation** - Full read-write only in current directory
@@ -126,17 +126,17 @@ The agent shares the host kernel, so every kernel bug it can reach is a way out.
 
 | Level | Refused |
 |---|---|
-| `default` | kernel keyrings (`keyctl`, `add_key`, `request_key`), `bpf`, `userfaultfd`, `perf_event_open`, module and kexec loading, NUMA page migration, `syslog`, `acct`, `quotactl`, `open_by_handle_at`, `modify_ldt`/`vm86`, `ioctl(TIOCSTI/TIOCLINUX)` (typing commands into the terminal the agent was started from) and exotic `personality` flags; `io_uring` reports "not implemented" so runtimes fall back to their normal I/O |
-| `strict` (used unless configured otherwise) | everything from `default`, plus new user namespaces (`unshare`, `setns`, `clone` with `CLONE_NEWUSER`; `clone3` reports "not implemented", glibc then uses `clone`) and every mount syscall. Closes the netfilter/nf_tables class of exploits that need namespace root, but nested sandboxes stop working: bwrap, rootless Podman, Flatpak, Claude Code's own sandbox, Chromium's sandbox (Puppeteer needs `--no-sandbox`; Playwright already passes it) and this project's integration tests. Docker through `--enable-docker` is not affected, the daemon runs on the host |
+| `nested` | kernel keyrings (`keyctl`, `add_key`, `request_key`), `bpf`, `userfaultfd`, `perf_event_open`, module and kexec loading, NUMA page migration, `syslog`, `acct`, `quotactl`, `open_by_handle_at`, `modify_ldt`/`vm86`, `ioctl(TIOCSTI/TIOCLINUX)` (typing commands into the terminal the agent was started from) and exotic `personality` flags; `io_uring` reports "not implemented" so runtimes fall back to their normal I/O |
+| `strict` (used unless configured otherwise) | everything from `nested`, plus new user namespaces (`unshare`, `setns`, `clone` with `CLONE_NEWUSER`; `clone3` reports "not implemented", glibc then uses `clone`) and every mount syscall. Closes the netfilter/nf_tables class of exploits that need namespace root, but nested sandboxes stop working: bwrap, rootless Podman, Flatpak, Claude Code's own sandbox, Chromium's sandbox (Puppeteer needs `--no-sandbox`; Playwright already passes it) and this project's integration tests. Docker through `--enable-docker` is not affected, the daemon runs on the host |
 | `off` | nothing |
 
 ```bash
 # Allow nested sandboxes (rootless Podman, bwrap) for this run
-./ai-agent-sandbox.sh --seccomp default
+./ai-agent-sandbox.sh --seccomp nested
 AI_AGENT_SANDBOX_SECCOMP=off ./ai-agent-sandbox.sh
 ```
 
-The config key is `seccomp`. A project file may only **tighten** the level: with the default `strict`, `seccomp: default` or `seccomp: off` in a repository is ignored with a warning. To use nested sandboxes in a project, set `seccomp: default` in your user-level `config.yaml`/`config.local.yaml` or pass the flag (for example in an orchestrator wrapper); the environment variable works as well. 32-bit x86 programs are filtered with their own syscall numbers; x32 and 32-bit ARM programs cannot run under the filter. Supported architectures are x86_64 and aarch64; elsewhere the default switches the filter off with a warning, an explicit level fails. `perf`, `bpftrace` and other tools that need the refused syscalls work with `--seccomp off`.
+The config key is `seccomp`. A project file may only **tighten** the level: with the default `strict`, `seccomp: nested` or `seccomp: off` in a repository is ignored with a warning. To use nested sandboxes in a project, set `seccomp: nested` in your user-level `config.yaml`/`config.local.yaml` or pass the flag (for example in an orchestrator wrapper); the environment variable works as well. 32-bit x86 programs are filtered with their own syscall numbers; x32 and 32-bit ARM programs cannot run under the filter. Supported architectures are x86_64 and aarch64; elsewhere the default switches the filter off with a warning, an explicit level fails. `perf`, `bpftrace` and other tools that need the refused syscalls work with `--seccomp off`.
 
 **Terminal input injection.** A process attached to the terminal you started the sandbox from can push keystrokes into it (`ioctl(TIOCSTI)`), which your shell would execute after the agent exits. The syscall filter refuses that ioctl, and kernels since 6.2 refuse it to unprivileged processes when `dev.tty.legacy_tiocsti` is 0. When neither applies (`--seccomp off` on such a kernel), and whenever no terminal is attached at all (orchestrators), the sandbox is started in a new session (`bwrap --new-session`) so it has no controlling terminal. In a terminal that has a price, window resizes do not reach the agent, so it is not done when the filter already covers it. `--new-session` / `--no-new-session` force the choice; the summary line `Terminal Session:` shows it.
 
@@ -400,7 +400,7 @@ See [`config-example.yaml`](config-example.yaml) for a commented example of ever
 | `profile` | string | `--profile NAME` (`default` = host configuration) |
 | `agent` | string | `--agent claudecode\|opencode` |
 | `network` | string | `--network isolated\|host\|none` (default: `isolated`, see [Network isolation](#network-isolation)) |
-| `seccomp` | string | `--seccomp strict\|default\|off` (default: `strict`, project files may only tighten it, see [Syscall filter](#syscall-filter)) |
+| `seccomp` | string | `--seccomp strict\|nested\|off` (default: `strict`, project files may only tighten it, see [Syscall filter](#syscall-filter)) |
 | `host_ports` | list | `--host-port PORT` (host loopback TCP ports or ranges `a-b` reachable at localhost inside) |
 | `allow_hosts` | list | `--allow-host ADDR` (IPs, CIDR ranges or hostnames exempt from the private-network block) |
 | `docker` | bool | `--enable-docker` / `--no-docker` |

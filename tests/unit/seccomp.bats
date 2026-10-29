@@ -64,9 +64,9 @@ assert_verdict() {
 
 # --- Levels ---------------------------------------------------------------------
 
-@test "seccomp_level_rank orders off < default < strict and rejects other values" {
+@test "seccomp_level_rank orders off < nested < strict and rejects other values" {
     assert_equal "$(seccomp_level_rank off)" 0
-    assert_equal "$(seccomp_level_rank default)" 1
+    assert_equal "$(seccomp_level_rank nested)" 1
     assert_equal "$(seccomp_level_rank strict)" 2
     run seccomp_level_rank on
     assert_failure
@@ -108,10 +108,10 @@ assert_verdict() {
     assert_output --partial "out of range"
 }
 
-# --- default level ----------------------------------------------------------------
+# --- nested level -----------------------------------------------------------------
 
-@test "default: exploit-prone syscalls are refused, ordinary ones allowed" {
-    build_seccomp_filter default "$FILTER" x86_64 i386
+@test "nested: exploit-prone syscalls are refused, ordinary ones allowed" {
+    build_seccomp_filter nested "$FILTER" x86_64 i386
     assert_verdict EPERM x86_64 250   # keyctl
     assert_verdict EPERM x86_64 321   # bpf
     assert_verdict EPERM x86_64 323   # userfaultfd
@@ -123,15 +123,15 @@ assert_verdict() {
     assert_verdict ALLOW x86_64 101   # ptrace (confined by the PID namespace)
 }
 
-@test "default: io_uring reports ENOSYS so runtimes fall back" {
-    build_seccomp_filter default "$FILTER" x86_64 i386
+@test "nested: io_uring reports ENOSYS so runtimes fall back" {
+    build_seccomp_filter nested "$FILTER" x86_64 i386
     assert_verdict ENOSYS x86_64 425
     assert_verdict ENOSYS x86_64 426
     assert_verdict ENOSYS x86_64 427
 }
 
-@test "default: TIOCSTI and TIOCLINUX are refused, other ioctls allowed" {
-    build_seccomp_filter default "$FILTER" x86_64 i386
+@test "nested: TIOCSTI and TIOCLINUX are refused, other ioctls allowed" {
+    build_seccomp_filter nested "$FILTER" x86_64 i386
     assert_verdict EPERM x86_64 16 0 0x5412
     assert_verdict EPERM x86_64 16 0 0x541c
     # the tty layer only looks at the low 32 bits of the request
@@ -140,8 +140,8 @@ assert_verdict() {
     assert_verdict ALLOW x86_64 16 0x5412 0   # the value in the fd argument
 }
 
-@test "default: only the usual personalities are allowed" {
-    build_seccomp_filter default "$FILTER" x86_64 i386
+@test "nested: only the usual personalities are allowed" {
+    build_seccomp_filter nested "$FILTER" x86_64 i386
     assert_verdict ALLOW x86_64 135 0
     assert_verdict ALLOW x86_64 135 0xffffffff
     assert_verdict ALLOW x86_64 135 0x8
@@ -149,8 +149,8 @@ assert_verdict() {
     assert_verdict EPERM x86_64 135 0x0400000   # READ_IMPLIES_EXEC
 }
 
-@test "default: user namespaces and mounts stay available (nested sandboxes)" {
-    build_seccomp_filter default "$FILTER" x86_64 i386
+@test "nested: user namespaces and mounts stay available (nested sandboxes)" {
+    build_seccomp_filter nested "$FILTER" x86_64 i386
     assert_verdict ALLOW x86_64 272                # unshare
     assert_verdict ALLOW x86_64 56 0x10000000      # clone(CLONE_NEWUSER)
     assert_verdict ALLOW x86_64 435                # clone3
@@ -158,15 +158,15 @@ assert_verdict() {
 }
 
 @test "foreign ABIs are refused: x32 numbers and unknown architectures" {
-    build_seccomp_filter default "$FILTER" x86_64 i386
+    build_seccomp_filter nested "$FILTER" x86_64 i386
     assert_verdict EPERM x86_64 $((0x40000000 + 39))
     assert_verdict EPERM 0x40000028 20             # 32-bit ARM
-    build_seccomp_filter default "$FILTER" aarch64
+    build_seccomp_filter nested "$FILTER" aarch64
     assert_verdict EPERM x86_64 39
 }
 
 @test "i386 uses its own syscall numbers" {
-    build_seccomp_filter default "$FILTER" x86_64 i386
+    build_seccomp_filter nested "$FILTER" x86_64 i386
     assert_verdict EPERM i386 288     # keyctl
     assert_verdict EPERM i386 166     # vm86
     assert_verdict ENOSYS i386 425    # io_uring_setup
@@ -176,7 +176,7 @@ assert_verdict() {
 }
 
 @test "aarch64 uses the generic syscall numbers" {
-    build_seccomp_filter default "$FILTER" aarch64
+    build_seccomp_filter nested "$FILTER" aarch64
     assert_verdict EPERM aarch64 219  # keyctl
     assert_verdict EPERM aarch64 280  # bpf
     assert_verdict EPERM aarch64 29 0 0x5412
@@ -213,7 +213,7 @@ assert_verdict() {
 
 @test "every filtered name exists in the x86_64 table, the generic table, or is ABI-specific" {
     local name
-    local -a all=("${SECCOMP_EPERM_DEFAULT[@]}" "${SECCOMP_ENOSYS_DEFAULT[@]}"
+    local -a all=("${SECCOMP_EPERM_BASE[@]}" "${SECCOMP_ENOSYS_BASE[@]}"
         "${SECCOMP_EPERM_STRICT[@]}" "${SECCOMP_ENOSYS_STRICT[@]}" ioctl personality clone)
     for name in "${all[@]}"; do
         [[ -n "${SECCOMP_NR_x86_64[$name]:-}${SECCOMP_NR_i386[$name]:-}${SECCOMP_NR_aarch64[$name]:-}" ]] \
@@ -261,14 +261,14 @@ for line in sys.stdin.read().split("\n"):
 }
 
 @test "a project file may tighten the filter" {
-    apply_config_scalar seccomp default "$DEFAULT_CONFIG_FILE" false
+    apply_config_scalar seccomp nested "$DEFAULT_CONFIG_FILE" false
     apply_config_scalar seccomp strict "$PROJECT_CONFIG_DIR/config.yaml" false
     assert_equal "$SECCOMP_LEVEL" strict
     assert_equal "$SECCOMP_SOURCE" "$PROJECT_CONFIG_DIR/config.yaml"
 }
 
 @test "a project file cannot loosen the filter" {
-    apply_config_scalar seccomp default "$PROJECT_CONFIG_DIR/config.yaml" false
+    apply_config_scalar seccomp nested "$PROJECT_CONFIG_DIR/config.yaml" false
     assert_equal "$SECCOMP_LEVEL" ""
     apply_config_scalar seccomp off "$PROJECT_CONFIG_DIR/config.yaml" false
     assert_equal "$SECCOMP_LEVEL" ""
@@ -276,7 +276,7 @@ for line in sys.stdin.read().split("\n"):
     [[ "${CONFIG_LOG_MESSAGES[*]}" == *"may only tighten"* ]] || fail "no warning: ${CONFIG_LOG_MESSAGES[*]}"
 
     apply_config_scalar seccomp strict "$DEFAULT_CONFIG_FILE" false
-    apply_config_scalar seccomp default "$PROJECT_CONFIG_DIR/config.local.yaml" false
+    apply_config_scalar seccomp nested "$PROJECT_CONFIG_DIR/config.local.yaml" false
     assert_equal "$SECCOMP_LEVEL" strict
     apply_config_scalar seccomp "" "$PROJECT_CONFIG_DIR/config.yaml" true
     assert_equal "$SECCOMP_LEVEL" strict
@@ -285,7 +285,7 @@ for line in sys.stdin.read().split("\n"):
 @test "an invalid seccomp value is fatal" {
     run apply_config_scalar seccomp on "$DEFAULT_CONFIG_FILE" false
     assert_failure
-    assert_output --partial "expected off, default or strict"
+    assert_output --partial "expected off, nested or strict"
 }
 
 # --- resolve_seccomp_level --------------------------------------------------------------
@@ -317,7 +317,7 @@ for line in sys.stdin.read().split("\n"):
 @test "open_seccomp_filter leaves no file behind" {
     export TMPDIR="$BATS_TEST_TMPDIR/tmp"
     mkdir -p "$TMPDIR"
-    SECCOMP_LEVEL=default SECCOMP_ARCHES=(x86_64 i386)
+    SECCOMP_LEVEL=nested SECCOMP_ARCHES=(x86_64 i386)
     open_seccomp_filter
     [[ -n "$SECCOMP_FD" ]]
     run ls -A "$TMPDIR"

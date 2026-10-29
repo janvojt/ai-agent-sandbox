@@ -304,10 +304,10 @@ require_seccomp_probe() {
     esac
 }
 
-@test "the default syscall filter refuses keyctl, io_uring and TIOCSTI but allows user namespaces" {
+@test "the nested syscall filter refuses keyctl, io_uring and TIOCSTI but allows user namespaces" {
     require_seccomp_probe
     run_real_sandbox "$seccomp_probe
-unshare --user true && echo userns-ok" --seccomp default
+unshare --user true && echo userns-ok" --seccomp nested
     assert_success
     assert_line "keyctl EPERM"
     assert_line "io_uring_setup ENOSYS"

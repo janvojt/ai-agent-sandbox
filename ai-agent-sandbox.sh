@@ -145,9 +145,10 @@ NETWORK_BLOCKED_V6=(fc00::/7 fe80::/10)
 # Route metrics: an allow route must beat a block route of the same prefix
 NETWORK_ALLOW_METRIC=10
 NETWORK_BLOCK_METRIC=100
-# Syscall filter (see build_seccomp_filter): off, default (rarely needed,
-# exploit-prone syscalls) or strict (also user namespaces and mounts). Nested
-# sandboxes need "default", which a user-level file or the flag can select.
+# Syscall filter (see build_seccomp_filter): off, nested (rarely needed,
+# exploit-prone syscalls, but user namespaces and mounts stay allowed for
+# nested sandboxes) or strict (also user namespaces and mounts, the default).
+# "nested" can be selected by a user-level file, the variable or the flag.
 SECCOMP_LEVEL=""
 SECCOMP_SOURCE="default"
 SECCOMP_LEVEL_DEFAULT="strict"
@@ -236,7 +237,7 @@ OPTIONS:
                             blocked as a private network (isolated mode, repeatable)
     --seccomp LEVEL         Syscall filter: strict (default: blocks rarely needed,
                             exploit-prone syscalls such as keyctl, bpf, io_uring and
-                            TIOCSTI, plus new user namespaces and mounts), default (the
+                            TIOCSTI, plus new user namespaces and mounts), nested (the
                             same without the namespace/mount block, for nested
                             sandboxes) or off; project files may only tighten it
     --new-session           Always detach the sandbox from the terminal (setsid), so it
@@ -325,7 +326,7 @@ EXAMPLES:
     $0 --venv
     $0 --gpg-agent
     $0 --network host
-    $0 --seccomp default
+    $0 --seccomp nested
     $0 --host-port 5432 --allow-host 192.168.1.50
     $0 -- --model claude-sonnet-4-5
     $0 -a opencode -- run -m deepseek/deepseek-chat "Explain this repository"
@@ -359,7 +360,7 @@ validate_network_mode() {
 seccomp_level_rank() {
     case "$1" in
         off) echo 0 ;;
-        default) echo 1 ;;
+        nested) echo 1 ;;
         strict) echo 2 ;;
         *) return 1 ;;
     esac
@@ -547,7 +548,7 @@ apply_config_scalar() {
             ;;
         seccomp)
             if [[ "$is_null" != true ]]; then
-                seccomp_level_rank "$value" >/dev/null || config_error "Invalid value for 'seccomp' in $file: '$value' (expected off, default or strict)"
+                seccomp_level_rank "$value" >/dev/null || config_error "Invalid value for 'seccomp' in $file: '$value' (expected off, nested or strict)"
             fi
             # Unlike the network mode, the filter protects the host kernel: a
             # repository may tighten it but not loosen it
@@ -2753,7 +2754,7 @@ filter_host_environment() {
 # is no allow-list. Syscalls of a foreign ABI (x32, 32-bit ARM) are refused as a
 # whole because their numbers differ; i386 has its own table.
 #
-# default (the level's name, the script's default is strict): kernel keyrings, BPF, userfaultfd, perf, module/kexec loading, NUMA
+# nested: kernel keyrings, BPF, userfaultfd, perf, module/kexec loading, NUMA
 #   page migration, TIOCSTI/TIOCLINUX (typing into the terminal the agent was
 #   started from), exotic personalities; io_uring gets ENOSYS so runtimes fall
 #   back to epoll/threads
@@ -2806,11 +2807,11 @@ declare -gA SECCOMP_NR_aarch64=(
     [fspick]=433 [mount_setattr]=442 [open_tree_attr]=467
 )
 # Names missing from an ABI's table do not exist there and are skipped
-SECCOMP_EPERM_DEFAULT=(syslog uselib acct quotactl quotactl_fd add_key keyctl
+SECCOMP_EPERM_BASE=(syslog uselib acct quotactl quotactl_fd add_key keyctl
     request_key bpf userfaultfd perf_event_open kexec_load kexec_file_load
     init_module finit_module delete_module open_by_handle_at modify_ldt vm86
     vm86old move_pages mbind migrate_pages set_mempolicy set_mempolicy_home_node)
-SECCOMP_ENOSYS_DEFAULT=(io_uring_setup io_uring_enter io_uring_register)
+SECCOMP_ENOSYS_BASE=(io_uring_setup io_uring_enter io_uring_register)
 SECCOMP_EPERM_STRICT=(unshare setns mount umount umount2 pivot_root chroot
     open_tree open_tree_attr move_mount fsopen fsconfig fsmount fspick mount_setattr)
 SECCOMP_ENOSYS_STRICT=(clone3)
@@ -2875,12 +2876,12 @@ seccomp_asm_write() {
     printf "$fmt" > "$file"
 }
 
-# Usage: build_seccomp_filter <default|strict> <file> <abi...>
+# Usage: build_seccomp_filter <nested|strict> <file> <abi...>
 # Writes the BPF program for the given ABIs (the first is the native one).
 build_seccomp_filter() {
     local level="$1" file="$2" abi name value
     shift 2
-    local -a eperm=("${SECCOMP_EPERM_DEFAULT[@]}") enosys=("${SECCOMP_ENOSYS_DEFAULT[@]}")
+    local -a eperm=("${SECCOMP_EPERM_BASE[@]}") enosys=("${SECCOMP_ENOSYS_BASE[@]}")
     if [[ "$level" = strict ]]; then
         eperm+=("${SECCOMP_EPERM_STRICT[@]}")
         enosys+=("${SECCOMP_ENOSYS_STRICT[@]}")
@@ -4365,7 +4366,7 @@ if [[ -n "${AI_AGENT_SANDBOX_NETWORK:-}" ]]; then
 fi
 
 if [[ -n "${AI_AGENT_SANDBOX_SECCOMP:-}" ]]; then
-    seccomp_level_rank "$AI_AGENT_SANDBOX_SECCOMP" >/dev/null || { echo -e "${RED}Error: invalid AI_AGENT_SANDBOX_SECCOMP '$AI_AGENT_SANDBOX_SECCOMP' (expected off, default or strict)${NC}" >&2; exit 1; }
+    seccomp_level_rank "$AI_AGENT_SANDBOX_SECCOMP" >/dev/null || { echo -e "${RED}Error: invalid AI_AGENT_SANDBOX_SECCOMP '$AI_AGENT_SANDBOX_SECCOMP' (expected off, nested or strict)${NC}" >&2; exit 1; }
     SECCOMP_LEVEL="$AI_AGENT_SANDBOX_SECCOMP"
     SECCOMP_SOURCE="AI_AGENT_SANDBOX_SECCOMP"
 fi
@@ -4483,7 +4484,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --seccomp)
-            seccomp_level_rank "${2:-}" >/dev/null || { echo -e "${RED}Error: invalid --seccomp level '${2:-}' (expected off, default or strict)${NC}" >&2; exit 1; }
+            seccomp_level_rank "${2:-}" >/dev/null || { echo -e "${RED}Error: invalid --seccomp level '${2:-}' (expected off, nested or strict)${NC}" >&2; exit 1; }
             SECCOMP_LEVEL="$2"
             SECCOMP_SOURCE="--seccomp"
             shift 2
@@ -5235,7 +5236,7 @@ case "$NETWORK_MODE" in
 esac
 case "$SECCOMP_LEVEL" in
     off) log_info "Syscall Filter: ${YELLOW}off${NC} (from $SECCOMP_SOURCE)" ;;
-    default) log_info "Syscall Filter: ${YELLOW}default${NC} (from $SECCOMP_SOURCE; ${SECCOMP_ARCHES[*]})" ;;
+    nested) log_info "Syscall Filter: ${YELLOW}nested${NC} (user namespaces and mounts allowed, from $SECCOMP_SOURCE; ${SECCOMP_ARCHES[*]})" ;;
     strict) log_info "Syscall Filter: ${YELLOW}strict${NC} (no user namespaces or mounts, from $SECCOMP_SOURCE; ${SECCOMP_ARCHES[*]})" ;;
 esac
 if [[ "$NEW_SESSION" = true ]]; then

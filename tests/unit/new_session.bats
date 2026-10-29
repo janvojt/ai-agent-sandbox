@@ -29,7 +29,7 @@ with_terminal() {
 @test "in a terminal the session is shared while the syscall filter blocks TIOCSTI" {
     with_terminal true
     echo 1 > "$LEGACY_TIOCSTI_SYSCTL"
-    SECCOMP_LEVEL=default
+    SECCOMP_LEVEL=nested
     resolve_new_session
     assert_equal "$NEW_SESSION" false
     assert_equal "$NEW_SESSION_REASON" "TIOCSTI is blocked by the syscall filter"

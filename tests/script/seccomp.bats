@@ -61,7 +61,7 @@ exit 0"
     mkdir -p "$PROJECT_DIR"
     printf 'seccomp: strict\n' > "$PROJECT_DIR/config.yaml"
     AI_AGENT_SANDBOX_CONFIG="$BATS_TEST_TMPDIR/user.yaml"
-    printf 'seccomp: default\nwhitelist:\n  - /usr\n' > "$AI_AGENT_SANDBOX_CONFIG"
+    printf 'seccomp: nested\nwhitelist:\n  - /usr\n' > "$AI_AGENT_SANDBOX_CONFIG"
     export AI_AGENT_SANDBOX_CONFIG
     run_sandbox --dry-run
     assert_success
@@ -70,7 +70,7 @@ exit 0"
 
 @test "a project file cannot loosen the filter" {
     mkdir -p "$PROJECT_DIR"
-    printf 'seccomp: default\n' > "$PROJECT_DIR/config.yaml"
+    printf 'seccomp: nested\n' > "$PROJECT_DIR/config.yaml"
     run_sandbox --dry-run
     assert_success
     assert_output --partial "project files may only tighten the syscall filter"
@@ -94,4 +94,14 @@ exit 0"
     AI_AGENT_SANDBOX_SECCOMP=yes run_sandbox --dry-run
     assert_failure
     assert_output --partial "invalid AI_AGENT_SANDBOX_SECCOMP 'yes'"
+}
+
+@test "--seccomp nested allows nested sandboxes and is named in the summary" {
+    run_sandbox --dry-run --seccomp nested
+    assert_success
+    assert_output --partial "Syscall Filter: nested (user namespaces and mounts allowed, from --seccomp;"
+    assert_args_contain BWRAP_RECORDED --seccomp
+    run_sandbox --dry-run --seccomp default
+    assert_failure
+    assert_output --partial "expected off, nested or strict"
 }

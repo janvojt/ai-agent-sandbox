@@ -39,11 +39,11 @@ profile: work
 # --network, environment variable: AI_AGENT_SANDBOX_NETWORK.
 # network: isolated
 
-# Syscall filter: strict (default), default or off. "default" refuses rarely
+# Syscall filter: strict (default), nested or off. "nested" refuses rarely
 # needed, exploit-prone syscalls (keyrings, bpf, io_uring, userfaultfd, perf,
 # module loading, TIOCSTI); "strict" also new user namespaces and mounts, so
 # nested sandboxes (bwrap, rootless Podman, Chromium's sandbox) do not work.
-# Project files may only tighten the level, so set "default" here in the
+# Project files may only tighten the level, so set "nested" here in the
 # user-level file when you need nested sandboxes. Equivalent flag: --seccomp,
 # environment variable: AI_AGENT_SANDBOX_SECCOMP.
 # seccomp: strict
