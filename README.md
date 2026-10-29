@@ -286,9 +286,25 @@ T3's own OpenCode provider cannot be sandboxed: it starts a single shared `openc
 
 ```sh
 #!/bin/sh
-# /home/you/.local/bin/opencode-acp-sandboxed  (chmod +x)
+# /home/you/.local/bin/opencode-acp-sandboxed  (chmod +x; needs jq on the host)
+
+# Hand T3's MCP server (its tools for the agent) to OpenCode
+if [ -n "${T3_ACP_MCP_ENDPOINT:-}" ] &&
+   [ -n "${T3_ACP_MCP_AUTHORIZATION:-}" ]; then
+    OPENCODE_CONFIG_CONTENT=$(jq -nc \
+        --arg url "$T3_ACP_MCP_ENDPOINT" \
+        --arg auth "$T3_ACP_MCP_AUTHORIZATION" \
+        '{mcp: {servers: {t3: {type: "remote", url: $url, enabled: true, oauth: false,
+                     headers: {Authorization: $auth}}}}}')
+    export OPENCODE_CONFIG_CONTENT
+fi
+
 exec /home/you/ai-agent-sandbox/ai-agent-sandbox.sh --agent opencode --quiet --host-port 3773 -- acp "$@"
 ```
+
+T3 passes the address and token of its MCP server to an ACP agent in `T3_ACP_MCP_ENDPOINT` and `T3_ACP_MCP_AUTHORIZATION`, but OpenCode does not read them, and the sandbox does not pass them through (see [Environment Variables](#environment-variables)). The wrapper therefore builds the OpenCode configuration on the host, with the values filled in, and hands it over in `OPENCODE_CONFIG_CONTENT`, which does reach the sandbox. Do not use OpenCode's `{env:T3_ACP_MCP_...}` substitution instead: it is resolved inside the sandbox, where the variables are empty. The token only lives in the environment of the launched process; nothing is written to your OpenCode configuration. `--host-port 3773` makes T3's port reachable from the isolated sandbox network (use the port of your T3 server if you changed it). OpenCode 2 expects servers under `mcp.servers`. To check the wrapper: `T3_ACP_MCP_ENDPOINT=http://127.0.0.1:3773/mcp T3_ACP_MCP_AUTHORIZATION="Bearer test" /home/you/.local/bin/opencode-acp-sandboxed debug config` should show a `t3` entry under `mcp.servers`.
+
+Keep `acp` the first argument after `--`: the sandbox only accepts T3's health check in your home directory (see below) for exactly that form, anything before it (such as `--print-logs`) makes it refuse with "the working directory … is your home directory". Put extra OpenCode flags after `acp`.
 
 Then, in T3 Code:
 
@@ -300,6 +316,7 @@ Good to know:
 
 - T3 runs its health check (initialize, sign-in state, models) by starting the wrapper in its own working directory, usually your home directory. There is no project there, so the sandbox mounts no working directory at all: the agent only gets its private home and the profile's OpenCode configuration (the summary shows `not mounted: ACP agent without a project`). Relative whitelist entries are skipped and Docker is off in that case. That check runs under the profile without a pin (your host configuration by default), so T3's sign-in state and model list are those of that profile.
 - Every new thread starts a sandbox and a fresh OpenCode server, which takes a few seconds. T3 resumes a thread by asking the new process to load its session, which OpenCode keeps in the profile's database.
+- After changing the wrapper, disable and re-enable (or reconnect) the ACP provider in T3 and start a new thread; running threads keep the process they were started with.
 - T3's generic ACP integration does not have every feature of its native OpenCode provider (for example OpenCode Go usage limits).
 - Logging, worktrees, the project configuration and stopping behave as for Claude above.
 
