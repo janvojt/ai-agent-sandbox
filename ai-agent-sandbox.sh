@@ -2728,6 +2728,16 @@ hidden_host_env_names() {
     done < <(compgen -e)
 }
 
+# Prints the names of the exported variables the sandbox gets
+passed_host_env_names() {
+    local name
+    while IFS= read -r name; do
+        if host_env_allowed "$name"; then
+            printf '%s\n' "$name"
+        fi
+    done < <(compgen -e)
+}
+
 # Unsets every exported variable that is not allowed, and every exported
 # function (BASH_FUNC_<name>%% in the environment: code a bash inside would
 # import). Run in the subshell that executes bwrap.
@@ -5282,10 +5292,10 @@ if [[ ${#LEGACY_FILES_IN_USE[@]} -gt 0 ]]; then
     done
 fi
 log_info "Direct Environment Variables: ${YELLOW}${#ENV_VARS[@]}${NC}"
+mapfile -t PASSED_HOST_ENV < <(passed_host_env_names)
+log_info "Passed Host Environment Variables (${#PASSED_HOST_ENV[@]}): ${YELLOW}${PASSED_HOST_ENV[*]}${NC}"
 mapfile -t HIDDEN_HOST_ENV < <(hidden_host_env_names)
-if [[ ${#HIDDEN_HOST_ENV[@]} -gt 0 ]]; then
-    log_info "Hidden Host Environment Variables (${#HIDDEN_HOST_ENV[@]}): ${YELLOW}${HIDDEN_HOST_ENV[*]}${NC}"
-fi
+log_info "Hidden Host Environment Variables: ${YELLOW}${#HIDDEN_HOST_ENV[@]}${NC}"
 log_info "${GREEN}=============================================${NC}\n"
 
 # Start socket proxy if Docker is enabled

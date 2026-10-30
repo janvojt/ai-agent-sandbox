@@ -43,7 +43,7 @@ setup() {
     assert_args_contain BWRAP_RECORDED --ro-bind /sys/devices /sys/devices
 }
 
-@test "only allowed host variables reach bwrap and the hidden ones are named" {
+@test "only allowed host variables reach bwrap and only the passed ones are named" {
     export GITHUB_TOKEN=secret-value ANTHROPIC_API_KEY=key DISPLAY=:0 LC_ALL=C
     run_sandbox --dry-run
     assert_success
@@ -53,7 +53,10 @@ setup() {
     assert_line ANTHROPIC_API_KEY=key
     assert_line LC_ALL=C
     run_sandbox --dry-run
-    assert_output --regexp "Hidden Host Environment Variables \([0-9]+\): .*GITHUB_TOKEN"
+    assert_output --regexp "Hidden Host Environment Variables: [1-9][0-9]*"
+    refute_output --partial GITHUB_TOKEN
+    assert_output --regexp "Passed Host Environment Variables \([0-9]+\): .*ANTHROPIC_API_KEY"
+    refute_output --partial "=key"
     refute_output --partial secret-value
     # values must not end up on the bwrap command line either
     refute_args_contain BWRAP_RECORDED key
