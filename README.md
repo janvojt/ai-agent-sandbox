@@ -156,6 +156,10 @@ A git worktree (`git worktree add ../feature`) has a `.git` *file* that points i
 
 The `.git` file is writable by the agent, so it is not trusted on its own: the link is followed only when the target is a `<repo>/.git/worktrees/<name>` directory whose `gitdir` back-link (written by git) points at this working tree's `.git` file and whose `commondir` matches. An agent that rewrites `.git` or `commondir` to name some other directory gets a warning on the next start, not a mount. Checkouts with a separate git dir (`--separate-git-dir`) and submodules have no such back-link and are not followed; add their git dir with `--whitelist-path-rw` or the `whitelist:` key of your user config instead. If a worktree was moved, `git worktree repair` fixes the back-link.
 
+The other worktrees of the repository are not mounted: a sandbox of the main checkout does not see T3 Code's worktrees under `~/.t3/worktrees` (the home directory is a tmpfs), and one worktree does not see another. To git inside the sandbox they would look deleted, and `git worktree prune` (by hand, by an agent cleaning up, or through `git gc`) would delete their `HEAD`, `index`, `logs/` and `refs/` from the shared `.git`, breaking those checkouts on the host. The sandbox therefore puts an empty `.git` directory at the path of every worktree checkout that exists on the host but is hidden inside (listed as `Other Git Worktrees` in the summary); git only checks that the path exists and keeps the worktree. Worktrees whose checkout is really gone stay prunable, inside the sandbox as on the host. A worktree created inside the sandbox in a directory that is not mounted from the host (`~/.cache/...`, `/tmp/...`) disappears with the sandbox; create worktrees in the working directory or in a read-write whitelisted directory if they must outlive the session.
+
+Tools based on JGit (for example `buildnumber-maven-plugin` and other Maven SCM plugins, which use JGit 5.13) cannot open linked worktrees at all and fail with `repository not found: <repo>/.git/worktrees/<name>`; this happens on the host as well. For the build number plugin, `-Dmaven.buildNumber.revisionOnScmFailure=<value>` (or skipping it with `-Dmaven.buildNumber.skip=true`) works around it.
+
 ### GPG commit signing:
 
 To sign commits inside the sandbox without exposing your private keys, forward the host `gpg-agent`:
@@ -239,7 +243,7 @@ With `--agent opencode` the arguments go to the `opencode` binary in the same wa
   --whitelist-path-rw ~/.gradle/caches
 ```
 
-Docker access goes through two layers started for each run. The sandbox only sees `.docker-proxy/docker.sock` in the working directory (mode 0600). The script serves that socket from a **Docker API filter** on the host, which forwards to a socket proxy container ([wollomatic/socket-proxy](https://github.com/wollomatic/socket-proxy)) holding the real Docker socket. Access to the Docker daemon is root on the host, so the filter refuses everything that would give a container access to the host:
+Docker access goes through two layers started for each run. The sandbox only sees `.docker-proxy/docker-<pid>.sock` in the working directory (mode 0600, `DOCKER_HOST` points at it; one socket per run, so several sandboxes can use the same directory at once). The script serves that socket from a **Docker API filter** on the host, which forwards to a socket proxy container ([wollomatic/socket-proxy](https://github.com/wollomatic/socket-proxy)) holding the real Docker socket. Access to the Docker daemon is root on the host, so the filter refuses everything that would give a container access to the host:
 
 - privileged containers, host PID/IPC/network/UTS/user/cgroup namespaces, added capabilities other than those acting only inside the container (`NET_ADMIN`, `SYS_PTRACE`, `IPC_LOCK`, `SYS_NICE`, …), devices and GPU requests, `seccomp`/`apparmor`/`systempaths=unconfined` and `label=disable`, other runtimes and cgroup parents;
 - privileged `docker exec`;
@@ -550,6 +554,7 @@ blacklist:
   - **Ant-style recursive**: `**` for recursive matching (e.g., `**/wallet.dat` matches `wallet.dat` anywhere in the working directory tree)
 - Trailing `/` is accepted and normalized (for example, `secret-data/` behaves like `secret-data`)
 - Patterns from all config files are merged
+- Files tracked by git that the blacklist hides show up as deleted in `git status` inside the sandbox, and `git add -A` or `git commit -a` would commit their deletion. The startup summary lists them as `Tracked Files Hidden by Blacklist`; commit with explicit paths in such projects. (Marking them `--skip-worktree` is no fix: the index is shared with the host, where the flag would hide your own changes to those files.)
 
 ### Symlink behavior
 

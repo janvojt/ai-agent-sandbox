@@ -168,6 +168,28 @@ git config core.fsmonitor 'touch pwned' || echo config-ro"
     assert_success
 }
 
+@test "git worktree prune inside the sandbox keeps worktrees it cannot see and removes gone ones" {
+    command -v git >/dev/null || skip "git is not installed"
+    git init -q .
+    git -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+    # outside the working directory, so not visible inside (like T3 Code's
+    # ~/.t3/worktrees/... in a sandbox of the main checkout)
+    git worktree add -q "$BATS_TEST_TMPDIR/other" -b other
+    git worktree add -q "$BATS_TEST_TMPDIR/gone" -b gone
+    rm -rf "$BATS_TEST_TMPDIR/gone"
+    run_real_sandbox 'git worktree prune -v 2>&1; git gc --auto 2>&1; git worktree list'
+    assert_output --partial "Removing worktrees/gone"
+    refute_output --partial "worktrees/other"
+    refute_output --partial "busy"
+    refute_output --partial prunable
+    assert_not_exist .git/worktrees/gone
+    assert_file_exists .git/worktrees/other/HEAD
+    assert_file_exists .git/worktrees/other/index
+    run git -C "$BATS_TEST_TMPDIR/other" status -sb
+    assert_success
+    assert_output --partial "## other"
+}
+
 @test "a forged .git link does not expose the target directory" {
     mkdir -p "$BATS_TEST_TMPDIR/private"
     printf 'secret\n' > "$BATS_TEST_TMPDIR/private/data"

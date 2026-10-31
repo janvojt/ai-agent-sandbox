@@ -56,6 +56,9 @@ PROTECT_GIT_CONFIG=true
 PROTECTED_GIT_DIRS=()
 # Host paths mounted read-only by protect_sandbox_config (refused by the Docker proxy)
 PROTECTED_CONFIG_SOURCES=()
+# Checkouts of other worktrees that exist on the host but not in the sandbox,
+# represented by an empty .git directory (see keep_hidden_worktrees_registered)
+HIDDEN_WORKTREE_CHECKOUTS=()
 # Deprecated whitelist.txt / blacklist.txt / .env files still in use
 WHITELIST_FILES=()
 BLACKLIST_FILES=()
@@ -94,6 +97,10 @@ HOST_ENV_ALLOWED=(
 HOST_ENV_ALLOWED_PREFIXES=(LC_ ANTHROPIC_ CLAUDE_ OPENCODE_ T3CODE_ VERTEX_REGION_ DISABLE_PROMPT_CACHING)
 declare -A SANDBOX_ENV=()
 BLACKLISTED_DIRS=()
+# Every path hidden by the blacklist, and the git-tracked files among them in
+# the working directory (see find_tracked_hidden_files)
+BLACKLIST_HIDDEN_PATHS=()
+TRACKED_HIDDEN_FILES=()
 BLACKLIST_SEARCH_ROOTS=()
 WHITELIST_OVERRIDE_ARGS=()
 EXPLICIT_WHITELIST=false
@@ -2294,10 +2301,31 @@ remove_stale_socket_proxies() {
     return 0
 }
 
+# The filter's socket in the working directory, one per run: several sandboxes
+# can run in the same directory at once (T3 Code starts more than one Claude
+# process per worktree), and one run's cleanup must not remove the socket of
+# another one that is still running
+docker_proxy_socket_path() {
+    echo "$WORKING_DIR/.docker-proxy/docker-$$.sock"
+}
+
+# Sockets of earlier runs in .docker-proxy whose script is gone
+remove_stale_proxy_sockets() {
+    local socket pid
+    for socket in "$PROXY_SOCKET_DIR"/docker-*.sock; do
+        [[ -S "$socket" ]] || continue
+        pid="${socket##*/docker-}"
+        pid="${pid%.sock}"
+        [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
+        kill -0 "$pid" 2>/dev/null || rm -f "$socket"
+    done
+    return 0
+}
+
 start_socket_proxy() {
     PROXY_CONTAINER_NAME="ai-agent-sandbox-proxy-$$"
-    PROXY_SOCKET_DIR="$WORKING_DIR/.docker-proxy"
-    PROXY_SOCKET_PATH="$PROXY_SOCKET_DIR/docker.sock"
+    PROXY_SOCKET_PATH="$(docker_proxy_socket_path)"
+    PROXY_SOCKET_DIR="${PROXY_SOCKET_PATH%/*}"
     local upstream_dir upstream_socket filter_program
     local docker_group_gid=""
     local proxy_group_args=()
@@ -2320,6 +2348,7 @@ start_socket_proxy() {
     # daemons), which nobody else can reach through the 0700 parent.
     mkdir -p "$PROXY_SOCKET_DIR"
     chmod 0700 "$PROXY_SOCKET_DIR" 2>/dev/null || true
+    remove_stale_proxy_sockets
     rm -f "$PROXY_SOCKET_PATH"
     DOCKER_PRIVATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ai-agent-sandbox-docker.XXXXXX")" || exit 1
     upstream_dir="$DOCKER_PRIVATE_DIR/upstream"
@@ -3354,6 +3383,42 @@ parse_whitelist_override() {
     echo "$override" "$line"
 }
 
+# Sets TRACKED_HIDDEN_FILES to the files tracked by git in the working
+# directory that the blacklist hides. Inside the sandbox git status reports
+# them as deleted, so git add -A or git commit -a would commit their deletion.
+# Marking them skip-worktree is no way out: the index is shared with the host,
+# where the flag would hide later changes and keep checkouts from updating them.
+find_tracked_hidden_files() {
+    TRACKED_HIDDEN_FILES=()
+    [[ "$NO_PROJECT_WORKDIR" != true && -e "$WORKING_DIR/.git" ]] || return 0
+    command -v git >/dev/null 2>&1 || return 0
+    local -a rel_paths=()
+    local path
+    for path in "${BLACKLIST_HIDDEN_PATHS[@]}"; do
+        [[ "$path" == "$WORKING_DIR/"* ]] && rel_paths+=("${path#"$WORKING_DIR/"}")
+    done
+    [[ ${#rel_paths[@]} -gt 0 ]] || return 0
+    # Reads the index only: no fsmonitor, hooks or filters run
+    local -a tracked=()
+    mapfile -d '' -t tracked < <(GIT_LITERAL_PATHSPECS=1 \
+        git -C "$WORKING_DIR" -c core.fsmonitor=false ls-files -z -- "${rel_paths[@]}" 2>/dev/null)
+    # Files a ! override brings back are visible again
+    local file i dest visible
+    for file in "${tracked[@]}"; do
+        visible=false
+        for ((i = 0; i < ${#WHITELIST_OVERRIDE_ARGS[@]}; i++)); do
+            [[ "${WHITELIST_OVERRIDE_ARGS[i]}" == --bind || "${WHITELIST_OVERRIDE_ARGS[i]}" == --ro-bind ]] || continue
+            dest="${WHITELIST_OVERRIDE_ARGS[i+2]}"
+            if path_is_within "$WORKING_DIR/$file" "$dest"; then
+                visible=true
+                break
+            fi
+        done
+        [[ "$visible" = true ]] || TRACKED_HIDDEN_FILES+=("$file")
+    done
+    return 0
+}
+
 is_covered_by_blacklisted_dir() {
     local path="$1"
     local blocked_dir
@@ -3594,9 +3659,11 @@ blacklist_pattern() {
                             if [[ -d "$target" ]]; then
                                 BWRAP_ARGS+=(--tmpfs "$target")
                                 remember_blacklisted_dir "$target"
+                                BLACKLIST_HIDDEN_PATHS+=("$target")
                                 log_info "${RED}✗${NC} Blacklisted (symlink->dir target): ${match_display} -> ${target_display}"
                             else
                                 BWRAP_ARGS+=(--ro-bind /dev/null "$target")
+                                BLACKLIST_HIDDEN_PATHS+=("$target")
                                 log_info "${RED}✗${NC} Blacklisted (symlink->file target): ${match_display} -> ${target_display}"
                             fi
                         else
@@ -3615,6 +3682,7 @@ blacklist_pattern() {
                     # Hide directories with tmpfs overlay
                     BWRAP_ARGS+=(--tmpfs "$match")
                     remember_blacklisted_dir "$match"
+                    BLACKLIST_HIDDEN_PATHS+=("$match")
                     log_info "${RED}✗${NC} Blacklisted (dir): $(display_path "$match")"
                 else
                     if is_covered_by_blacklisted_dir "$match"; then
@@ -3625,6 +3693,7 @@ blacklist_pattern() {
 
                     # Hide files by binding /dev/null over them
                     BWRAP_ARGS+=(--ro-bind /dev/null "$match")
+                    BLACKLIST_HIDDEN_PATHS+=("$match")
                     log_info "${RED}✗${NC} Blacklisted (file): $(display_path "$match")"
                 fi
                 ((match_count++)) || true
@@ -3771,14 +3840,19 @@ protect_git_dir() {
     protect_git_file "$src/hooks" "$dest/hooks" false
     protect_git_file "$src/config.worktree" "$dest/config.worktree" "$worktree_config"
     # Per-worktree directories of linked worktrees: commondir and gitdir decide
-    # which repository (and therefore which hooks and config) git uses there
+    # which repository (and therefore which hooks and config) git uses there.
+    # A worktree whose checkout is gone on the host is left alone: git prunes
+    # it on the host anyway, and inside the sandbox git worktree prune stops at
+    # the first mount point it cannot unlink, leaving a half-deleted directory.
     for wt in "$src"/worktrees/*; do
         [[ -d "$wt" && ! -L "$wt" ]] || continue
+        worktree_checkout_exists "$wt" || continue
         pg_target+=(--bind "$wt" "$dest${wt#"$src"}")
         protect_git_file "$wt/commondir" "$dest${wt#"$src"}/commondir" false
         protect_git_file "$wt/gitdir" "$dest${wt#"$src"}/gitdir" false
         protect_git_file "$wt/config.worktree" "$dest${wt#"$src"}/config.worktree" "$worktree_config"
     done
+    keep_hidden_worktrees_registered "$src" "$target_name" "$seen_name"
     # Submodule repositories (nested ones included)
     if [[ -d "$src/modules" ]]; then
         while IFS= read -r module; do
@@ -3788,6 +3862,56 @@ protect_git_dir() {
         done < <(find "$src/modules" \( -name objects -o -name refs -o -name logs \) -prune -o -name HEAD -print 2>/dev/null)
     fi
     log_info "${GREEN}✓${NC} Protected git directory $(display_path "$dest") (hooks and configuration read-only)"
+}
+
+# Usage: worktree_checkout_git_file <per-worktree-dir>
+# Print the checkout's .git file named by <dir>/gitdir (relative to <dir>
+# with worktree.useRelativePaths), normalised without resolving symlinks the
+# way git reads it. Fails when the gitdir file is missing or empty.
+worktree_checkout_git_file() {
+    local wt="$1" line target
+    [[ -f "$wt/gitdir" ]] || return 1
+    IFS= read -r line < "$wt/gitdir" || true
+    line="$(trim_whitespace "$line")"
+    [[ -n "$line" ]] || return 1
+    target="$line"
+    [[ "$target" = /* ]] || target="$wt/$target"
+    realpath -m -s -- "$target"
+}
+
+# Usage: worktree_checkout_exists <per-worktree-dir>
+worktree_checkout_exists() {
+    local checkout_git
+    checkout_git="$(worktree_checkout_git_file "$1")" || return 1
+    [[ -e "$checkout_git" || -L "$checkout_git" ]]
+}
+
+# Usage: keep_hidden_worktrees_registered <git-dir> <target-array-name> <seen-assoc-name>
+# git worktree prune (run by hand, by an agent, or by git gc) deletes the
+# per-worktree directory (HEAD, index, logs, refs) of every worktree whose
+# checkout it cannot see. Inside the sandbox that is every other worktree of
+# the repository: the main checkout cannot see T3 Code's ~/.t3/worktrees/...
+# (tmpfs home), and one worktree cannot see another. An empty .git directory
+# at the checkout's path is enough for git to keep the worktree (it only
+# checks that the path exists) and exposes nothing from the host; it is no
+# repository itself (git commands run in it look further up).
+keep_hidden_worktrees_registered() {
+    local src="$1"
+    local -n kw_target="$2"
+    local -n kw_seen="$3"
+    local wt checkout_git
+    for wt in "$src"/worktrees/*; do
+        [[ -d "$wt" && ! -L "$wt" ]] || continue
+        checkout_git="$(worktree_checkout_git_file "$wt")" || continue
+        [[ -e "$checkout_git" || -L "$checkout_git" ]] || continue
+        [[ -z "${kw_seen["worktree:$checkout_git"]:-}" ]] || continue
+        kw_seen["worktree:$checkout_git"]=1
+        # Visible through a mount (bwrap could not create directories in a
+        # read-only one); otherwise below the sandbox's own tmpfs directories
+        is_path_bound "$checkout_git" && continue
+        kw_target+=(--dir "$checkout_git")
+        HIDDEN_WORKTREE_CHECKOUTS+=("${checkout_git%/.git}")
+    done
 }
 
 # Usage: protect_git_file <source> <destination> <create-if-missing>
@@ -3863,9 +3987,10 @@ create_missing_project_config_dirs() {
 
 # Usage: protect_sandbox_config <scan-array-name> [target-array-name]
 # Mount every sandbox configuration path inside a read-write --bind of the scan
-# array read-only (appended to the target array, default BWRAP_ARGS)
+# array read-only (appended to the target array, default BWRAP_ARGS), and keep
+# the hidden worktrees of the git directories found there registered (also
+# with both protections off)
 protect_sandbox_config() {
-    [[ "$PROTECT_PROJECT_CONFIG" = true || "$PROTECT_GIT_CONFIG" = true ]] || return 0
     local -n protect_scan="$1"
     local target_name="${2:-BWRAP_ARGS}"
     local -a user_paths=()
@@ -3889,8 +4014,8 @@ protect_sandbox_config() {
         dest="${binds[i+1]}"
         # A bound git directory itself (a linked worktree's common dir, a
         # whitelisted bare repository); one named .git is found below
-        if [[ "$PROTECT_GIT_CONFIG" = true && "${src##*/}" != .git ]] && is_git_dir "$src"; then
-            protect_git_dir "$src" "$dest" "$target_name" seen
+        if [[ "${src##*/}" != .git ]] && is_git_dir "$src"; then
+            protect_or_keep_git_dir "$src" "$dest" "$target_name" seen
         fi
         while IFS= read -r path; do
             case "${path##*/}" in
@@ -3902,6 +4027,8 @@ protect_sandbox_config() {
                 .git)
                     if [[ "$PROTECT_GIT_CONFIG" = true ]]; then
                         protect_git_entry "$path" "$dest${path#"$src"}" "$target_name" seen
+                    elif [[ -d "$path" && ! -L "$path" ]]; then
+                        protect_or_keep_git_dir "$path" "$dest${path#"$src"}" "$target_name" seen
                     fi
                     ;;
             esac
@@ -3912,6 +4039,17 @@ protect_sandbox_config() {
             fi
         done
     done
+}
+
+# Usage: protect_or_keep_git_dir <source> <destination> <target-array-name> <seen-assoc-name>
+# A git directory in a read-write bind: protected (which keeps its hidden
+# worktrees registered too), or with the protection off only the latter
+protect_or_keep_git_dir() {
+    if [[ "$PROTECT_GIT_CONFIG" = true ]]; then
+        protect_git_dir "$@"
+    else
+        keep_hidden_worktrees_registered "$1" "$3" "$4"
+    fi
 }
 
 # Usage: protect_config_path <source> <destination> <target-array-name> <seen-assoc-name> [-]
@@ -5011,6 +5149,8 @@ if [[ ${#WHITELIST_OVERRIDE_ARGS[@]} -gt 0 ]]; then
     protect_sandbox_config WHITELIST_OVERRIDE_ARGS
 fi
 
+find_tracked_hidden_files
+
 # Never expose other profiles' credentials, even when a whitelist entry covers
 # the profile store (e.g. ~/.local/share); the active profile is bound separately
 if [[ -d "$PROFILES_DIR" ]] && is_path_bound "$PROFILES_DIR"; then
@@ -5136,8 +5276,8 @@ BWRAP_ARGS+=(--unsetenv SSH_AUTH_SOCK)
 BWRAP_ARGS+=(--unsetenv SSH_AGENT_PID)
 
 if [[ "$ENABLE_DOCKER" = true ]]; then
-    sandbox_setenv DOCKER_HOST "unix://$WORKING_DIR/.docker-proxy/docker.sock"
-    sandbox_setenv TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE "$WORKING_DIR/.docker-proxy/docker.sock"
+    sandbox_setenv DOCKER_HOST "unix://$(docker_proxy_socket_path)"
+    sandbox_setenv TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE "$(docker_proxy_socket_path)"
     sandbox_setenv TESTCONTAINERS_HOST_OVERRIDE "localhost"
 fi
 
@@ -5269,6 +5409,13 @@ if [[ "$PROTECT_GIT_CONFIG" = false ]]; then
     log_info "Git Config Protection: ${YELLOW}disabled${NC}"
 elif [[ ${#PROTECTED_GIT_DIRS[@]} -gt 0 ]]; then
     log_info "Git Config Protection: ${YELLOW}enabled${NC} (hooks and configuration read-only in ${#PROTECTED_GIT_DIRS[@]} git director$([[ ${#PROTECTED_GIT_DIRS[@]} -eq 1 ]] && echo y || echo ies))"
+fi
+if [[ ${#TRACKED_HIDDEN_FILES[@]} -gt 0 ]]; then
+    log_info "Tracked Files Hidden by Blacklist (${#TRACKED_HIDDEN_FILES[@]}): ${YELLOW}${TRACKED_HIDDEN_FILES[*]:0:5}$([[ ${#TRACKED_HIDDEN_FILES[@]} -gt 5 ]] && echo " …")${NC}"
+    log_info "  ${YELLOW}⚠${NC} git status shows them as deleted inside; git add -A or git commit -a would commit the deletion"
+fi
+if [[ ${#HIDDEN_WORKTREE_CHECKOUTS[@]} -gt 0 ]]; then
+    log_info "Other Git Worktrees (kept registered, not mounted): ${YELLOW}${HIDDEN_WORKTREE_CHECKOUTS[*]}${NC}"
 fi
 if [[ "$ENABLE_VENV" = true ]]; then
     log_info "Virtual Environment: ${YELLOW}$VENV_PATH${NC}"

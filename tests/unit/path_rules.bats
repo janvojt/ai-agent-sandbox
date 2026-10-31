@@ -583,6 +583,97 @@ make_git_dir() {
     assert_equal "${#PROTECTED_GIT_DIRS[@]}" 1
 }
 
+# Usage: make_worktree_entry <common-dir> <name> <checkout>; the per-worktree
+# directory git writes for <checkout>, and the checkout's .git file unless
+# <checkout> is "-gone-" (removed on the host)
+make_worktree_entry() {
+    local wt="$1/worktrees/$2" checkout="$3"
+    mkdir -p "$wt/refs" "$wt/logs"
+    printf 'ref: refs/heads/%s\n' "$2" > "$wt/HEAD"
+    : > "$wt/index"
+    printf '../..\n' > "$wt/commondir"
+    printf '%s/.git\n' "$checkout" > "$wt/gitdir"
+    mkdir -p "$checkout"
+    printf 'gitdir: %s\n' "$wt" > "$checkout/.git"
+}
+
+@test "protect_git_dir: other worktrees' checkouts hidden from the sandbox get an empty .git directory" {
+    # The main checkout is the working directory; T3 Code's worktree lives in
+    # the (tmpfs) home directory, another one inside the working directory
+    make_git_dir "$TEST_WORK/.git"
+    make_worktree_entry "$TEST_WORK/.git" t3 "$TEST_HOME/.t3/worktrees/p/t3"
+    make_worktree_entry "$TEST_WORK/.git" inside "$TEST_WORK/.trees/inside"
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
+    assert_args_contain BWRAP_ARGS --dir "$TEST_HOME/.t3/worktrees/p/t3/.git"
+    refute_args_contain BWRAP_ARGS --dir "$TEST_WORK/.trees/inside/.git"
+    assert_equal "${HIDDEN_WORKTREE_CHECKOUTS[*]}" "$TEST_HOME/.t3/worktrees/p/t3"
+    # still protected, and the host's .git file is not exposed
+    assert_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/.git/worktrees/t3/gitdir" "$TEST_WORK/.git/worktrees/t3/gitdir"
+    refute_args_contain BWRAP_ARGS --ro-bind "$TEST_HOME/.t3/worktrees/p/t3/.git" "$TEST_HOME/.t3/worktrees/p/t3/.git"
+}
+
+@test "protect_git_dir: a worktree whose checkout is gone on the host is neither protected nor kept" {
+    make_git_dir "$TEST_WORK/.git"
+    make_worktree_entry "$TEST_WORK/.git" gone "$BATS_TEST_TMPDIR/gone"
+    rm -rf "$BATS_TEST_TMPDIR/gone"
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
+    # git worktree prune must be able to delete the whole directory
+    refute_args_contain BWRAP_ARGS --bind "$TEST_WORK/.git/worktrees/gone" "$TEST_WORK/.git/worktrees/gone"
+    refute_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/.git/worktrees/gone/gitdir" "$TEST_WORK/.git/worktrees/gone/gitdir"
+    refute_args_contain BWRAP_ARGS --dir "$BATS_TEST_TMPDIR/gone/.git"
+}
+
+@test "protect_git_dir: sibling worktrees are kept from inside a linked worktree, relative gitdir files included" {
+    local common="$BATS_TEST_TMPDIR/main/.git"
+    make_git_dir "$common"
+    make_worktree_entry "$common" self "$TEST_WORK"
+    make_worktree_entry "$common" sibling "$BATS_TEST_TMPDIR/sibling"
+    printf '../../../../sibling/.git\n' > "$common/worktrees/sibling/gitdir"
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK" --bind "$common" "$common")
+    protect_sandbox_config BWRAP_ARGS
+    assert_args_contain BWRAP_ARGS --dir "$BATS_TEST_TMPDIR/sibling/.git"
+    refute_args_contain BWRAP_ARGS --dir "$TEST_WORK/.git"
+    # the main checkout is no linked worktree: nothing to keep
+    assert_equal "${HIDDEN_WORKTREE_CHECKOUTS[*]}" "$BATS_TEST_TMPDIR/sibling"
+}
+
+@test "keep_hidden_worktrees_registered: also with git and project config protection off" {
+    make_git_dir "$TEST_WORK/.git"
+    make_worktree_entry "$TEST_WORK/.git" t3 "$TEST_HOME/t3"
+    PROTECT_GIT_CONFIG=false PROTECT_PROJECT_CONFIG=false
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
+    assert_args_contain BWRAP_ARGS --dir "$TEST_HOME/t3/.git"
+    refute_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/.git/worktrees/t3/gitdir" "$TEST_WORK/.git/worktrees/t3/gitdir"
+}
+
+@test "find_tracked_hidden_files: lists tracked files the blacklist hides, minus ! overrides" {
+    command -v git >/dev/null || skip "git is not installed"
+    git -C "$TEST_WORK" init -q
+    make_files .idea/a.xml .idea/b.xml local.env untracked.key keep/x.env
+    git -C "$TEST_WORK" add .idea local.env keep
+    BLACKLIST_HIDDEN_PATHS=("$TEST_WORK/.idea" "$TEST_WORK/local.env" "$TEST_WORK/untracked.key" "$TEST_WORK/keep/x.env" "$BATS_TEST_TMPDIR/elsewhere")
+    WHITELIST_OVERRIDE_ARGS=(--bind "$TEST_WORK/keep/x.env" "$TEST_WORK/keep/x.env")
+    find_tracked_hidden_files
+    assert_equal "${TRACKED_HIDDEN_FILES[*]}" ".idea/a.xml .idea/b.xml local.env"
+}
+
+@test "find_tracked_hidden_files: nothing outside a git checkout" {
+    make_files local.env
+    BLACKLIST_HIDDEN_PATHS=("$TEST_WORK/local.env")
+    find_tracked_hidden_files
+    assert_equal "${#TRACKED_HIDDEN_FILES[@]}" 0
+}
+
+@test "blacklist_pattern: records the hidden paths" {
+    make_files secret.env dir/x
+    blacklist_pattern '*.env'
+    blacklist_pattern dir
+    assert_equal "${BLACKLIST_HIDDEN_PATHS[*]}" "$TEST_WORK/secret.env $TEST_WORK/dir"
+}
+
 @test "protect_git_dir: config.worktree is protected, and created when worktreeConfig is on" {
     make_git_dir "$TEST_WORK/.git"
     BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")

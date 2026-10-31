@@ -427,3 +427,36 @@ sys.stdout.write(out.decode("latin-1"))
     assert_output --partial "101 UPGRADED"
     assert_output --partial "echo:raw stdin bytes"
 }
+
+# --- the socket in the working directory --------------------------------------
+
+@test "every run has its own socket, so a run's cleanup leaves a concurrent run's socket alone" {
+    assert_equal "$(docker_proxy_socket_path)" "$WORKING_DIR/.docker-proxy/docker-$$.sock"
+    PROXY_SOCKET_DIR="$WORKING_DIR/.docker-proxy"
+    mkdir -p "$PROXY_SOCKET_DIR"
+    local other="$PROXY_SOCKET_DIR/docker-$PPID.sock"
+    python3 -I -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$other"
+    PROXY_SOCKET_PATH="$(docker_proxy_socket_path)"
+    : > "$PROXY_SOCKET_PATH"
+    PROXY_CONTAINER_NAME=""
+    cleanup_socket_proxy
+    assert_not_exist "$PROXY_SOCKET_PATH"
+    assert_exist "$other"
+    assert_dir_exists "$PROXY_SOCKET_DIR"
+}
+
+@test "remove_stale_proxy_sockets removes the sockets of runs that are gone" {
+    PROXY_SOCKET_DIR="$WORKING_DIR/.docker-proxy"
+    mkdir -p "$PROXY_SOCKET_DIR"
+    local dead_pid
+    sh -c 'exit 0' & dead_pid=$!
+    wait "$dead_pid"
+    local socket
+    for socket in "docker-$PPID.sock" "docker-$dead_pid.sock" "docker-$$.sock"; do
+        python3 -I -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$PROXY_SOCKET_DIR/$socket"
+    done
+    remove_stale_proxy_sockets
+    assert_exist "$PROXY_SOCKET_DIR/docker-$PPID.sock"
+    assert_exist "$PROXY_SOCKET_DIR/docker-$$.sock"
+    assert_not_exist "$PROXY_SOCKET_DIR/docker-$dead_pid.sock"
+}
