@@ -134,6 +134,20 @@ assert_matches() {
     assert_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/data" "$TEST_WORK/data"
 }
 
+@test "whitelist_path: .., . and extra slashes are removed from bound paths" {
+    mkdir -p "$BATS_TEST_TMPDIR/sibling/sub" "$TEST_WORK/data"
+    ln -s "$BATS_TEST_TMPDIR/sibling" "$TEST_WORK/link"
+    whitelist_path ../sibling rw
+    whitelist_path "$BATS_TEST_TMPDIR//sibling/./sub/" ro
+    whitelist_path data/ ro
+    whitelist_path link/.. ro
+    assert_args_contain BWRAP_ARGS --bind "$BATS_TEST_TMPDIR/sibling" "$BATS_TEST_TMPDIR/sibling"
+    assert_args_contain BWRAP_ARGS --ro-bind "$BATS_TEST_TMPDIR/sibling/sub" "$BATS_TEST_TMPDIR/sibling/sub"
+    assert_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/data" "$TEST_WORK/data"
+    # lexical, like the destinations it is compared with: symlinks are kept
+    assert_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK" "$TEST_WORK"
+}
+
 @test "whitelist_path: relative matches become blacklist search roots, absolute ones do not" {
     make_files data/file.txt single.txt
     mkdir -p "$BATS_TEST_TMPDIR/abs"
@@ -637,6 +651,19 @@ make_worktree_entry() {
     refute_args_contain BWRAP_ARGS --dir "$TEST_WORK/.git"
     # the main checkout is no linked worktree: nothing to keep
     assert_equal "${HIDDEN_WORKTREE_CHECKOUTS[*]}" "$BATS_TEST_TMPDIR/sibling"
+}
+
+@test "keep_hidden_worktrees_registered: a worktree in a repository whitelisted as ../repo is visible, not covered" {
+    # bwrap: "Destination is not a directory" when --dir lands on the .git file
+    local other="$BATS_TEST_TMPDIR/other"
+    make_git_dir "$other/.git"
+    make_worktree_entry "$other/.git" master "$other/.trees/master"
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    whitelist_path ../other rw
+    protect_sandbox_config BWRAP_ARGS
+    refute_args_contain BWRAP_ARGS --dir "$other/.trees/master/.git"
+    assert_equal "${#HIDDEN_WORKTREE_CHECKOUTS[@]}" 0
+    assert_equal "${#PROTECTED_GIT_DIRS[@]}" 1
 }
 
 @test "keep_hidden_worktrees_registered: also with git and project config protection off" {

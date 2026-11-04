@@ -147,7 +147,7 @@ write_user_config() {
     run_sandbox
     assert_success
     assert_args_contain BWRAP_RECORDED --ro-bind /usr/share /usr/share
-    assert_args_contain BWRAP_RECORDED --bind "$TEST_WORK/data/" "$TEST_WORK/data/"
+    assert_args_contain BWRAP_RECORDED --bind "$TEST_WORK/data" "$TEST_WORK/data"
     assert_args_contain BWRAP_RECORDED --tmpfs "$TEST_WORK/secrets"
     assert_args_contain BWRAP_RECORDED --setenv FOO bar
     assert_equal "${SANDBOX_COMMAND[*]}" "$STUB_DIR/claude --dangerously-skip-permissions --model x"

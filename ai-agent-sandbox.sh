@@ -2673,6 +2673,14 @@ setup_isolated_network() {
         return 1
     fi
 
+    # bwrap reports the child pid before it sets up the mounts; when a mount
+    # fails the child is gone and every step below would fail with a
+    # misleading message, while bwrap's own error is already on stderr
+    if [[ ! -e "/proc/$SANDBOX_CHILD_PID/ns/net" ]]; then
+        echo -e "${RED}Error: the sandbox exited during setup (see bwrap's error above)${NC}" >&2
+        return 1
+    fi
+
     # pasta sets ping_group_range to "0 2147483647" in the namespace so ping can
     # use ICMP datagram sockets, but a group id must be mapped in the user
     # namespace to be accepted and ours maps only our own gid (root there): set
@@ -3587,6 +3595,12 @@ whitelist_path() {
     local match_count=0
     while IFS= read -r match; do
         if [[ -e "$match" ]]; then
+            # Bind destinations are compared as strings later (is_path_bound,
+            # protect_sandbox_config), so ../x, x/ and // must not reach them.
+            # Lexical only: symlinks stay as written
+            if [[ "$match" =~ //|/\./|/\.\./|/\.$|/\.\.$|./$ ]]; then
+                match="$(realpath -m -s -- "$match")"
+            fi
             if [[ "$is_relative_path" = true ]]; then
                 if [[ -d "$match" ]]; then
                     remember_blacklist_search_root "$match"
