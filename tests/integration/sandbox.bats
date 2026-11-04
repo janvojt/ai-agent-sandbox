@@ -241,6 +241,14 @@ git config core.fsmonitor 'touch pwned' || echo config-ro"
     assert_output --partial "$(id -g)	$(id -g)"
 }
 
+@test "isolated mode forwards only the listed host ports, no UDP without Docker" {
+    stub_command pasta "printf '%s\\n' \"\$@\" > '$BATS_TEST_TMPDIR/pasta.args'"
+    AI_AGENT_SANDBOX_NETWORK=isolated run_real_sandbox 'true' --host-port 3773
+    assert_success
+    run paste -sd ' ' "$BATS_TEST_TMPDIR/pasta.args"
+    assert_output --partial "--tcp-ns 3773 --udp-ns none"
+}
+
 @test "isolated mode writes the sandbox resolver into resolv.conf" {
     stub_command pasta
     AI_AGENT_SANDBOX_NETWORK=isolated run_real_sandbox 'cat /etc/resolv.conf'

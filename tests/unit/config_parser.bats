@@ -206,6 +206,16 @@ assert_no_config_warnings() {
     assert_equal "$NETWORK_MODE_SOURCE" f.yaml
 }
 
+@test "apply_config_scalar sets docker_port_range, ~ restores the default, invalid ranges are fatal" {
+    apply_config_scalar docker_port_range 40000-40099 f.yaml false
+    assert_equal "$DOCKER_PORT_RANGE" 40000-40099
+    apply_config_scalar docker_port_range "" f.yaml true
+    assert_equal "$DOCKER_PORT_RANGE" "$DOCKER_PORT_RANGE_DEFAULT"
+    run apply_config_scalar docker_port_range 5432 f.yaml false
+    assert_failure
+    assert_output --partial "Invalid docker_port_range"
+}
+
 @test "apply_config_scalar maps the boolean keys to their variables" {
     apply_config_scalar docker true f.yaml false
     apply_config_scalar venv yes f.yaml false

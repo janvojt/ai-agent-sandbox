@@ -168,6 +168,11 @@ PROC_SELF_CGROUP="/proc/self/cgroup"
 NEW_SESSION_REASON=""
 LEGACY_TIOCSTI_SYSCTL="/proc/sys/dev/tty/legacy_tiocsti"
 SOCKET_PROXY_IMAGE="${AI_AGENT_SANDBOX_DOCKER_PROXY:-ghcr.io/wollomatic/socket-proxy:1}"
+# Host loopback ports for container ports published without a host port; the
+# isolated network forwards them. Below the kernel's ephemeral range, where
+# host programs bind random listening ports. "none" turns the mapping off.
+DOCKER_PORT_RANGE_DEFAULT="29000-29999"
+DOCKER_PORT_RANGE="$DOCKER_PORT_RANGE_DEFAULT"
 PROXY_CONTAINER_NAME=""
 PROXY_SOCKET_PATH=""
 PROXY_SOCKET_DIR=""
@@ -231,6 +236,9 @@ OPTIONS:
                             writable mounts writable (read-only by default: git runs
                             them on the host); --protect-git-config switches it back on
     --docker-image IMAGE    Socket proxy image (default: ghcr.io/wollomatic/socket-proxy:1)
+    --docker-port-range A-B Host loopback ports for container ports published without a
+                            host port (-p 5432, Testcontainers), reachable inside the
+                            sandbox (default: 29000-29999; none leaves Docker's random ports)
     --network MODE          Network access: isolated (default: internet only, host
                             loopback and private networks blocked), host (share the
                             host network) or none (no network)
@@ -277,7 +285,8 @@ DEPRECATED LEGACY FILES:
     project-level files are migrated with --migrate-project-conf.
 
 CONFIGURATION FILE FORMAT:
-    Config:    YAML (flat subset). Keys: profile, agent, network, seccomp, docker, docker_image, venv,
+    Config:    YAML (flat subset). Keys: profile, agent, network, seccomp, docker, docker_image,
+                docker_port_range, venv,
                 gitconfig, shared_skills, gpg_agent, quiet,
                 protect_project_config, protect_git_config (user-level only),
                 whitelist, blacklist, host_ports, allow_hosts, agent_args (lists),
@@ -376,6 +385,12 @@ validate_host_port() {
     first=${BASH_REMATCH[1]}
     last=${BASH_REMATCH[3]:-$first}
     (( first >= 1 && first <= 65535 && last >= first && last <= 65535 ))
+}
+
+# A range a-b of at least two ports (Docker allocates from it), or none
+validate_docker_port_range() {
+    [[ "$1" == none ]] && return 0
+    [[ "$1" =~ ^[0-9]+-[0-9]+$ ]] && validate_host_port "$1" && (( ${1%-*} < ${1#*-} ))
 }
 
 # Removes duplicates from the named array (config files and flags are merged)
@@ -538,6 +553,14 @@ apply_config_scalar() {
             ;;
         docker_image)
             [[ "$is_null" = true ]] || SOCKET_PROXY_IMAGE="$value"
+            ;;
+        docker_port_range)
+            if [[ "$is_null" = true ]]; then
+                DOCKER_PORT_RANGE="$DOCKER_PORT_RANGE_DEFAULT"
+            else
+                validate_docker_port_range "$value" || config_error "Invalid docker_port_range in $file: '$value' (expected a range a-b or none)"
+                DOCKER_PORT_RANGE="$value"
+            fi
             ;;
         network)
             if [[ "$is_null" = true ]]; then
@@ -1579,9 +1602,15 @@ collect_allowed_mount_paths() {
     local -a roots=()
     mapfile -t roots < <(echo "$paths" | tr ',' '\n' | sed '/^$/d' | sort -u)
     local root
-    for root in "${roots[@]}"; do
-        split_mount_root "$root" "${PROTECTED_CONFIG_SOURCES[@]}"
-    done | sort -u | tr '\n' ',' | sed 's/,$//'
+    {
+        for root in "${roots[@]}"; do
+            split_mount_root "$root" "${PROTECTED_CONFIG_SOURCES[@]}"
+        done
+        # This run's own socket (TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE): Ryuk
+        # mounts it. It does not exist yet and the working directory is split
+        # around its configuration, so it is never covered by the roots.
+        docker_proxy_socket_path
+    } | sort -u | tr '\n' ',' | sed 's/,$//'
 }
 
 # Usage: split_mount_root <root> [excluded...]
@@ -1637,7 +1666,11 @@ requires that label, so the agent cannot inspect, exec into, copy into or
 remove containers it did not create (the user's databases, the socket proxy
 itself, which has the real Docker socket).
 
-Usage: python3 -I docker_filter.py LISTEN_SOCKET UPSTREAM_SOCKET OWNER
+Ports published without a host port go to 127.0.0.1 and PORT_RANGE (Docker
+picks a free one), which the sandbox's isolated network forwards, so the
+sandbox can reach them; an empty PORT_RANGE leaves them alone.
+
+Usage: python3 -I docker_filter.py LISTEN_SOCKET UPSTREAM_SOCKET OWNER [PORT_RANGE]
 """
 import asyncio
 import json
@@ -1662,7 +1695,7 @@ HIJACK_RE = re.compile(r"^/(containers/[^/]+/attach|exec/[^/]+/start|session|grp
 VERSION_RE = re.compile(r"^(/v[0-9]+(?:\.[0-9]+)?)(/.*)$")
 RAW_STREAM_TYPES = ("application/vnd.docker.raw-stream", "application/vnd.docker.multiplexed-stream")
 
-LISTEN = UPSTREAM = OWNER = ""
+LISTEN = UPSTREAM = OWNER = PORT_RANGE = ""
 
 
 class Deny(Exception):
@@ -1840,6 +1873,7 @@ class Request:
         self.head = head
         self.body = None
         self.target_changed = False
+        self.warnings = []  # added to the "Warnings" of a container create response
 
     @property
     def api_prefix(self):
@@ -1902,7 +1936,7 @@ def canonical(obj, fields, where):
 CREATE_FIELDS = ("HostConfig", "NetworkingConfig", "Labels")
 HOST_FIELDS = ("Privileged", "CapAdd", "CapDrop", "Devices", "DeviceCgroupRules", "DeviceRequests",
                "SecurityOpt", "CgroupParent", "Runtime", "MaskedPaths", "ReadonlyPaths", "VolumeDriver",
-               "VolumesFrom", "Binds", "Mounts") + NAMESPACE_MODES
+               "VolumesFrom", "Binds", "Mounts", "PortBindings", "PublishAllPorts") + NAMESPACE_MODES
 
 
 def quote(ref):
@@ -2047,8 +2081,39 @@ async def check_container_create(req, body):
     endpoints = networking.get("EndpointsConfig") or {}
     for name in endpoints:
         await ensure_network(req, name)
+    publish_ports(req, host)
     body["HostConfig"] = host
     add_owner_label(body)
+
+
+def publish_ports(req, host):
+    """Moves ports published without a host port (-p 5432, Testcontainers,
+    compose "5432") into PORT_RANGE on the host loopback. -P picks random host
+    ports the sandbox cannot reach: warn about it."""
+    if not PORT_RANGE:
+        return
+    bindings = host.get("PortBindings")
+    if bindings is not None and not isinstance(bindings, dict):
+        raise Deny("invalid PortBindings")
+    for port, entries in (bindings or {}).items():
+        if entries is None:
+            continue
+        if not isinstance(entries, list):
+            raise Deny("invalid PortBindings")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise Deny("invalid PortBindings")
+            canonical(entry, ("HostIp", "HostPort"), "PortBindings")
+            if str(entry.get("HostPort") or "0") == "0":
+                entry["HostPort"] = PORT_RANGE
+                if not entry.get("HostIp"):
+                    entry["HostIp"] = "127.0.0.1"
+    if host.get("PublishAllPorts"):
+        req.warnings.append(
+            "ai-agent-sandbox: ports published with -P/PublishAllPorts get random host ports, "
+            "which the sandbox cannot reach; publish them with -p PORT instead (mapped to "
+            "127.0.0.1:%s)" % PORT_RANGE)
+        print("warning: PublishAllPorts on a container create", file=sys.stderr, flush=True)
 
 
 async def check_request(req, reader):
@@ -2168,10 +2233,14 @@ async def relay_response(req, up_reader, writer):
         raw = await up_reader.readuntil(b"\r\n\r\n")
         head = Message(raw)
         status = int(head.start.split()[1])
-        writer.write(raw)
-        await writer.drain()
         if status != 100:
             break
+        writer.write(raw)
+        await writer.drain()
+    if req.warnings and status == 201 and head.framing() is not None:
+        return await relay_with_warnings(req, head, up_reader, writer)
+    writer.write(raw)
+    await writer.drain()
     content_type = (head.get("Content-Type") or "").split(";")[0].strip()
     # After 101 the daemon no longer parses HTTP on this connection; a raw
     # stream answer to attach/exec start means the same
@@ -2191,6 +2260,25 @@ async def relay_response(req, up_reader, writer):
     if (head.get("Connection") or "").lower() == "close":
         return "close"
     return "keep"
+
+
+async def relay_with_warnings(req, head, up_reader, writer):
+    """A create response with req.warnings appended to its "Warnings" (the CLI
+    prints them)."""
+    data = await read_body(up_reader, head.framing())
+    try:
+        value = json.loads(data)
+        if not isinstance(value, dict):
+            raise ValueError
+        value["Warnings"] = list(value.get("Warnings") or []) + req.warnings
+        data = json.dumps(value).encode()
+    except ValueError:
+        pass
+    head.set("Transfer-Encoding", None)
+    head.set("Content-Length", str(len(data)))
+    writer.write(head.encode() + data)
+    await writer.drain()
+    return "close" if (head.get("Connection") or "").lower() == "close" else "keep"
 
 
 async def pipe(reader, writer):
@@ -2276,6 +2364,7 @@ async def main():
 
 if __name__ == "__main__":
     LISTEN, UPSTREAM, OWNER = sys.argv[1:4]
+    PORT_RANGE = sys.argv[4] if len(sys.argv) > 4 else ""
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
@@ -2303,6 +2392,11 @@ remove_stale_socket_proxies() {
 # another one that is still running
 docker_proxy_socket_path() {
     echo "$WORKING_DIR/.docker-proxy/docker-$$.sock"
+}
+
+# The range the filter maps published ports into (empty: no mapping)
+docker_published_port_range() {
+    [[ "$DOCKER_PORT_RANGE" == none ]] || echo "$DOCKER_PORT_RANGE"
 }
 
 # Sockets of earlier runs in .docker-proxy whose script is gone
@@ -2390,7 +2484,7 @@ start_socket_proxy() {
     if [[ -S "$upstream_socket" ]]; then
         # Not a child of the sandbox: the agent cannot stop it. It exits on its
         # own when this script is gone.
-        python3 -I "$filter_program" "$PROXY_SOCKET_PATH" "$upstream_socket" "$WORKING_DIR" \
+        python3 -I "$filter_program" "$PROXY_SOCKET_PATH" "$upstream_socket" "$WORKING_DIR" "$(docker_published_port_range)" \
             </dev/null 2>>"$DOCKER_PRIVATE_DIR/filter.log" &
         DOCKER_FILTER_PID=$!
         timeout=20
@@ -2643,15 +2737,28 @@ resolve_allow_host() {
     getent ahosts "$entry" 2>/dev/null | awk '{print $1}' | sort -u
 }
 
+# The published container port range the isolated network forwards (empty: none)
+docker_forwarded_port_range() {
+    [[ "$ENABLE_DOCKER" == true ]] && docker_published_port_range
+    return 0
+}
+
 # Attaches pasta to the network namespace of bwrap's child and installs the routes.
 # Requires SANDBOX_CHILD_PID; returns non-zero when the sandbox must not start.
 setup_isolated_network() {
     local -a pasta_args=() blocked4=() blocked6=()
     local -a addrs=()
-    local host_ports="none" subnet gw6="" entry addr line failed=false
+    local host_ports="none" host_udp_ports="none" docker_ports subnet gw6="" entry addr line failed=false
+    local -a tcp_ports=("${NETWORK_HOST_PORTS[@]}")
 
-    if [[ ${#NETWORK_HOST_PORTS[@]} -gt 0 ]]; then
-        host_ports=$(IFS=,; echo "${NETWORK_HOST_PORTS[*]}")
+    # Ports of containers published through the Docker filter (TCP and UDP)
+    docker_ports=$(docker_forwarded_port_range)
+    if [[ -n "$docker_ports" ]]; then
+        tcp_ports+=("$docker_ports")
+        host_udp_ports="$docker_ports"
+    fi
+    if [[ ${#tcp_ports[@]} -gt 0 ]]; then
+        host_ports=$(IFS=,; echo "${tcp_ports[*]}")
     fi
     pasta_args=(
         --quiet --config-net --no-map-gw
@@ -2659,7 +2766,7 @@ setup_isolated_network() {
         --address "$NETWORK_NS_ADDR4" --gateway "$NETWORK_GW4"
         "${NETWORK_DNS_FORWARD_ARGS[@]}"
         --tcp-ports auto --udp-ports auto
-        --tcp-ns "$host_ports" --udp-ns none
+        --tcp-ns "$host_ports" --udp-ns "$host_udp_ports"
     )
     # pasta closes every inherited fd before it opens the namespace paths, so the
     # user namespace fd has to be addressed through this shell's /proc entry
@@ -4595,6 +4702,11 @@ while [[ $# -gt 0 ]]; do
             SOCKET_PROXY_IMAGE="$2"
             shift 2
             ;;
+        --docker-port-range)
+            validate_docker_port_range "$2" || { echo -e "${RED}Error: invalid --docker-port-range '$2' (expected a range a-b or none)${NC}" >&2; exit 1; }
+            DOCKER_PORT_RANGE="$2"
+            shift 2
+            ;;
         --network)
             validate_network_mode "$2" || { echo -e "${RED}Error: invalid --network mode '$2' (expected isolated, host or none)${NC}" >&2; exit 1; }
             NETWORK_MODE="$2"
@@ -5247,6 +5359,8 @@ if [[ "$ENABLE_DOCKER" = true ]]; then
     sandbox_setenv DOCKER_HOST "unix://$(docker_proxy_socket_path)"
     sandbox_setenv TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE "$(docker_proxy_socket_path)"
     sandbox_setenv TESTCONTAINERS_HOST_OVERRIDE "localhost"
+    # Testcontainers starts Ryuk privileged by default, which the filter refuses
+    sandbox_setenv TESTCONTAINERS_RYUK_CONTAINER_PRIVILEGED "false"
 fi
 
 # Preserve agent-specific environment variables
@@ -5338,7 +5452,9 @@ case "$NETWORK_MODE" in
         [[ ${#NETWORK_HOST_PORTS[@]} -gt 0 ]] && NETWORK_SUMMARY+=", host ports: ${NETWORK_HOST_PORTS[*]}"
         [[ ${#NETWORK_ALLOW_HOSTS[@]} -gt 0 ]] && NETWORK_SUMMARY+=", allowed hosts: ${NETWORK_ALLOW_HOSTS[*]}"
         log_info "Network: ${YELLOW}$NETWORK_SUMMARY${NC} (from $NETWORK_MODE_SOURCE)"
-        if [[ "$ENABLE_DOCKER" = true ]]; then
+        if [[ -n "$(docker_forwarded_port_range)" ]]; then
+            log_info "  Container ports published without a host port: ${YELLOW}127.0.0.1:$DOCKER_PORT_RANGE${NC} (reachable inside)"
+        elif [[ "$ENABLE_DOCKER" = true ]]; then
             log_info "  ${YELLOW}⚠${NC} Ports published by containers are on the host loopback: list them in host_ports or use --network host"
         fi
         ;;

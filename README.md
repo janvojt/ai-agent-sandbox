@@ -118,7 +118,7 @@ The same settings exist as config keys (`network`, `host_ports`, `allow_hosts`) 
 
 Requirements: `pasta` (package `passt`), `nsenter` and `unshare --map-user` (util-linux 2.38 or newer, e.g. Ubuntu 24.04) and `ip` (iproute2) on the host. Without them the default mode falls back to the host network with a warning; an explicitly requested `isolated` mode fails instead.
 
-Limits: LAN machines with public IP addresses on subnets the host is not directly attached to are indistinguishable from the internet. Blocking the internet itself is pointless, the agent talks to its LLM provider anyway. With `--enable-docker`, containers' published ports live on the host loopback, so list them in `host_ports` (or use `--network host`); the `172.17.x` bridge addresses are blocked.
+Limits: LAN machines with public IP addresses on subnets the host is not directly attached to are indistinguishable from the internet. Blocking the internet itself is pointless, the agent talks to its LLM provider anyway. With `--enable-docker`, container ports published without a host port are reachable at `localhost` inside (see [Docker support](#docker-support-testcontainers)); ports published at a fixed host port need `host_ports`, and the `172.17.x` bridge addresses are blocked.
 
 ### Syscall filter:
 
@@ -251,6 +251,10 @@ Docker access goes through two layers started for each run. The sandbox only see
 - plugins and swarm, host-network builds, and API endpoints it does not know.
 
 Containers, volumes and networks created through the sandbox get the label `ai-agent-sandbox.owner=<working directory>`. Every operation on an existing object (inspect, exec, attach, copy, logs, stop, remove, joining its network or namespaces, mounting its volume) requires that label, and lists, prunes and events only show labelled objects. So the agent cannot read the environment of your other containers, exec into them, delete your databases' volumes or reach the socket proxy itself. A named volume that does not exist yet is created with the label. `MKNOD` is dropped from every container, so no device nodes appear in mounted directories.
+
+Testcontainers works without configuration: `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE` points at the sandbox's socket, which is the one bind mount source always allowed, so Ryuk can mount it, and `TESTCONTAINERS_RYUK_CONTAINER_PRIVILEGED=false` is set because Testcontainers would otherwise start Ryuk privileged.
+
+Published ports: Docker gives a port published without a host port (`-p 5432`, Testcontainers' exposed ports, compose `ports: ["5432"]`) a random host port, which the isolated network cannot reach. The filter publishes such ports on `127.0.0.1` in `29000-29999` instead (Docker picks a free one, `docker port` shows it), and the sandbox forwards that range (TCP and UDP) to its `localhost`. So these containers are also no longer reachable from your LAN. Ports with a fixed host port (`-p 8080:80`) are left alone; list them in `host_ports` to reach them. `-P` (`PublishAllPorts`) still gets random ports: the create answer carries a warning, which the Docker CLI prints. Change the range with `--docker-port-range` / `docker_port_range` (`none` turns the mapping off); host services listening in the range become reachable from the sandbox too. The range is shared by all sandboxes, so one sandbox can connect to the published ports of another one's containers.
 
 Builds use the daemon's built-in BuildKit (`/session` and `/grpc`). A buildx builder with the `docker-container` driver runs BuildKit in a privileged container and is therefore refused: use the default `docker` driver.
 
@@ -409,6 +413,7 @@ See [`config-example.yaml`](config-example.yaml) for a commented example of ever
 | `allow_hosts` | list | `--allow-host ADDR` (IPs, CIDR ranges or hostnames exempt from the private-network block) |
 | `docker` | bool | `--enable-docker` / `--no-docker` |
 | `docker_image` | string | `--docker-image IMAGE` |
+| `docker_port_range` | string | `--docker-port-range A-B` (default `29000-29999`, `none` keeps Docker's random host ports) |
 | `venv` | bool | `--venv` / `--no-venv` |
 | `gitconfig` | bool | `--gitconfig` / `--no-gitconfig` |
 | `shared_skills` | bool | `--shared-skills` / `--no-shared-skills` (default: shared) |

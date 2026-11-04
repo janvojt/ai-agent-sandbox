@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import docker_filter as f
 
 f.OWNER = "/work"
+f.PORT_RANGE = os.environ.get("PORT_RANGE", "")
 MINE = {f.OWNER_LABEL: "/work"}
 OBJECTS = {
     "/containers/mine/json": {"Config": {"Labels": MINE}},
@@ -81,6 +82,19 @@ create() {
     create '{"Image":"alpine","HostConfig":{"CapDrop":["NET_RAW"]}}'
     assert_output --partial '"ai-agent-sandbox.owner": "/work"'
     assert_output --partial '"CapDrop": ["NET_RAW", "MKNOD"]'
+}
+
+@test "ports published without a host port go to the loopback range" {
+    PORT_RANGE=29000-29999 create '{"HostConfig":{"PortBindings":{"5432/tcp":[{"HostIp":"","HostPort":""}],"53/udp":[{}],"80/tcp":[{"HostPort":"0"}],"81/tcp":[{"HostIp":"0.0.0.0","HostPort":""}],"8080/tcp":[{"HostPort":"8080"}],"9000/tcp":null}}}'
+    assert_output --partial '"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "29000-29999"}]'
+    assert_output --partial '"53/udp": [{"HostIp": "127.0.0.1", "HostPort": "29000-29999"}]'
+    assert_output --partial '"80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "29000-29999"}]'
+    assert_output --partial '"81/tcp": [{"HostIp": "0.0.0.0", "HostPort": "29000-29999"}]'
+    assert_output --partial '"8080/tcp": [{"HostPort": "8080"}]'
+    PORT_RANGE=29000-29999 create '{"HostConfig":{"PortBindings":{"5432/tcp":[{"hostport":"1"}]}}}'
+    assert_output --partial "deny: field hostport"
+    create '{"HostConfig":{"PortBindings":{"5432/tcp":[{"HostPort":""}]}}}'
+    assert_output --partial '"5432/tcp": [{"HostPort": ""}]'
 }
 
 @test "privileged containers, host namespaces and devices are refused" {
@@ -323,6 +337,11 @@ async def handle(reader, writer):
                 await writer.drain()
             writer.close()
             return
+        if path.endswith("/containers/create"):
+            text = b'{"Id":"c1","Warnings":null}'
+            writer.write(b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(text), text))
+            await writer.drain()
+            continue
         text = ("%s body=%s" % (lines[0], body.decode())).encode()
         if "/close" in path:
             writer.write(b"HTTP/1.1 200 OK\r\n\r\n" + text)
@@ -342,7 +361,7 @@ EOF
     python3 -I "$BATS_TEST_TMPDIR/upstream.py" "$UPSTREAM_SOCKET" &
     UPSTREAM_PID=$!
     while [[ ! -S "$UPSTREAM_SOCKET" ]]; do sleep 0.05; done
-    python3 -I "$BATS_TEST_TMPDIR/docker_filter.py" "$FILTER_SOCKET" "$UPSTREAM_SOCKET" /work 2>"$BATS_TEST_TMPDIR/filter.log" &
+    python3 -I "$BATS_TEST_TMPDIR/docker_filter.py" "$FILTER_SOCKET" "$UPSTREAM_SOCKET" /work "${1:-}" 2>"$BATS_TEST_TMPDIR/filter.log" &
     FILTER_PID=$!
     while [[ ! -S "$FILTER_SOCKET" ]]; do sleep 0.05; done
 }
@@ -393,9 +412,19 @@ sys.stdout.write(out.decode("latin-1"))
 @test "relay: rewritten bodies, chunked requests and responses without framing" {
     start_relay
     run send 'POST /v1.41/containers/create HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n10\r\n{"Image":"alpine\r\n2\r\n"}\r\n0\r\n\r\nGET /v1.41/images/close HTTP/1.1\r\nHost: d\r\n\r\n'
-    assert_output --partial '"ai-agent-sandbox.owner": "/work"'
-    assert_output --partial '"CapDrop": ["MKNOD"]'
+    assert_output --partial '201 Created'
+    assert_output --partial '{"Id":"c1","Warnings":null}'
     assert_output --partial "GET /v1.41/images/close HTTP/1.1 body="
+}
+
+@test "relay: -P gets a warning in the create response, the connection stays usable" {
+    start_relay 29000-29999
+    run send 'POST /v1.41/containers/create HTTP/1.1\r\nHost: d\r\nContent-Length: 39\r\n\r\n{"HostConfig":{"PublishAllPorts":true}}GET /v1.41/version HTTP/1.1\r\nHost: d\r\n\r\n'
+    assert_output --partial '201 Created'
+    assert_output --partial '"Warnings": ["ai-agent-sandbox: ports published with -P/PublishAllPorts get random host ports'
+    assert_output --partial "GET /v1.41/version HTTP/1.1 body="
+    run cat "$BATS_TEST_TMPDIR/filter.log"
+    assert_output --partial "warning: PublishAllPorts"
 }
 
 @test "relay: a chunked upload to an uninspected endpoint is passed through as parsed" {

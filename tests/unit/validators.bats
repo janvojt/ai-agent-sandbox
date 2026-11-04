@@ -61,6 +61,34 @@ setup() {
     done
 }
 
+# --- validate_docker_port_range -----------------------------------------------
+
+@test "validate_docker_port_range accepts ascending ranges and none" {
+    local spec
+    for spec in 29000-29999 1-2 none; do
+        run validate_docker_port_range "$spec"
+        assert_success
+    done
+}
+
+@test "validate_docker_port_range rejects single ports and invalid ranges" {
+    local spec
+    for spec in 5432 5432-5432 8100-8000 0-10 65535-70000 "" off; do
+        run validate_docker_port_range "$spec"
+        assert_failure
+    done
+}
+
+@test "the published port range is forwarded only with Docker and not none" {
+    ENABLE_DOCKER=false DOCKER_PORT_RANGE=29000-29999
+    assert_equal "$(docker_forwarded_port_range)" ""
+    ENABLE_DOCKER=true
+    assert_equal "$(docker_forwarded_port_range)" 29000-29999
+    DOCKER_PORT_RANGE=none
+    assert_equal "$(docker_forwarded_port_range)" ""
+    assert_equal "$(docker_published_port_range)" ""
+}
+
 # --- validate_profile_name ----------------------------------------------------
 
 @test "validate_profile_name accepts letters, digits, dots, underscores and dashes" {

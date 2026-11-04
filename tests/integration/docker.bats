@@ -116,10 +116,13 @@ filtered_docker() {
     [[ -z "${DOCKER_HOST:-}" || "$DOCKER_HOST" == unix:///var/run/docker.sock ]] \
         || skip "--enable-docker needs the host's /var/run/docker.sock"
     stub_command claude
-    run bash -c 'printf "%s\n" "docker run --rm alpine echo inside-ok; docker run --rm --privileged alpine true || echo privileged-refused; ls -la .docker-proxy" \
+    run bash -c 'printf "%s\n" "docker run --rm alpine echo inside-ok; docker run --rm --privileged alpine true || echo privileged-refused; ls -la .docker-proxy; docker run --rm -v \"\$TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE:/var/run/docker.sock\" alpine test -S /var/run/docker.sock && echo socket-mounted; echo \"ryuk-privileged=\$TESTCONTAINERS_RYUK_CONTAINER_PRIVILEGED\"; c=\$(docker run -d -p 80 -p 53/udp alpine sleep 60); docker port \$c 80; docker rm -f \$c >/dev/null" \
         | AI_AGENT_SANDBOX_NETWORK=host bash "$0" --dry-run -q --enable-docker' "$SANDBOX_SCRIPT"
     assert_output --partial inside-ok
     assert_output --partial privileged-refused
     assert_output --partial "srw-------"
+    assert_output --partial socket-mounted
+    assert_output --partial ryuk-privileged=false
+    assert_output --regexp '127\.0\.0\.1:29[0-9]{3}'
     assert_not_exist "$TEST_WORK/.docker-proxy"
 }

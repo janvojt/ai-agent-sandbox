@@ -788,5 +788,5 @@ make_worktree_entry() {
     QUIET=true
     run collect_allowed_mount_paths
     assert_success
-    assert_output "$TEST_WORK/src"
+    assert_output "$TEST_WORK/.docker-proxy/docker-$$.sock,$TEST_WORK/src"
 }

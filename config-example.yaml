@@ -64,6 +64,8 @@ profile: work
 # Feature toggles (same as the corresponding command-line flags)
 # docker: true          # --enable-docker / --no-docker
 # docker_image: ghcr.io/wollomatic/socket-proxy:1
+# docker_port_range: 29000-29999  # host loopback ports for container ports published without
+#                                 # a host port (-p 5432, Testcontainers); none: Docker's random ports
 # venv: true            # --venv / --no-venv
 # gitconfig: false      # --gitconfig / --no-gitconfig
 # shared_skills: false  # --shared-skills / --no-shared-skills (host skills in every profile)
