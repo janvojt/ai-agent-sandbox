@@ -97,10 +97,6 @@ HOST_ENV_ALLOWED=(
 HOST_ENV_ALLOWED_PREFIXES=(LC_ ANTHROPIC_ CLAUDE_ OPENCODE_ T3CODE_ VERTEX_REGION_ DISABLE_PROMPT_CACHING)
 declare -A SANDBOX_ENV=()
 BLACKLISTED_DIRS=()
-# Every path hidden by the blacklist, and the git-tracked files among them in
-# the working directory (see find_tracked_hidden_files)
-BLACKLIST_HIDDEN_PATHS=()
-TRACKED_HIDDEN_FILES=()
 BLACKLIST_SEARCH_ROOTS=()
 WHITELIST_OVERRIDE_ARGS=()
 EXPLICIT_WHITELIST=false
@@ -3391,42 +3387,6 @@ parse_whitelist_override() {
     echo "$override" "$line"
 }
 
-# Sets TRACKED_HIDDEN_FILES to the files tracked by git in the working
-# directory that the blacklist hides. Inside the sandbox git status reports
-# them as deleted, so git add -A or git commit -a would commit their deletion.
-# Marking them skip-worktree is no way out: the index is shared with the host,
-# where the flag would hide later changes and keep checkouts from updating them.
-find_tracked_hidden_files() {
-    TRACKED_HIDDEN_FILES=()
-    [[ "$NO_PROJECT_WORKDIR" != true && -e "$WORKING_DIR/.git" ]] || return 0
-    command -v git >/dev/null 2>&1 || return 0
-    local -a rel_paths=()
-    local path
-    for path in "${BLACKLIST_HIDDEN_PATHS[@]}"; do
-        [[ "$path" == "$WORKING_DIR/"* ]] && rel_paths+=("${path#"$WORKING_DIR/"}")
-    done
-    [[ ${#rel_paths[@]} -gt 0 ]] || return 0
-    # Reads the index only: no fsmonitor, hooks or filters run
-    local -a tracked=()
-    mapfile -d '' -t tracked < <(GIT_LITERAL_PATHSPECS=1 \
-        git -C "$WORKING_DIR" -c core.fsmonitor=false ls-files -z -- "${rel_paths[@]}" 2>/dev/null)
-    # Files a ! override brings back are visible again
-    local file i dest visible
-    for file in "${tracked[@]}"; do
-        visible=false
-        for ((i = 0; i < ${#WHITELIST_OVERRIDE_ARGS[@]}; i++)); do
-            [[ "${WHITELIST_OVERRIDE_ARGS[i]}" == --bind || "${WHITELIST_OVERRIDE_ARGS[i]}" == --ro-bind ]] || continue
-            dest="${WHITELIST_OVERRIDE_ARGS[i+2]}"
-            if path_is_within "$WORKING_DIR/$file" "$dest"; then
-                visible=true
-                break
-            fi
-        done
-        [[ "$visible" = true ]] || TRACKED_HIDDEN_FILES+=("$file")
-    done
-    return 0
-}
-
 is_covered_by_blacklisted_dir() {
     local path="$1"
     local blocked_dir
@@ -3673,11 +3633,9 @@ blacklist_pattern() {
                             if [[ -d "$target" ]]; then
                                 BWRAP_ARGS+=(--tmpfs "$target")
                                 remember_blacklisted_dir "$target"
-                                BLACKLIST_HIDDEN_PATHS+=("$target")
                                 log_info "${RED}✗${NC} Blacklisted (symlink->dir target): ${match_display} -> ${target_display}"
                             else
                                 BWRAP_ARGS+=(--ro-bind /dev/null "$target")
-                                BLACKLIST_HIDDEN_PATHS+=("$target")
                                 log_info "${RED}✗${NC} Blacklisted (symlink->file target): ${match_display} -> ${target_display}"
                             fi
                         else
@@ -3696,7 +3654,6 @@ blacklist_pattern() {
                     # Hide directories with tmpfs overlay
                     BWRAP_ARGS+=(--tmpfs "$match")
                     remember_blacklisted_dir "$match"
-                    BLACKLIST_HIDDEN_PATHS+=("$match")
                     log_info "${RED}✗${NC} Blacklisted (dir): $(display_path "$match")"
                 else
                     if is_covered_by_blacklisted_dir "$match"; then
@@ -3707,7 +3664,6 @@ blacklist_pattern() {
 
                     # Hide files by binding /dev/null over them
                     BWRAP_ARGS+=(--ro-bind /dev/null "$match")
-                    BLACKLIST_HIDDEN_PATHS+=("$match")
                     log_info "${RED}✗${NC} Blacklisted (file): $(display_path "$match")"
                 fi
                 ((match_count++)) || true
@@ -5163,8 +5119,6 @@ if [[ ${#WHITELIST_OVERRIDE_ARGS[@]} -gt 0 ]]; then
     protect_sandbox_config WHITELIST_OVERRIDE_ARGS
 fi
 
-find_tracked_hidden_files
-
 # Never expose other profiles' credentials, even when a whitelist entry covers
 # the profile store (e.g. ~/.local/share); the active profile is bound separately
 if [[ -d "$PROFILES_DIR" ]] && is_path_bound "$PROFILES_DIR"; then
@@ -5423,10 +5377,6 @@ if [[ "$PROTECT_GIT_CONFIG" = false ]]; then
     log_info "Git Config Protection: ${YELLOW}disabled${NC}"
 elif [[ ${#PROTECTED_GIT_DIRS[@]} -gt 0 ]]; then
     log_info "Git Config Protection: ${YELLOW}enabled${NC} (hooks and configuration read-only in ${#PROTECTED_GIT_DIRS[@]} git director$([[ ${#PROTECTED_GIT_DIRS[@]} -eq 1 ]] && echo y || echo ies))"
-fi
-if [[ ${#TRACKED_HIDDEN_FILES[@]} -gt 0 ]]; then
-    log_info "Tracked Files Hidden by Blacklist (${#TRACKED_HIDDEN_FILES[@]}): ${YELLOW}${TRACKED_HIDDEN_FILES[*]:0:5}$([[ ${#TRACKED_HIDDEN_FILES[@]} -gt 5 ]] && echo " …")${NC}"
-    log_info "  ${YELLOW}⚠${NC} git status shows them as deleted inside; git add -A or git commit -a would commit the deletion"
 fi
 if [[ ${#HIDDEN_WORKTREE_CHECKOUTS[@]} -gt 0 ]]; then
     log_info "Other Git Worktrees (kept registered, not mounted): ${YELLOW}${HIDDEN_WORKTREE_CHECKOUTS[*]}${NC}"

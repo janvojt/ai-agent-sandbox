@@ -255,7 +255,6 @@ bats tests/unit/path_rules.bats # a single file
 - Uses `/dev/null` binding to hide files
 - Pattern matching happens against `$WORKING_DIR/$pattern`
 - Non-matching patterns generate warnings but don't fail
-- Hidden paths are collected in `BLACKLIST_HIDDEN_PATHS`; after the `!` overrides `find_tracked_hidden_files` runs one host `git ls-files` (index only, `core.fsmonitor=false`, literal pathspecs) and the summary lists the tracked ones as `Tracked Files Hidden by Blacklist`, because inside they show as deleted and `git add -A`/`commit -a` would commit the deletion. `--skip-worktree` is deliberately not used: the index is shared with the host
 - Missing blacklist files are skipped with warning (non-fatal)
 
 **Whitelist Implementation** (whitelist_path function, lines 191-246):

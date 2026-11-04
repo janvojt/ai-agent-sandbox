@@ -554,7 +554,7 @@ blacklist:
   - **Ant-style recursive**: `**` for recursive matching (e.g., `**/wallet.dat` matches `wallet.dat` anywhere in the working directory tree)
 - Trailing `/` is accepted and normalized (for example, `secret-data/` behaves like `secret-data`)
 - Patterns from all config files are merged
-- Files tracked by git that the blacklist hides show up as deleted in `git status` inside the sandbox, and `git add -A` or `git commit -a` would commit their deletion. The startup summary lists them as `Tracked Files Hidden by Blacklist`; commit with explicit paths in such projects. (Marking them `--skip-worktree` is no fix: the index is shared with the host, where the flag would hide your own changes to those files.)
+- Files tracked by git that the blacklist hides show up as deleted in `git status` inside the sandbox, and `git add -A` or `git commit -a` would commit their deletion. Commit with explicit paths in such projects. (Marking them `--skip-worktree` is no fix: the index is shared with the host, where the flag would hide your own changes to those files.)
 
 ### Symlink behavior
 

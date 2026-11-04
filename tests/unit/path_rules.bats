@@ -676,31 +676,6 @@ make_worktree_entry() {
     refute_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/.git/worktrees/t3/gitdir" "$TEST_WORK/.git/worktrees/t3/gitdir"
 }
 
-@test "find_tracked_hidden_files: lists tracked files the blacklist hides, minus ! overrides" {
-    command -v git >/dev/null || skip "git is not installed"
-    git -C "$TEST_WORK" init -q
-    make_files .idea/a.xml .idea/b.xml local.env untracked.key keep/x.env
-    git -C "$TEST_WORK" add .idea local.env keep
-    BLACKLIST_HIDDEN_PATHS=("$TEST_WORK/.idea" "$TEST_WORK/local.env" "$TEST_WORK/untracked.key" "$TEST_WORK/keep/x.env" "$BATS_TEST_TMPDIR/elsewhere")
-    WHITELIST_OVERRIDE_ARGS=(--bind "$TEST_WORK/keep/x.env" "$TEST_WORK/keep/x.env")
-    find_tracked_hidden_files
-    assert_equal "${TRACKED_HIDDEN_FILES[*]}" ".idea/a.xml .idea/b.xml local.env"
-}
-
-@test "find_tracked_hidden_files: nothing outside a git checkout" {
-    make_files local.env
-    BLACKLIST_HIDDEN_PATHS=("$TEST_WORK/local.env")
-    find_tracked_hidden_files
-    assert_equal "${#TRACKED_HIDDEN_FILES[@]}" 0
-}
-
-@test "blacklist_pattern: records the hidden paths" {
-    make_files secret.env dir/x
-    blacklist_pattern '*.env'
-    blacklist_pattern dir
-    assert_equal "${BLACKLIST_HIDDEN_PATHS[*]}" "$TEST_WORK/secret.env $TEST_WORK/dir"
-}
-
 @test "protect_git_dir: config.worktree is protected, and created when worktreeConfig is on" {
     make_git_dir "$TEST_WORK/.git"
     BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
