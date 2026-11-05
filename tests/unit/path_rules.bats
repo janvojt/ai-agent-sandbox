@@ -538,7 +538,58 @@ make_git_dir() {
         --ro-bind "$TEST_WORK/.git/config" "$TEST_WORK/.git/config" \
         --ro-bind "$TEST_WORK/.git/hooks" "$TEST_WORK/.git/hooks"
     assert_equal "${PROTECTED_GIT_DIRS[*]}" "$TEST_WORK/.git"
-    assert_equal "${PROTECTED_CONFIG_SOURCES[*]}" "$TEST_WORK/.git/config $TEST_WORK/.git/hooks"
+    assert_equal "${PROTECTED_CONFIG_SOURCES[*]}" "$TEST_WORK/.git/config $TEST_WORK/.git/hooks $TEST_WORK/.git/info/exclude"
+}
+
+@test "protect_git_dir: info/exclude is created on the host and protected" {
+    make_git_dir "$TEST_WORK/.git"
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
+    assert_file_exists "$TEST_WORK/.git/info/exclude"
+    assert_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/.git/info/exclude" "$TEST_WORK/.git/info/exclude"
+}
+
+@test "protect_sandbox_config: nested repositories in git-ignored directories are left unprotected" {
+    command -v git >/dev/null || skip "git is not installed"
+    git init -q "$TEST_WORK"
+    printf 'target/\n' > "$TEST_WORK/.gitignore"
+    make_git_dir "$TEST_WORK/target/work/.git"
+    mkdir -p "$TEST_WORK/target/linked" "$TEST_WORK/build"
+    printf 'gitdir: /elsewhere\n' > "$TEST_WORK/target/linked/.git"
+    make_git_dir "$TEST_WORK/build/tool/.git"
+    BWRAP_ARGS=(--bind "$TEST_WORK" "$TEST_WORK")
+    protect_sandbox_config BWRAP_ARGS
+    assert_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/.git/config" "$TEST_WORK/.git/config"
+    assert_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/build/tool/.git/config" "$TEST_WORK/build/tool/.git/config"
+    refute_args_contain BWRAP_ARGS --bind "$TEST_WORK/target/work/.git" "$TEST_WORK/target/work/.git"
+    refute_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/target/work/.git/config" "$TEST_WORK/target/work/.git/config"
+    refute_args_contain BWRAP_ARGS --ro-bind "$TEST_WORK/target/linked/.git" "$TEST_WORK/target/linked/.git"
+    assert_equal "${IGNORED_GIT_REPOS[*]}" "$TEST_WORK/target/linked/.git $TEST_WORK/target/work/.git" \
+        || assert_equal "${IGNORED_GIT_REPOS[*]}" "$TEST_WORK/target/work/.git $TEST_WORK/target/linked/.git"
+}
+
+@test "protect_sandbox_config: the bind root's own repository is protected even when ignored" {
+    command -v git >/dev/null || skip "git is not installed"
+    local outer="$BATS_TEST_TMPDIR/outer"
+    git init -q "$outer"
+    printf 'repo/\n' > "$outer/.gitignore"
+    git init -q "$outer/repo"
+    BWRAP_ARGS=(--bind "$outer/repo" "$outer/repo")
+    protect_sandbox_config BWRAP_ARGS
+    assert_args_contain BWRAP_ARGS --ro-bind "$outer/repo/.git/config" "$outer/repo/.git/config"
+    assert_equal "${#IGNORED_GIT_REPOS[@]}" 0
+}
+
+@test "protect_sandbox_config: ignore rules of a repository above the bind root do not count" {
+    command -v git >/dev/null || skip "git is not installed"
+    local outer="$BATS_TEST_TMPDIR/dotfiles"
+    git init -q "$outer"
+    printf '*\n' > "$outer/.gitignore"
+    make_git_dir "$outer/proj/vendor/.git"
+    BWRAP_ARGS=(--bind "$outer/proj" "$outer/proj")
+    protect_sandbox_config BWRAP_ARGS
+    assert_args_contain BWRAP_ARGS --ro-bind "$outer/proj/vendor/.git/config" "$outer/proj/vendor/.git/config"
+    assert_equal "${#IGNORED_GIT_REPOS[@]}" 0
 }
 
 @test "protect_git_dir: a missing hooks directory is created on the host and protected" {

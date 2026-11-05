@@ -209,5 +209,6 @@ agent_args:
 # config.worktree, hooks/, worktree links) of every git repository in a writable
 # mount read-only, because git runs them on the host. Inside the sandbox,
 # commands that write .git/config (git config, git remote add, git push -u)
-# fail while this is on.
+# fail while this is on. Nested repositories in git-ignored directories
+# (target/, node_modules/) are build output and stay writable.
 # protect_git_config: true

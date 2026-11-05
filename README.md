@@ -441,7 +441,10 @@ See [`config-example.yaml`](config-example.yaml) for a commented example of ever
 
 - `config`, `config.worktree` and `hooks/` mounted read-only (a missing `hooks/` is created on the host first);
 - the git directory mounted onto itself, so it cannot be renamed or replaced by a forged one;
-- for linked worktrees, the `.git` file and the main repository's `worktrees/<name>/commondir` and `gitdir` read-only, so the worktree cannot be pointed at another repository.
+- for linked worktrees, the `.git` file and the main repository's `worktrees/<name>/commondir` and `gitdir` read-only, so the worktree cannot be pointed at another repository;
+- `info/exclude` read-only (see the next paragraph).
+
+Exception: nested repositories in a git-ignored directory (`target/`, `node_modules/`, `build/`) are left writable. Those are build output, often cloned or initialised by a build tool (a Maven plugin, a package manager) that would fail on a read-only `.git`, and you do not run git in them. The host's `git check-ignore` decides, using only the repositories inside the mount: a dotfiles repository in your home directory ignoring `*` does not count, and the mount's own repository is always protected. The summary lists them under `Unprotected Git Repositories`. An agent that adds a directory to a `.gitignore` lifts the protection of a repository in it from the next start on; that change shows up in `git status`, and `info/exclude`, which would not, is read-only.
 
 Commits, branches, rebases, stashes, fetches and merges keep working. Commands that write the repository configuration fail inside the sandbox: `git config` without `--global`, `git remote add`, `git branch --set-upstream-to`, `git push -u`, `git submodule init`, `git lfs install` and hook managers that set `core.hooksPath` (husky, lefthook; their install step typically reports an error). Run them on the host, or pass the identity per command (`git -c user.email=… commit`). Changes made on the host to `.git/config` while a sandbox runs are only visible inside after a restart (the read-only mount keeps the file it started with). Disable with `--no-protect-git-config` or `protect_git_config: false` in the user-level config; project files cannot switch it off.
 

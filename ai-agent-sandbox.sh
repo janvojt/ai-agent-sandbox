@@ -54,6 +54,8 @@ PROTECT_PROJECT_CONFIG=true
 PROTECT_GIT_CONFIG=true
 # Git directories protected by protect_git_dir (destinations, for the summary)
 PROTECTED_GIT_DIRS=()
+# Nested repositories in git-ignored directories, left unprotected
+IGNORED_GIT_REPOS=()
 # Host paths mounted read-only by protect_sandbox_config (refused by the Docker proxy)
 PROTECTED_CONFIG_SOURCES=()
 # Checkouts of other worktrees that exist on the host but not in the sandbox,
@@ -3869,6 +3871,29 @@ find_project_config_dirs() {
     find -H "$root" \( -name .git -prune -print \) -o \( -name .ai-agent-sandbox -prune -print \) 2>/dev/null
 }
 
+# Usage: git_entry_is_ignored <bind-root> <path-of-.git>
+# A nested repository (not the bind root's own) whose checkout is git-ignored
+# by a repository inside the bind root: build output such as target/ or
+# node_modules/, where tools clone or init repositories the user never runs git
+# in, and which would fail on a read-only .git. Asks the host git with the
+# discovery stopped at the bind root (a dotfiles repository in $HOME ignoring
+# "*" must not count) and without the index; any error keeps the protection.
+# The enclosing repository's info/exclude is protected (an invisible way to
+# un-protect a repository), its .gitignore files are not (changes show up in
+# git status)
+git_entry_is_ignored() {
+    local root="$1" path="$2" checkout parent
+    checkout="${path%/.git}"
+    [[ "$checkout" != "$root" && "$checkout" == "$root/"* ]] || return 1
+    command -v git >/dev/null 2>&1 || return 1
+    parent="${checkout%/*}"
+    env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+        -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
+        GIT_CEILING_DIRECTORIES="$(dirname "$root")" GIT_OPTIONAL_LOCKS=0 \
+        git -C "$parent" --no-pager -c core.fsmonitor=false \
+        check-ignore -q --no-index -- "$checkout" >/dev/null 2>&1
+}
+
 # A directory git would use as a repository: HEAD plus an object store or, for
 # a linked worktree's per-worktree directory, a commondir file
 is_git_dir() {
@@ -3916,6 +3941,10 @@ protect_git_dir() {
     protect_git_file "$src/config" "$dest/config" false
     protect_git_file "$src/hooks" "$dest/hooks" false
     protect_git_file "$src/config.worktree" "$dest/config.worktree" "$worktree_config"
+    # Ignore rules decide which nested repositories stay unprotected
+    # (git_entry_is_ignored); git init writes this file anyway
+    [[ -e "$src/info" || -L "$src/info" ]] || mkdir "$src/info" 2>/dev/null || true
+    protect_git_file "$src/info/exclude" "$dest/info/exclude" true
     # Per-worktree directories of linked worktrees: commondir and gitdir decide
     # which repository (and therefore which hooks and config) git uses there.
     # A worktree whose checkout is gone on the host is left alone: git prunes
@@ -4102,7 +4131,13 @@ protect_sandbox_config() {
                     fi
                     ;;
                 .git)
-                    if [[ "$PROTECT_GIT_CONFIG" = true ]]; then
+                    if [[ "$PROTECT_GIT_CONFIG" = true ]] && git_entry_is_ignored "$src" "$path"; then
+                        log_info "${YELLOW}⚠${NC} Not protecting $(display_path "$dest${path#"$src"}") (repository in a git-ignored directory)"
+                        IGNORED_GIT_REPOS+=("$dest${path#"$src"}")
+                        if [[ -d "$path" && ! -L "$path" ]]; then
+                            keep_hidden_worktrees_registered "$path" "$target_name" seen
+                        fi
+                    elif [[ "$PROTECT_GIT_CONFIG" = true ]]; then
                         protect_git_entry "$path" "$dest${path#"$src"}" "$target_name" seen
                     elif [[ -d "$path" && ! -L "$path" ]]; then
                         protect_or_keep_git_dir "$path" "$dest${path#"$src"}" "$target_name" seen
@@ -5493,6 +5528,9 @@ if [[ "$PROTECT_GIT_CONFIG" = false ]]; then
     log_info "Git Config Protection: ${YELLOW}disabled${NC}"
 elif [[ ${#PROTECTED_GIT_DIRS[@]} -gt 0 ]]; then
     log_info "Git Config Protection: ${YELLOW}enabled${NC} (hooks and configuration read-only in ${#PROTECTED_GIT_DIRS[@]} git director$([[ ${#PROTECTED_GIT_DIRS[@]} -eq 1 ]] && echo y || echo ies))"
+fi
+if [[ ${#IGNORED_GIT_REPOS[@]} -gt 0 ]]; then
+    log_info "Unprotected Git Repositories (in git-ignored directories): ${YELLOW}${IGNORED_GIT_REPOS[*]}${NC}"
 fi
 if [[ ${#HIDDEN_WORKTREE_CHECKOUTS[@]} -gt 0 ]]; then
     log_info "Other Git Worktrees (kept registered, not mounted): ${YELLOW}${HIDDEN_WORKTREE_CHECKOUTS[*]}${NC}"
