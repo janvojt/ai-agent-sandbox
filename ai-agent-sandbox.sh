@@ -49,6 +49,13 @@ ACP_COMMAND=false
 NO_PROJECT_WORKDIR=false
 MIGRATE_PROJECT_CONFIG=false
 PROTECT_PROJECT_CONFIG=true
+# Project config files must have been approved on the host (opt-in, see
+# check_project_approval); --approve-project-config approves them and exits
+REQUIRE_PROJECT_APPROVAL=false
+APPROVE_PROJECT_CONFIG=false
+APPROVALS_DIR="${AI_AGENT_SANDBOX_APPROVALS_DIR:-$HOME/.local/state/ai-agent-sandbox/approved-config}"
+# Summary text of the approval check
+PROJECT_APPROVAL_STATUS=""
 # Hooks and configuration of git repositories in read-write mounts are mounted
 # read-only (see protect_git_dir): git runs them on the host later
 PROTECT_GIT_CONFIG=true
@@ -237,6 +244,13 @@ OPTIONS:
     --no-protect-git-config Leave the hooks and configuration of git repositories in
                             writable mounts writable (read-only by default: git runs
                             them on the host); --protect-git-config switches it back on
+    --require-project-approval
+                            Refuse project config files (.ai-agent-sandbox/) whose
+                            content was not approved on the host; asks in a terminal.
+                            Off by default, --no-require-project-approval overrides
+                            the config file
+    --approve-project-config
+                            Show this project's config files, approve them and exit
     --docker-image IMAGE    Socket proxy image (default: ghcr.io/wollomatic/socket-proxy:1)
     --docker-port-range A-B Host loopback ports for container ports published without a
                             host port (-p 5432, Testcontainers), reachable inside the
@@ -290,7 +304,8 @@ CONFIGURATION FILE FORMAT:
     Config:    YAML (flat subset). Keys: profile, agent, network, seccomp, docker, docker_image,
                 docker_port_range, venv,
                 gitconfig, shared_skills, gpg_agent, quiet,
-                protect_project_config, protect_git_config (user-level only),
+                protect_project_config, protect_git_config,
+                require_project_approval (user-level only),
                 whitelist, blacklist, host_ports, allow_hosts, agent_args (lists),
                 env (KEY: VALUE mapping)
     whitelist: Absolute or relative paths/patterns that the agent can read
@@ -595,7 +610,7 @@ apply_config_scalar() {
                 SECCOMP_SOURCE="$file"
             fi
             ;;
-        docker|venv|gpg_agent|gitconfig|shared_skills|quiet|protect_project_config|protect_git_config)
+        docker|venv|gpg_agent|gitconfig|shared_skills|quiet|protect_project_config|protect_git_config|require_project_approval)
             [[ "$is_null" = true ]] && return 0
             bool=$(parse_yaml_bool "$value" "$key" "$file") || exit 1
             case "$key" in
@@ -605,15 +620,17 @@ apply_config_scalar() {
                 gitconfig) MOUNT_GITCONFIG="$bool" ;;
                 shared_skills) SHARE_SKILLS="$bool" ;;
                 quiet) QUIET="$bool" ;;
-                protect_project_config|protect_git_config)
+                protect_project_config|protect_git_config|require_project_approval)
                     # The project itself must not be able to switch off the
                     # protection of its own configuration
                     if is_project_config_file "$file"; then
                         config_warn "Ignoring '$key' in $file (only allowed in user-level config files or on the command line)"
                     elif [[ "$key" = protect_project_config ]]; then
                         PROTECT_PROJECT_CONFIG="$bool"
-                    else
+                    elif [[ "$key" = protect_git_config ]]; then
                         PROTECT_GIT_CONFIG="$bool"
+                    else
+                        REQUIRE_PROJECT_APPROVAL="$bool"
                     fi
                     ;;
             esac
@@ -831,6 +848,152 @@ load_config_files() {
         CONFIG_FILES_LOADED+=("$file")
         parse_config_file "$file"
     done
+}
+
+# --- Project configuration approval -------------------------------------------
+#
+# Project files are controlled by the repository: a clone, a pull, or a commit
+# the agent made through git (the working tree's .ai-agent-sandbox/ is read-only,
+# .git/objects and refs are not) can change them, and they may whitelist any
+# host path. With REQUIRE_PROJECT_APPROVAL a project file only applies once its
+# exact content has been approved on the host. Approvals live in APPROVALS_DIR,
+# outside every mount (hidden when a whitelist entry covers it), one directory
+# per project and file name holding a copy of every approved version, named by
+# its SHA-256: switching branches back does not ask again, and a change is
+# shown as a diff against the newest approved version. The project is the main
+# checkout for a git worktree, so T3 Code's per-thread worktrees share it.
+
+# Print the project files that apply to this run
+project_config_files_in_use() {
+    local file
+    for file in "${CONFIG_FILES_LOADED[@]}"; do
+        if is_project_config_file "$file"; then
+            echo "$file"
+        fi
+    done
+    if [[ "$PROJECT_HAS_YAML" = false ]]; then
+        for file in "${PROJECT_LEGACY_FILES[@]}"; do
+            echo "$file"
+        done
+    fi
+}
+
+# The directory approvals are keyed by: the main checkout (or bare repository)
+# of a verified git worktree, otherwise the working directory
+project_approval_root() {
+    local common="$GIT_WORKTREE_COMMON_DIR"
+    if [[ -n "$common" && "${common##*/}" == .git ]]; then
+        realpath -m "$(dirname "$common")"
+    elif [[ -n "$common" ]]; then
+        realpath -m "$common"
+    else
+        realpath -m "$WORKING_DIR"
+    fi
+}
+
+# Usage: project_approval_dir <file>
+project_approval_dir() {
+    local root key
+    root="$(project_approval_root)"
+    key="$(printf '%s\0%s' "$root" "${1##*/}" | sha256sum | cut -d' ' -f1)"
+    printf '%s/%s\n' "$APPROVALS_DIR" "$key"
+}
+
+# Usage: project_file_hash <file>
+project_file_hash() {
+    sha256sum < "$1" | cut -d' ' -f1
+}
+
+# Usage: project_file_approved <file>
+project_file_approved() {
+    local dir hash
+    dir="$(project_approval_dir "$1")"
+    hash="$(project_file_hash "$1")"
+    [[ -f "$dir/$hash" ]]
+}
+
+# Usage: approve_project_file <file>
+approve_project_file() {
+    local file="$1" dir hash
+    dir="$(project_approval_dir "$file")"
+    hash="$(project_file_hash "$file")"
+    (umask 077 && mkdir -p "$dir" && cp -- "$file" "$dir/$hash.tmp" && mv -f -- "$dir/$hash.tmp" "$dir/$hash") || return 1
+    printf '%s/.ai-agent-sandbox/%s\n' "$(project_approval_root)" "${file##*/}" > "$dir/path"
+    chmod 700 "$APPROVALS_DIR" 2>/dev/null || true
+}
+
+# Usage: show_project_file_change <file>
+# The file, or its diff against the newest approved version, on stderr; cat -v
+# keeps escape sequences in the file from rewriting what the terminal shows
+show_project_file_change() {
+    local file="$1" dir latest="" version
+    dir="$(project_approval_dir "$file")"
+    for version in "$dir"/[0-9a-f]*; do
+        [[ -f "$version" ]] || continue
+        [[ -z "$latest" || "$version" -nt "$latest" ]] && latest="$version"
+    done
+    if [[ -n "$latest" ]]; then
+        echo -e "${YELLOW}Changed since approved:${NC} $file" >&2
+        diff -u --label approved --label "$file" -- "$latest" "$file" | cat -v >&2 || true
+    else
+        echo -e "${YELLOW}Not approved yet:${NC} $file" >&2
+        cat -v -- "$file" >&2
+    fi
+    echo >&2
+}
+
+# Usage: check_project_approval <mode>
+# mode "start": approved files pass; unapproved ones are shown and asked about
+# in a terminal, otherwise the start is refused (exit 1). mode "approve"
+# (--approve-project-config): unapproved files are shown and approved, after a
+# question in a terminal. Sets PROJECT_APPROVAL_STATUS.
+check_project_approval() {
+    local mode="$1" file answer
+    local -a files=() pending=()
+    mapfile -t files < <(project_config_files_in_use)
+    if [[ ${#files[@]} -gt 0 ]] && ! command -v sha256sum >/dev/null 2>&1; then
+        echo -e "${RED}Error: sha256sum is needed to check project config approvals${NC}" >&2
+        exit 1
+    fi
+    for file in "${files[@]}"; do
+        project_file_approved "$file" || pending+=("$file")
+    done
+    if [[ ${#pending[@]} -eq 0 ]]; then
+        PROJECT_APPROVAL_STATUS="required (${#files[@]} project file$([[ ${#files[@]} -eq 1 ]] || echo s) approved)"
+        [[ "$mode" = approve ]] && echo "Project configuration is approved, nothing to do" >&2
+        return 0
+    fi
+    if [[ "$mode" = start ]] && ! [[ -t 0 && -t 2 ]]; then
+        echo -e "${RED}Error: project configuration not approved:${NC}" >&2
+        printf '  %s\n' "${pending[@]}" >&2
+        echo "Project files can whitelist host paths and set environment variables, and they" >&2
+        echo "change with every pull or commit. Review and approve them on the host with:" >&2
+        echo "  cd $WORKING_DIR && $0 --approve-project-config" >&2
+        exit 1
+    fi
+    echo -e "${YELLOW}Project configuration needs your approval${NC} (it can whitelist host paths and set environment variables):\n" >&2
+    for file in "${pending[@]}"; do
+        show_project_file_change "$file"
+    done
+    if [[ -t 0 && -t 2 ]]; then
+        answer=""
+        read -r -p "Approve and use this configuration? [y/N] " answer || answer=""
+        case "$answer" in
+            y|Y|yes|Yes|YES) ;;
+            *)
+                echo "Not approved." >&2
+                exit 1
+                ;;
+        esac
+    fi
+    for file in "${pending[@]}"; do
+        if ! approve_project_file "$file"; then
+            echo -e "${RED}Error: could not record the approval of $file in $APPROVALS_DIR${NC}" >&2
+            exit 1
+        fi
+    done
+    echo -e "${GREEN}Approved${NC} ${#pending[@]} project file$([[ ${#pending[@]} -eq 1 ]] || echo s) (recorded in $APPROVALS_DIR)" >&2
+    PROJECT_APPROVAL_STATUS="required (${#files[@]} project file$([[ ${#files[@]} -eq 1 ]] || echo s) approved, ${#pending[@]} just now)"
 }
 
 # --- Profiles -----------------------------------------------------------------
@@ -4689,6 +4852,18 @@ while [[ $# -gt 0 ]]; do
             PROTECT_GIT_CONFIG=false
             shift
             ;;
+        --require-project-approval)
+            REQUIRE_PROJECT_APPROVAL=true
+            shift
+            ;;
+        --no-require-project-approval)
+            REQUIRE_PROJECT_APPROVAL=false
+            shift
+            ;;
+        --approve-project-config)
+            APPROVE_PROJECT_CONFIG=true
+            shift
+            ;;
         --env|-e)
             ENV_VARS+=("$2")
             ENV_VAR_SOURCES+=("--env")
@@ -4893,6 +5068,11 @@ warn_legacy_files "user-level" "$DEFAULT_CONFIG_FILE" "$USER_HAS_YAML" \
 warn_legacy_files "project-level" "$PROJECT_CONFIG_FILE" "$PROJECT_HAS_YAML" \
     "run with --migrate-project-conf to migrate them" "${PROJECT_LEGACY_FILES[@]}"
 
+if [[ "$APPROVE_PROJECT_CONFIG" = true ]]; then
+    check_project_approval approve
+    exit 0
+fi
+
 if [[ -z "$PROFILE" ]]; then
     PROFILE="default"
     PROFILE_SOURCE="default"
@@ -4988,6 +5168,12 @@ elif [[ "$ALLOW_HOME_WORKDIR" = false ]] \
         echo "provider instead (see README, T3 Code section)." >&2
     fi
     exit 1
+fi
+
+# Before anything is started or mounted (the version fast path above runs only
+# the host binary, without the project's settings)
+if [[ "$REQUIRE_PROJECT_APPROVAL" = true ]]; then
+    check_project_approval start
 fi
 
 if [[ "$AGENT" = "opencode" ]] && [[ -x "$AGENT_BIN" ]]; then
@@ -5272,6 +5458,11 @@ if [[ -d "$PROFILES_DIR" ]] && is_path_bound "$PROFILES_DIR"; then
     BWRAP_ARGS+=(--tmpfs "$PROFILES_DIR")
     log_info "${YELLOW}✓${NC} Hidden profile store $PROFILES_DIR (covered by another mount)"
 fi
+# The agent must not approve its own changes
+if [[ -d "$APPROVALS_DIR" ]] && is_path_bound "$APPROVALS_DIR"; then
+    BWRAP_ARGS+=(--tmpfs "$APPROVALS_DIR")
+    log_info "${YELLOW}✓${NC} Hidden project config approvals $APPROVALS_DIR (covered by another mount)"
+fi
 
 if [[ "$ENABLE_VENV" = true ]]; then
     log_info "\n${GREEN}Virtual environment:${NC} $VENV_PATH"
@@ -5523,6 +5714,9 @@ if [[ "$PROTECT_PROJECT_CONFIG" = true ]]; then
     log_info "Project Config Protection: ${YELLOW}enabled${NC} (.ai-agent-sandbox/ in writable mounts and the user configuration are read-only)"
 else
     log_info "Project Config Protection: ${YELLOW}disabled${NC}"
+fi
+if [[ "$REQUIRE_PROJECT_APPROVAL" = true ]]; then
+    log_info "Project Config Approval: ${YELLOW}${PROJECT_APPROVAL_STATUS}${NC}"
 fi
 if [[ "$PROTECT_GIT_CONFIG" = false ]]; then
     log_info "Git Config Protection: ${YELLOW}disabled${NC}"

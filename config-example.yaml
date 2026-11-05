@@ -204,6 +204,14 @@ agent_args:
 # the agent cannot rewrite these rules.
 # protect_project_config: true
 
+# Only honoured in the user-level file (or via --require-project-approval /
+# --no-require-project-approval): a project's .ai-agent-sandbox/ files only apply
+# once their exact content has been approved on the host. A start in a terminal
+# shows a new or changed file (as a diff) and asks; without a terminal (T3 Code)
+# it is refused until you run `ai-agent-sandbox.sh --approve-project-config` in
+# the project. Off by default.
+# require_project_approval: false
+
 # Only honoured in the user-level file (or via --no-protect-git-config /
 # --protect-git-config): mount the hooks and configuration (config,
 # config.worktree, hooks/, worktree links) of every git repository in a writable

@@ -450,6 +450,15 @@ Commits, branches, rebases, stashes, fetches and merges keep working. Commands t
 
 Not covered: code that lives in the working tree itself and runs when you use the project (hooks managed in the tree such as `.husky/`, `Makefile`, `package.json` scripts, `.envrc`, `.vscode/tasks.json`, a virtualenv's `activate`). Those are project files the agent is meant to edit, so review the diff before running them, as you would review any change it makes. Neither are git repositories the agent creates during the session: a new `.git` below the working directory (a nested clone, `git init`) is writable, so do not run git in such a directory on the host without looking at its `.git/config` first.
 
+**Project config approval (opt-in).** The read-only `.ai-agent-sandbox/` does not stop changes that arrive through git: a clone, a pull, or a commit the agent creates with git commands (it may write `.git/objects` and `refs`) changes the file in your working tree once you check it out, and a project file can whitelist any host path (`~/.ssh`) or set environment variables. With `require_project_approval: true` in the user-level config (or `--require-project-approval`), a project file only applies once you have approved its exact content:
+
+- A start in a terminal shows every new file, or the diff of a changed one against the version you approved last, and asks `[y/N]`. Escape sequences in the file are shown escaped.
+- A start without a terminal (T3 Code, scripts) is refused with the list of files. Review and approve them with `ai-agent-sandbox.sh --approve-project-config` in the project directory; it shows the same output and exits.
+- Approvals are stored per project and file name in `~/.local/state/ai-agent-sandbox/approved-config` (`AI_AGENT_SANDBOX_APPROVALS_DIR`), with a copy of every approved version: going back to a version approved before does not ask again. The git worktrees of a repository share the approvals of the main checkout, so T3 Code's per-thread worktrees do not ask once each. The directory is hidden inside the sandbox even when a whitelist entry covers it.
+- Every file that applies counts: `config.yaml`, `config.local.yaml` (also the main checkout's one in a worktree) and legacy files still in use. Deleting a file needs no approval.
+
+The setting is ignored in project files. `--no-require-project-approval` switches it off for one run.
+
 All files are merged together, allowing you to:
 - Maintain a base configuration in the user-level file
 - Add project-specific rules in `.ai-agent-sandbox/config.yaml` (can be committed to version control)
