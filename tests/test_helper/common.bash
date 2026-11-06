@@ -21,6 +21,7 @@ setup_test_env() {
     STUB_DIR="$BATS_TEST_TMPDIR/stubs"
     BWRAP_ARGS_FILE="$BATS_TEST_TMPDIR/bwrap.args"
     BWRAP_ENV_FILE="$BATS_TEST_TMPDIR/bwrap.env"
+    BWRAP_SIGIGN_FILE="$BATS_TEST_TMPDIR/bwrap.sigign"
     mkdir -p "$TEST_HOME" "$TEST_WORK" "$STUB_DIR"
     # Physical paths without subshells (every command is slow under bats);
     # ends in TEST_WORK
@@ -56,13 +57,15 @@ stub_command() {
 }
 
 # Stub bwrap that advertises overlay support and records its arguments, one
-# per line, in BWRAP_ARGS_FILE, and its environment in BWRAP_ENV_FILE, instead
-# of starting a sandbox. Exits with STUB_BWRAP_STATUS (default 0), read when
+# per line, in BWRAP_ARGS_FILE, its environment in BWRAP_ENV_FILE and its
+# ignored signals (the SigIgn line of /proc/self/status) in BWRAP_SIGIGN_FILE,
+# instead of starting a sandbox. Exits with STUB_BWRAP_STATUS (default 0), read when
 # the stub is created: the script hides such variables from bwrap.
 stub_bwrap() {
     stub_command bwrap "if [[ \"\${1:-}\" == --help ]]; then echo '--overlay-src'; exit 0; fi
 printf '%s\n' \"\$@\" > '$BWRAP_ARGS_FILE'
 env > '$BWRAP_ENV_FILE'
+grep '^SigIgn:' /proc/self/status > '$BWRAP_SIGIGN_FILE'
 exit ${STUB_BWRAP_STATUS:-0}"
 }
 
@@ -70,6 +73,7 @@ exit ${STUB_BWRAP_STATUS:-0}"
 # Run the script as a subprocess in TEST_WORK with stdin from /dev/null and a
 # stub bwrap and claude. The network mode defaults to host (isolated mode needs
 # pasta and real namespaces); export AI_AGENT_SANDBOX_NETWORK to change it.
+# RUN_SANDBOX_ENV_OPTIONS (array) is passed to the env that starts the script.
 # Sets bats' status/output (stdout and stderr combined, colors stripped), loads
 # the recorded bwrap arguments into BWRAP_RECORDED and the command bwrap was
 # asked to run (everything after the first --) into SANDBOX_COMMAND.
@@ -77,7 +81,7 @@ run_sandbox() {
     [[ -x "$STUB_DIR/bwrap" ]] || stub_bwrap
     [[ -x "$STUB_DIR/claude" ]] || stub_command claude 'echo "2.1.0 (Claude Code)"'
     rm -f "$BWRAP_ARGS_FILE"
-    run env AI_AGENT_SANDBOX_NETWORK="${AI_AGENT_SANDBOX_NETWORK:-host}" \
+    run env "${RUN_SANDBOX_ENV_OPTIONS[@]}" AI_AGENT_SANDBOX_NETWORK="${AI_AGENT_SANDBOX_NETWORK:-host}" \
         bash "$SANDBOX_SCRIPT" "$@" </dev/null
     output="$(printf '%s' "$output" | sed 's/\x1b\[[0-9;]*m//g')"
     mapfile -t lines <<< "$output"

@@ -199,6 +199,17 @@ git config core.fsmonitor 'touch pwned' || echo config-ro"
     refute_output --partial secret
 }
 
+@test "commands inside do not inherit an ignored SIGINT or SIGQUIT" {
+    # Started with both at the default (see the harness test)
+    env --default-signal=INT true 2>/dev/null || skip "env --default-signal needs coreutils 8.31"
+    run env --default-signal=INT,QUIT bash -c 'echo "grep ^SigIgn: /proc/self/status" | AI_AGENT_SANDBOX_NETWORK=none bash "$0" --dry-run -q' "$SANDBOX_SCRIPT"
+    assert_success
+    local mask
+    mask=$(printf '%s\n' "$output" | awk '/^SigIgn:/ {print $2}')
+    assert [ -n "$mask" ]
+    assert_equal "$(( 0x$mask & 0x6 ))" 0
+}
+
 @test "SIGTERM and SIGHUP end the sandbox with 143 and 129" {
     # A unique sleep, matched at the start of the command line so the test
     # shell (whose source contains the marker) does not count

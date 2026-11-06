@@ -3470,8 +3470,13 @@ run_in_sandbox() {
         bwrap_extra+=(--seccomp "$SECCOMP_FD")
     fi
     # The subshell drops the hidden host variables and becomes bwrap (exec),
-    # so $! is bwrap's pid
+    # so $! is bwrap's pid. Without job control bash starts background jobs
+    # with SIGINT and SIGQUIT ignored, and an ignored disposition is inherited
+    # through bwrap by everything inside: Ctrl+C would not stop a build in the
+    # dry-run shell, and the JVM does not even install its handler then. The
+    # trap resets both to the default before the exec.
     {
+        trap - INT QUIT
         filter_host_environment
         exec "$BWRAP_BIN" "${BWRAP_ARGS[@]}" "${bwrap_extra[@]}" -- "$@"
     } <&0 &
@@ -5084,9 +5089,9 @@ resolve_profile_home
 trap cleanup_sandbox EXIT
 trap 'forward_signal_and_exit HUP "$SIGHUP_EXIT_STATUS"' HUP
 trap 'forward_signal_and_exit TERM "$SIGTERM_EXIT_STATUS"' TERM
-# Ctrl+C belongs to the agent: a trapped (not ignored) signal keeps the default
-# disposition in the children, and bash just returns to waiting. bwrap itself
-# ignores SIGINT, so the sandbox survives it like a foreground child would.
+# Ctrl+C belongs to the agent: the script traps it (an ignored signal would be
+# inherited) and keeps waiting, run_in_sandbox starts bwrap with the default
+# disposition, as for a foreground child.
 trap ':' INT
 
 # Validate agent selection

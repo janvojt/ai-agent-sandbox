@@ -19,6 +19,20 @@ setup() {
     assert_equal "$status" 42
 }
 
+@test "bwrap starts with SIGINT and SIGQUIT at their default disposition" {
+    # A background job of a non-interactive bash ignores both, and everything
+    # inside would inherit that (Ctrl+C could not stop a build). The script is
+    # started with both at the default: bash cannot reset a signal that was
+    # already ignored when it started (as under bats --jobs)
+    env --default-signal=INT true 2>/dev/null || skip "env --default-signal needs coreutils 8.31"
+    RUN_SANDBOX_ENV_OPTIONS=(--default-signal=INT,QUIT)
+    run_sandbox --dry-run -q
+    assert_success
+    local mask
+    mask=$(awk '{print $2}' "$BWRAP_SIGIGN_FILE")
+    assert_equal "$(( 0x$mask & 0x6 ))" 0
+}
+
 @test "without a terminal the sandbox runs in a new session" {
     run_sandbox --dry-run
     assert_success
