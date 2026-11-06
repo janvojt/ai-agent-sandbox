@@ -184,9 +184,14 @@ DOCKER_PORT_RANGE_DEFAULT="29000-29999"
 DOCKER_PORT_RANGE="$DOCKER_PORT_RANGE_DEFAULT"
 PROXY_CONTAINER_NAME=""
 PROXY_SOCKET_PATH=""
-PROXY_SOCKET_DIR=""
-# Docker API filter in front of the socket proxy (see docker_filter_program)
+# Docker API filter in front of the socket proxy (see docker_filter_program).
+# Per run, holds the filter's socket, the proxy's socket and the filter's log.
 DOCKER_PRIVATE_DIR=""
+# Where DOCKER_PRIVATE_DIR is created. Always /tmp, not $TMPDIR: the sandbox has
+# its own empty tmpfs there (a $TMPDIR under a whitelisted path would expose
+# the proxy's socket, which bypasses the filter), the path is short enough for
+# a Unix socket and the host clears it. Changed by the tests only.
+DOCKER_PRIVATE_BASE="/tmp"
 DOCKER_FILTER_PID=""
 DOCKER_ROOTLESS=false
 VENV_PATH=""
@@ -1772,9 +1777,8 @@ collect_allowed_mount_paths() {
             split_mount_root "$root" "${PROTECTED_CONFIG_SOURCES[@]}"
         done
         # This run's own socket (TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE): Ryuk
-        # mounts it. It does not exist yet and the working directory is split
-        # around its configuration, so it is never covered by the roots.
-        docker_proxy_socket_path
+        # mounts it. It does not exist yet and lies outside the roots.
+        [[ -z "$DOCKER_PRIVATE_DIR" ]] || docker_proxy_socket_path
     } | sort -u | tr '\n' ',' | sed 's/,$//'
 }
 
@@ -2551,12 +2555,40 @@ remove_stale_socket_proxies() {
     return 0
 }
 
-# The filter's socket in the working directory, one per run: several sandboxes
-# can run in the same directory at once (T3 Code starts more than one Claude
-# process per worktree), and one run's cleanup must not remove the socket of
-# another one that is still running
+# The filter's socket, bound into the sandbox at the same path (Ryuk mounts it
+# by that path, which the daemon resolves on the host). It lives in the per-run
+# private directory: several sandboxes can run in the same directory at once
+# (T3 Code starts more than one Claude process per worktree), and a path in the
+# working directory could exceed the 107 characters of a Unix socket path (T3
+# names scratch directories after the first prompt).
 docker_proxy_socket_path() {
-    echo "$WORKING_DIR/.docker-proxy/docker-$$.sock"
+    echo "$DOCKER_PRIVATE_DIR/docker.sock"
+}
+
+# Create DOCKER_PRIVATE_DIR (0700) with this run's pid in it, after removing
+# the directories of runs that are gone. Called before the sandbox environment
+# is set, which names the socket.
+prepare_docker_private_dir() {
+    remove_stale_docker_private_dirs
+    DOCKER_PRIVATE_DIR="$(mktemp -d "$DOCKER_PRIVATE_BASE/ai-agent-sandbox-docker.XXXXXX")" || exit 1
+    echo "$$" > "$DOCKER_PRIVATE_DIR/pid"
+}
+
+# Private directories of earlier runs whose script is gone (killed without its
+# EXIT trap). Only our own directories with a pid file count: one without is
+# from an older version or is just being created by a concurrent run.
+remove_stale_docker_private_dirs() {
+    local dir pid
+    for dir in "$DOCKER_PRIVATE_BASE"/ai-agent-sandbox-docker.*; do
+        [[ -d "$dir" && ! -L "$dir" && -O "$dir" && -f "$dir/pid" ]] || continue
+        pid=""
+        read -r pid < "$dir/pid" 2>/dev/null || true
+        [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -rf "$dir" && log_info "${YELLOW}Removed stale Docker proxy directory $dir${NC}"
+        fi
+    done
+    return 0
 }
 
 # The range the filter maps published ports into (empty: no mapping)
@@ -2564,23 +2596,9 @@ docker_published_port_range() {
     [[ "$DOCKER_PORT_RANGE" == none ]] || echo "$DOCKER_PORT_RANGE"
 }
 
-# Sockets of earlier runs in .docker-proxy whose script is gone
-remove_stale_proxy_sockets() {
-    local socket pid
-    for socket in "$PROXY_SOCKET_DIR"/docker-*.sock; do
-        [[ -S "$socket" ]] || continue
-        pid="${socket##*/docker-}"
-        pid="${pid%.sock}"
-        [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
-        kill -0 "$pid" 2>/dev/null || rm -f "$socket"
-    done
-    return 0
-}
-
 start_socket_proxy() {
     PROXY_CONTAINER_NAME="ai-agent-sandbox-proxy-$$"
     PROXY_SOCKET_PATH="$(docker_proxy_socket_path)"
-    PROXY_SOCKET_DIR="${PROXY_SOCKET_PATH%/*}"
     local upstream_dir upstream_socket filter_program
     local docker_group_gid=""
     local proxy_group_args=()
@@ -2597,15 +2615,11 @@ start_socket_proxy() {
 
     remove_stale_socket_proxies
 
-    # The sandbox only sees the filter's socket (mode 0600 in .docker-proxy);
-    # the proxy's own socket lives in a private directory outside it. The
-    # proxy container writes into upstream/ (0777 for user namespace remapped
-    # daemons), which nobody else can reach through the 0700 parent.
-    mkdir -p "$PROXY_SOCKET_DIR"
-    chmod 0700 "$PROXY_SOCKET_DIR" 2>/dev/null || true
-    remove_stale_proxy_sockets
+    # The sandbox only sees the filter's socket (mode 0600, bound on its own);
+    # the proxy's socket next to it is not mounted. The proxy container writes
+    # into upstream/ (0777 for user namespace remapped daemons), which nobody
+    # else can reach through the 0700 parent.
     rm -f "$PROXY_SOCKET_PATH"
-    DOCKER_PRIVATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ai-agent-sandbox-docker.XXXXXX")" || exit 1
     upstream_dir="$DOCKER_PRIVATE_DIR/upstream"
     upstream_socket="$upstream_dir/docker.sock"
     filter_program="$DOCKER_PRIVATE_DIR/docker_filter.py"
@@ -2698,9 +2712,6 @@ cleanup_socket_proxy() {
     fi
     if [[ -n "${PROXY_SOCKET_PATH:-}" ]] && [[ -e "$PROXY_SOCKET_PATH" ]]; then
         rm -f "$PROXY_SOCKET_PATH" 2>/dev/null || true
-    fi
-    if [[ -n "${PROXY_SOCKET_DIR:-}" ]] && [[ -d "$PROXY_SOCKET_DIR" ]]; then
-        rmdir "$PROXY_SOCKET_DIR" 2>/dev/null || true
     fi
     if [[ -n "${DOCKER_PRIVATE_DIR:-}" ]] && [[ -d "$DOCKER_PRIVATE_DIR" ]]; then
         rm -rf "$DOCKER_PRIVATE_DIR" 2>/dev/null || true
@@ -5155,7 +5166,7 @@ if [[ "$ALLOW_HOME_WORKDIR" = false && "$AGENT" = "opencode" && "$ACP_COMMAND" =
     && "$REAL_HOME" == "$REAL_WORKING_DIR" ]]; then
     NO_PROJECT_WORKDIR=true
     if [[ "$ENABLE_DOCKER" = true ]]; then
-        log_info "${YELLOW}⚠${NC} Docker disabled: no project directory for the proxy socket"
+        log_info "${YELLOW}⚠${NC} Docker disabled: no project directory to own containers and bind mounts"
         ENABLE_DOCKER=false
     fi
 elif [[ "$ALLOW_HOME_WORKDIR" = false ]] \
@@ -5587,6 +5598,9 @@ BWRAP_ARGS+=(--unsetenv SSH_AUTH_SOCK)
 BWRAP_ARGS+=(--unsetenv SSH_AGENT_PID)
 
 if [[ "$ENABLE_DOCKER" = true ]]; then
+    prepare_docker_private_dir
+    # Created by start_socket_proxy before bwrap starts
+    BWRAP_ARGS+=(--bind "$(docker_proxy_socket_path)" "$(docker_proxy_socket_path)")
     sandbox_setenv DOCKER_HOST "unix://$(docker_proxy_socket_path)"
     sandbox_setenv TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE "$(docker_proxy_socket_path)"
     sandbox_setenv TESTCONTAINERS_HOST_OVERRIDE "localhost"

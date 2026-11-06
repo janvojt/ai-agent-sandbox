@@ -836,8 +836,9 @@ make_worktree_entry() {
 @test "collect_allowed_mount_paths: the working directory is split around its configuration" {
     mkdir -p "$PROJECT_CONFIG_DIR" "$TEST_WORK/src"
     PROTECTED_CONFIG_SOURCES=("$PROJECT_CONFIG_DIR")
+    DOCKER_PRIVATE_DIR="$BATS_TEST_TMPDIR/docker"
     QUIET=true
     run collect_allowed_mount_paths
     assert_success
-    assert_output "$TEST_WORK/.docker-proxy/docker-$$.sock,$TEST_WORK/src"
+    assert_output "$BATS_TEST_TMPDIR/docker/docker.sock,$TEST_WORK/src"
 }

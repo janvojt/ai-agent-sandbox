@@ -457,35 +457,70 @@ sys.stdout.write(out.decode("latin-1"))
     assert_output --partial "echo:raw stdin bytes"
 }
 
-# --- the socket in the working directory --------------------------------------
+# --- the filter's socket --------------------------------------------------------
 
-@test "every run has its own socket, so a run's cleanup leaves a concurrent run's socket alone" {
-    assert_equal "$(docker_proxy_socket_path)" "$WORKING_DIR/.docker-proxy/docker-$$.sock"
-    PROXY_SOCKET_DIR="$WORKING_DIR/.docker-proxy"
-    mkdir -p "$PROXY_SOCKET_DIR"
-    local other="$PROXY_SOCKET_DIR/docker-$PPID.sock"
-    python3 -I -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$other"
+@test "every run gets its own private directory for the sockets, and cleanup removes only its own" {
+    DOCKER_PRIVATE_BASE="$BATS_TEST_TMPDIR/tmp"
+    mkdir -p "$DOCKER_PRIVATE_BASE"
+    prepare_docker_private_dir
+    local first="$DOCKER_PRIVATE_DIR"
+    assert_equal "$(docker_proxy_socket_path)" "$first/docker.sock"
+    assert_equal "$(stat -c %a "$first")" 700
+    assert_equal "$(cat "$first/pid")" "$$"
+    prepare_docker_private_dir
+    local second="$DOCKER_PRIVATE_DIR"
+    refute [ "$first" = "$second" ]
     PROXY_SOCKET_PATH="$(docker_proxy_socket_path)"
-    : > "$PROXY_SOCKET_PATH"
+    python3 -I -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$PROXY_SOCKET_PATH"
     PROXY_CONTAINER_NAME=""
     cleanup_socket_proxy
-    assert_not_exist "$PROXY_SOCKET_PATH"
-    assert_exist "$other"
-    assert_dir_exists "$PROXY_SOCKET_DIR"
+    assert_not_exist "$second"
+    assert_dir_exists "$first"
 }
 
-@test "remove_stale_proxy_sockets removes the sockets of runs that are gone" {
-    PROXY_SOCKET_DIR="$WORKING_DIR/.docker-proxy"
-    mkdir -p "$PROXY_SOCKET_DIR"
-    local dead_pid
+@test "the private directory is in /tmp, not in \$TMPDIR" {
+    assert_equal "$DOCKER_PRIVATE_BASE" /tmp
+    export TMPDIR="$BATS_TEST_TMPDIR/tmp"
+    mkdir -p "$TMPDIR"
+    prepare_docker_private_dir
+    [[ "$DOCKER_PRIVATE_DIR" == /tmp/ai-agent-sandbox-docker.* ]]
+    rm -rf "$DOCKER_PRIVATE_DIR"
+}
+
+@test "remove_stale_docker_private_dirs removes the directories of runs that are gone" {
+    DOCKER_PRIVATE_BASE="$BATS_TEST_TMPDIR/tmp"
+    local base="$DOCKER_PRIVATE_BASE" dead_pid
     sh -c 'exit 0' & dead_pid=$!
     wait "$dead_pid"
-    local socket
-    for socket in "docker-$PPID.sock" "docker-$dead_pid.sock" "docker-$$.sock"; do
-        python3 -I -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$PROXY_SOCKET_DIR/$socket"
-    done
-    remove_stale_proxy_sockets
-    assert_exist "$PROXY_SOCKET_DIR/docker-$PPID.sock"
-    assert_exist "$PROXY_SOCKET_DIR/docker-$$.sock"
-    assert_not_exist "$PROXY_SOCKET_DIR/docker-$dead_pid.sock"
+    mkdir -p "$base/ai-agent-sandbox-docker.dead" "$base/ai-agent-sandbox-docker.alive" \
+        "$base/ai-agent-sandbox-docker.own" "$base/ai-agent-sandbox-docker.nopid" \
+        "$base/ai-agent-sandbox-docker.junk" "$base/target"
+    echo "$dead_pid" > "$base/ai-agent-sandbox-docker.dead/pid"
+    python3 -I -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$base/ai-agent-sandbox-docker.dead/docker.sock"
+    echo "$PPID" > "$base/ai-agent-sandbox-docker.alive/pid"
+    echo "$$" > "$base/ai-agent-sandbox-docker.own/pid"
+    echo "x y" > "$base/ai-agent-sandbox-docker.junk/pid"
+    echo "$dead_pid" > "$base/target/pid"
+    ln -s "$base/target" "$base/ai-agent-sandbox-docker.link"
+    remove_stale_docker_private_dirs
+    assert_not_exist "$base/ai-agent-sandbox-docker.dead"
+    assert_dir_exists "$base/ai-agent-sandbox-docker.alive"
+    assert_dir_exists "$base/ai-agent-sandbox-docker.own"
+    assert_dir_exists "$base/ai-agent-sandbox-docker.nopid"
+    assert_dir_exists "$base/ai-agent-sandbox-docker.junk"
+    assert_exist "$base/target/pid"
+}
+
+@test "the socket path does not depend on the working directory's length" {
+    # T3 Code names scratch directories after the first prompt
+    WORKING_DIR="$HOME/.t3/scratch/2026-11-06-i-am-thinking-about-operating-33dd584d"
+    prepare_docker_private_dir
+    local socket upstream
+    socket="$(docker_proxy_socket_path)"
+    upstream="$DOCKER_PRIVATE_DIR/upstream/docker.sock"
+    # sun_path has 108 bytes including the NUL
+    (( ${#upstream} <= 107 ))
+    run python3 -I -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$socket"
+    assert_success
+    rm -rf "$DOCKER_PRIVATE_DIR"
 }
