@@ -9,15 +9,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Default configuration
-DEFAULT_WHITELIST_FILE="${AI_AGENT_SANDBOX_WHITELIST:-$HOME/.config/ai-agent-sandbox/whitelist.txt}"
-DEFAULT_BLACKLIST_FILE="${AI_AGENT_SANDBOX_BLACKLIST:-$HOME/.config/ai-agent-sandbox/blacklist.txt}"
-DEFAULT_ENV_FILE="${AI_AGENT_SANDBOX_ENV:-$HOME/.config/ai-agent-sandbox/.env}"
-DEFAULT_ENV_LOCAL_FILE="${AI_AGENT_SANDBOX_ENV_LOCAL:-$HOME/.config/ai-agent-sandbox/.env.local}"
 WORKING_DIR="$(pwd)"
-PROJECT_WHITELIST_FILE="$WORKING_DIR/.ai-agent-sandbox/whitelist.txt"
-PROJECT_BLACKLIST_FILE="$WORKING_DIR/.ai-agent-sandbox/blacklist.txt"
-PROJECT_ENV_FILE="$WORKING_DIR/.ai-agent-sandbox/.env"
-PROJECT_ENV_LOCAL_FILE="$WORKING_DIR/.ai-agent-sandbox/.env.local"
 DEFAULT_CONFIG_FILE="${AI_AGENT_SANDBOX_CONFIG:-$HOME/.config/ai-agent-sandbox/config.yaml}"
 DEFAULT_CONFIG_LOCAL_FILE="${AI_AGENT_SANDBOX_CONFIG_LOCAL:-$HOME/.config/ai-agent-sandbox/config.local.yaml}"
 PROJECT_CONFIG_DIR="$WORKING_DIR/.ai-agent-sandbox"
@@ -52,7 +44,6 @@ CLAUDE_SESSIONLESS=false
 # no project to give it; NO_PROJECT_WORKDIR_REASON names it in the summary
 NO_PROJECT_WORKDIR=false
 NO_PROJECT_WORKDIR_REASON=""
-MIGRATE_PROJECT_CONFIG=false
 PROTECT_PROJECT_CONFIG=true
 # Project config files must have been approved on the host (opt-in, see
 # check_project_approval); --approve-project-config approves them and exits
@@ -80,10 +71,6 @@ PROTECTED_CONFIG_SOURCES=()
 # Checkouts of other worktrees that exist on the host but not in the sandbox,
 # represented by an empty .git directory (see keep_hidden_worktrees_registered)
 HIDDEN_WORKTREE_CHECKOUTS=()
-# Deprecated whitelist.txt / blacklist.txt / .env files still in use
-WHITELIST_FILES=()
-BLACKLIST_FILES=()
-ENV_FILES=()
 WHITELIST_PATHS_RO=()
 WHITELIST_PATHS_RW=()
 BLACKLIST_PATHS=()
@@ -255,8 +242,6 @@ OPTIONS:
     --allow-home-workdir    Allow running in your home directory or one of its parents
                             (refused by default: the agent would get read-write access
                             to your whole home directory)
-    --migrate-project-conf  Migrate legacy .ai-agent-sandbox/ files (whitelist.txt,
-                            blacklist.txt, .env, .env.local) into config.yaml and exit
     --env, -e KEY=VALUE     Set environment variable inside sandbox (can be specified multiple times)
     --whitelist-path PATH   Directly whitelist a path (read-only, can be specified multiple times)
     --whitelist-path-rw PATH Directly whitelist a path (read-write, can be specified multiple times)
@@ -332,14 +317,6 @@ CONFIGURATION FILES (automatically included if they exist):
     A profile set in a project file is not overridden by AI_AGENT_SANDBOX_PROFILE:
     a different value there is an error (--profile still overrides). With
     --strict-profile, a missing AI_AGENT_SANDBOX_PROFILE counts as 'default' for this check.
-
-DEPRECATED LEGACY FILES:
-    whitelist.txt, blacklist.txt, .env and .env.local next to the config files
-    above are deprecated and will no longer be supported in a future release.
-    They are ignored at a level (user or project) that has a config.yaml or
-    config.local.yaml; otherwise they are still used. A warning is printed in
-    both cases. Starting in a terminal offers to migrate the user-level files;
-    project-level files are migrated with --migrate-project-conf.
 
 CONFIGURATION FILE FORMAT:
     Config:    YAML (flat subset). Keys: profile, agent, network, seccomp, docker, docker_image,
@@ -469,8 +446,10 @@ dedupe_array() {
 # --- Configuration file (config.yaml) support ---------------------------------
 #
 # Config files are parsed BEFORE the command line so that command-line flags
-# override them. Messages from the parser are buffered until --quiet/--verbose
-# are known; fatal errors are reported immediately.
+# override them. Anything the parser does not understand (unknown keys, invalid
+# values, unsupported syntax) is a fatal error, reported immediately: a typo
+# must not silently drop a blacklist entry. Warnings (settings a project file
+# may not change) are buffered until --quiet/--verbose are known.
 
 config_warn() {
     CONFIG_LOG_MESSAGES+=("${YELLOW}⚠${NC} $*")
@@ -514,10 +493,11 @@ strip_yaml_comment() {
 # Normalize a raw YAML scalar into the variable named by $2: handles single and
 # double quotes (a trailing comment after the closing quote is dropped) and
 # strips comments from unquoted values. Returns 1 for null (~, null, empty).
-# Must not be called in a subshell: it may buffer warnings.
+# $3 names the location for error messages (file or file:line).
 parse_yaml_scalar() {
     local raw="$1"
     local out_ref="$2"
+    local where="${3:-config file}"
     local _pys_value _pys_quote _pys_prefix _pys_idx _pys_rest
 
     raw=$(trim_whitespace "$raw")
@@ -529,7 +509,7 @@ parse_yaml_scalar() {
             _pys_value="${raw:1:_pys_idx-1}"
             _pys_rest=$(trim_whitespace "${raw:_pys_idx+1}")
             if [[ -n "$_pys_rest" && "$_pys_rest" != "#"* ]]; then
-                config_warn "Ignoring unexpected text after quoted value: $_pys_rest"
+                config_error "$where: unexpected text after quoted value: $_pys_rest"
             fi
             if [[ "$_pys_quote" == '"' ]]; then
                 _pys_value="${_pys_value//\\\"/\"}"
@@ -540,7 +520,7 @@ parse_yaml_scalar() {
             printf -v "$out_ref" '%s' "$_pys_value"
             return 0
         fi
-        config_warn "Unterminated quoted value treated literally: $raw"
+        config_error "$where: unterminated quoted value: $raw"
     fi
 
     _pys_value=$(strip_yaml_comment "$raw")
@@ -583,7 +563,7 @@ apply_config_list_item() {
             NETWORK_ALLOW_HOSTS+=("$item")
             ;;
         *)
-            config_warn "Key '$key' in $file does not accept a list (ignored)"
+            config_error "Key '$key' in $file does not accept a list"
             ;;
     esac
 }
@@ -684,28 +664,27 @@ apply_config_scalar() {
             esac
             ;;
         env)
-            config_warn "Ignoring '$key' in $file: expected an indented KEY: VALUE mapping"
+            config_error "'$key' in $file must be an indented KEY: VALUE mapping"
             ;;
         *)
             if is_config_list_key "$key"; then
                 # A single scalar is accepted as a one-item list
                 [[ "$is_null" = true ]] || apply_config_list_item "$key" "$value" "$file"
             else
-                config_warn "Unknown configuration key '$key' in $file (ignored)"
+                config_error "Unknown configuration key '$key' in $file"
             fi
             ;;
     esac
 }
 
 # env: entries are handed to parse_env_assignment as KEY=<raw value> later so
-# quoting, comments, ~ and $VAR expansion behave exactly like in .env files.
+# quoting, comments, ~ and $VAR expansion behave exactly like for --env.
 apply_config_env_item() {
     local key="$1" raw="$2" file="$3"
     local quote prefix idx
 
     if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-        config_warn "Skipping invalid environment variable name in $file: $key"
-        return 0
+        config_error "Invalid environment variable name in $file: $key"
     fi
 
     raw=$(trim_whitespace "$raw")
@@ -734,7 +713,7 @@ parse_yaml_flow_list() {
     body="${body%\]}"
     IFS=',' read -r -a items <<< "$body"
     for item in "${items[@]}"; do
-        if parse_yaml_scalar "$item" value; then
+        if parse_yaml_scalar "$item" value "$file"; then
             apply_config_list_item "$key" "$value" "$file"
         fi
     done
@@ -756,7 +735,7 @@ parse_yaml_flow_map() {
         if [[ "$entry" =~ ^([A-Za-z_][A-Za-z0-9_]*):([[:space:]]+(.*))?$ ]]; then
             apply_config_env_item "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "$file"
         else
-            config_warn "$file:$lineno: invalid env entry '$entry' (ignored)"
+            config_error "$file:$lineno: invalid env entry '$entry'"
         fi
     done
 }
@@ -768,13 +747,13 @@ parse_yaml_flow_map() {
 #   env:                  followed by indented "KEY: value" lines (mapping)
 #   env: {KEY: value}     flow mapping
 #   # comments, ---/... document markers, CRLF line endings, tab indentation
-# Anything else produces a warning and is ignored.
+# Anything else is a fatal error.
 # The file name is only passed on for messages, nothing writes to it
 # shellcheck disable=SC2094
 parse_config_file() {
     local file="$1"
     local raw_line line lineno=0
-    local state=none current_key=""
+    local state=none current_key=""  # none, pending (key without value), list, env
     local indent key rhs rhs_trimmed item value
 
     while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
@@ -793,16 +772,14 @@ parse_config_file() {
             item="${BASH_REMATCH[2]}"
             if [[ ( "$state" == pending || "$state" == list ) && -n "$current_key" ]]; then
                 if [[ "$state" == pending ]] && ! is_config_list_key "$current_key"; then
-                    config_warn "$file:$lineno: key '$current_key' does not accept a list (ignored)"
-                    state=skip
-                    continue
+                    config_error "$file:$lineno: key '$current_key' does not accept a list"
                 fi
                 state=list
-                if parse_yaml_scalar "$item" value; then
+                if parse_yaml_scalar "$item" value "$file:$lineno"; then
                     apply_config_list_item "$current_key" "$value" "$file"
                 fi
-            elif [[ "$state" != skip ]]; then
-                config_warn "$file:$lineno: list item outside of a list (ignored)"
+            else
+                config_error "$file:$lineno: list item outside of a list"
             fi
             continue
         fi
@@ -823,26 +800,13 @@ parse_config_file() {
                         continue
                         ;;
                     pending)
-                        config_warn "$file:$lineno: nested mapping under '$current_key' is not supported (ignored)"
-                        state=skip
-                        continue
-                        ;;
-                    skip)
-                        continue
+                        config_error "$file:$lineno: nested mapping under '$current_key' is not supported"
                         ;;
                     *)
-                        config_warn "$file:$lineno: unexpected indentation, treating '$key' as a top-level key"
+                        config_error "$file:$lineno: unexpected indentation of '$key'"
                         ;;
                 esac
             fi
-
-            # Removed keys are fatal: silently dropping blacklist_files would
-            # expose files the user meant to hide
-            case "$key" in
-                whitelist_files|blacklist_files|env_files)
-                    config_error "$file:$lineno: '$key' is no longer supported, move the entries of the referenced files into the '${key%_files}' key"
-                    ;;
-            esac
 
             # A previous key without a value and without a block is null
             if [[ "$state" == pending ]]; then
@@ -864,8 +828,8 @@ parse_config_file() {
             elif [[ "$key" == env && "$rhs_trimmed" == "{"* ]]; then
                 parse_yaml_flow_map "$rhs_trimmed" "$file" "$lineno"
             elif [[ "$rhs_trimmed" == [\|\>\&\*\{]* ]]; then
-                config_warn "$file:$lineno: unsupported YAML syntax for '$key' (ignored)"
-            elif parse_yaml_scalar "$rhs" value; then
+                config_error "$file:$lineno: unsupported YAML syntax for '$key'"
+            elif parse_yaml_scalar "$rhs" value "$file:$lineno"; then
                 apply_config_scalar "$key" "$value" "$file" false
             else
                 apply_config_scalar "$key" "" "$file" true
@@ -873,12 +837,26 @@ parse_config_file() {
             continue
         fi
 
-        config_warn "$file:$lineno: unsupported syntax (ignored): $(trim_whitespace "$line")"
+        config_error "$file:$lineno: unsupported syntax: $(trim_whitespace "$line")"
     done < "$file"
 
     if [[ "$state" == pending ]]; then
         apply_config_scalar "$current_key" "" "$file" true
     fi
+}
+
+# Print the whitelist.txt, blacklist.txt, .env and .env.local files that exist
+# in the user-level and project config directories. They are no longer read;
+# starting without them would silently drop a blacklist the user relies on.
+find_removed_config_files() {
+    local dir name
+    for dir in "$HOME/.config/ai-agent-sandbox" "$PROJECT_CONFIG_DIR"; do
+        for name in whitelist.txt blacklist.txt .env .env.local; do
+            if [[ -e "$dir/$name" || -L "$dir/$name" ]]; then
+                echo "$dir/$name"
+            fi
+        done
+    done
 }
 
 # Project-level files are controlled by the repository (or, for the main
@@ -1049,11 +1027,6 @@ project_config_files_in_use() {
             echo "$file"
         fi
     done
-    if [[ "$PROJECT_HAS_YAML" = false ]]; then
-        for file in "${PROJECT_LEGACY_FILES[@]}"; do
-            echo "$file"
-        done
-    fi
 }
 
 # The directory approvals are keyed by: the main checkout (or bare repository)
@@ -1456,308 +1429,6 @@ resolve_git_worktree() {
     GIT_MAIN_CHECKOUT_DIR="$main_checkout"
     if [[ ! -f "$PROJECT_CONFIG_LOCAL_FILE" && -f "$main_checkout/.ai-agent-sandbox/config.local.yaml" ]]; then
         MAIN_CHECKOUT_CONFIG_LOCAL_FILE="$main_checkout/.ai-agent-sandbox/config.local.yaml"
-    fi
-}
-
-# --- Legacy configuration files (deprecated) -----------------------------------
-#
-# whitelist.txt, blacklist.txt, .env and .env.local predate config.yaml. Each
-# level (user, project) uses them only when it has no config.yaml or
-# config.local.yaml; either way their presence is reported as deprecated.
-# User-level files are offered for migration on an interactive start;
-# project-level files only with --migrate-project-conf, because they are
-# usually shared through git and every team member would need a sandbox
-# version that reads config.yaml first.
-
-# Print a deprecation warning for the given legacy files. Always shown, even
-# with --quiet, so that the migration is not missed.
-warn_legacy_files() {
-    local level="$1"
-    local yaml_file="$2"
-    local ignored="$3"
-    local hint="$4"
-    shift 4
-    [[ $# -gt 0 ]] || return 0
-
-    local file
-    if [[ "$ignored" = true ]]; then
-        echo -e "${RED}Warning: Ignoring deprecated $level configuration files because a config.yaml/config.local.yaml exists:${NC}" >&2
-    else
-        echo -e "${RED}Warning: Using deprecated $level configuration files:${NC}" >&2
-    fi
-    for file in "$@"; do
-        echo -e "${RED}  $file${NC}" >&2
-    done
-    if [[ "$ignored" = false ]]; then
-        echo -e "${RED}  Support for whitelist.txt, blacklist.txt and .env files will be dropped in a future release.${NC}" >&2
-    fi
-    echo -e "${RED}  Move their entries into $yaml_file (keys: whitelist, blacklist, env), $hint.${NC}" >&2
-}
-
-# Format a whitelist/blacklist entry as a YAML list item, single-quoted when
-# it would not survive as a plain scalar
-yaml_list_item() {
-    local item="$1"
-    if [[ "$item" =~ ^[A-Za-z0-9_./\$~] && "$item" != "~" \
-        && "$item" != null && "$item" != Null && "$item" != NULL \
-        && "$item" != *"#"* && "$item" != *": "* && "$item" != *":" \
-        && "$item" != *"'"* && "$item" != *'"'* ]]; then
-        printf -- '- %s\n' "$item"
-    else
-        printf -- "- '%s'\n" "${item//\'/\'\'}"
-    fi
-}
-
-# Print the entries of a legacy whitelist/blacklist file as YAML list items,
-# read the same way the files are read at startup
-legacy_list_lines() {
-    local file="$1" line
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        # As at startup, everything after # is a comment
-        line=$(trim_whitespace "${line%%#*}")
-        line="${line%$'\r'}"
-        [[ -n "$line" ]] || continue
-        yaml_list_item "$line"
-    done < "$file"
-}
-
-# Print the entries of a legacy .env file as "KEY: value" lines. The value is
-# copied verbatim: env values in config.yaml follow the same quoting and
-# expansion rules as .env files.
-legacy_env_lines() {
-    local file="$1" line key value lineno=0
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        ((lineno++)) || true
-        line=$(trim_whitespace "${line%$'\r'}")
-        [[ -z "$line" || "$line" == "#"* ]] && continue
-        if [[ "$line" == export[[:space:]]* ]]; then
-            line=$(trim_whitespace "${line#export}")
-        fi
-        key=$(trim_whitespace "${line%%=*}")
-        if [[ "$line" != *=* || ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-            echo -e "${YELLOW}  $file:$lineno: not a KEY=VALUE entry (skipped)${NC}" >&2
-            continue
-        fi
-        value=$(trim_whitespace "${line#*=}")
-        [[ -n "$value" ]] || value='""'
-        printf '%s: %s\n' "$key" "$value"
-    done < "$file"
-}
-
-# Merge the lines of $lines_file into the top-level block $key of a YAML file
-# and print the result. mode=list merges "- item" lines, mode=map "KEY: value"
-# lines. A missing block is appended; entries already present are skipped and
-# reported on stderr. Exits with 2 when the key uses the inline form.
-yaml_merge_block() {
-    local file="$1" key="$2" mode="$3" lines_file="$4"
-    awk -v key="$key" -v mode="$mode" -v lines_file="$lines_file" '
-        function entry_id(e) {
-            if (mode == "map") {
-                sub(/[ \t]*:.*/, "", e)
-            } else {
-                sub(/^-[ \t]*/, "", e)
-                sub(/[ \t]+#.*$/, "", e)
-            }
-            return e
-        }
-        BEGIN {
-            n = 0
-            while ((getline l < lines_file) > 0) {
-                new[++n] = l
-            }
-            close(lines_file)
-        }
-        { line[NR] = $0 }
-        END {
-            h = 0
-            for (i = 1; i <= NR; i++) {
-                if (line[i] ~ ("^" key ":([ \t].*)?$")) {
-                    h = i
-                    break
-                }
-            }
-            if (h) {
-                rhs = substr(line[h], length(key) + 2)
-                sub(/^[ \t]+/, "", rhs)
-                if (rhs ~ /^#/) {
-                    rhs = ""
-                }
-                sub(/[ \t]+#.*$/, "", rhs)
-                sub(/[ \t]+$/, "", rhs)
-                if (rhs == "[]" || rhs == "{}") {
-                    line[h] = key ":"
-                } else if (rhs != "") {
-                    exit 2
-                }
-            }
-
-            last = h
-            indent = "  "
-            found_indent = 0
-            if (h) {
-                for (i = h + 1; i <= NR; i++) {
-                    if (line[i] ~ /^[ \t]*$/ || line[i] ~ /^[ \t]*#/) {
-                        continue
-                    }
-                    if (line[i] ~ /^[ \t]/ || (mode == "list" && line[i] ~ /^-/)) {
-                        last = i
-                        if (!found_indent) {
-                            match(line[i], /^[ \t]*/)
-                            indent = substr(line[i], 1, RLENGTH)
-                            found_indent = 1
-                        }
-                        e = line[i]
-                        sub(/^[ \t]*/, "", e)
-                        existing[entry_id(e)] = 1
-                        continue
-                    }
-                    break
-                }
-            }
-
-            m = 0
-            for (j = 1; j <= n; j++) {
-                id = entry_id(new[j])
-                if (id in existing) {
-                    print new[j] > "/dev/stderr"
-                    continue
-                }
-                existing[id] = 1
-                add[++m] = new[j]
-            }
-
-            for (i = 1; i <= NR; i++) {
-                print line[i]
-                if (h && i == last) {
-                    for (j = 1; j <= m; j++) {
-                        print indent add[j]
-                    }
-                }
-            }
-            if (!h && m > 0) {
-                if (NR > 0 && line[NR] !~ /^[ \t]*$/) {
-                    print ""
-                }
-                print key ":"
-                for (j = 1; j <= m; j++) {
-                    print indent add[j]
-                }
-            }
-        }
-    ' "$file"
-}
-
-# Merge one legacy file into a staged config file. Records the source in
-# MIGRATED_SOURCES and the staged file in MIGRATED_TARGETS.
-migrate_legacy_file() {
-    local src="$1" key="$2" mode="$3" staged="$4" target="$5" tmp_dir="$6"
-    local rc=0 skipped
-
-    [[ -f "$src" ]] || return 0
-
-    if [[ "$mode" == list ]]; then
-        legacy_list_lines "$src" > "$tmp_dir/lines" || rc=$?
-    else
-        legacy_env_lines "$src" > "$tmp_dir/lines" || rc=$?
-    fi
-    if [[ $rc -ne 0 ]]; then
-        echo -e "${RED}Error: Could not read $src${NC}" >&2
-        return 1
-    fi
-    yaml_merge_block "$staged" "$key" "$mode" "$tmp_dir/lines" \
-        > "$tmp_dir/merged" 2> "$tmp_dir/skipped" || rc=$?
-    if [[ $rc -ne 0 ]]; then
-        if [[ $rc -eq 2 ]]; then
-            echo -e "${RED}Error: '$key' in $target uses the inline form ([...] or {...}); change it to a block list and migrate again${NC}" >&2
-        else
-            echo -e "${RED}Error: Could not merge $src into $target${NC}" >&2
-        fi
-        return 1
-    fi
-    mv "$tmp_dir/merged" "$staged"
-
-    echo -e "${GREEN}✓${NC} $src → $target ($key)" >&2
-    while IFS= read -r skipped; do
-        if [[ "$mode" == map ]]; then
-            skipped="${skipped%%:*}"
-        fi
-        echo -e "${YELLOW}  already in $target, kept the existing entry: $skipped${NC}" >&2
-    done < "$tmp_dir/skipped"
-
-    MIGRATED_SOURCES+=("$src")
-    MIGRATED_TARGETS["$staged"]="$target"
-}
-
-# Migrate the legacy files of one level into its config.yaml (whitelist,
-# blacklist, .env) and config.local.yaml (.env.local). Nothing is written
-# unless every file merges; the old files are then renamed to *.migrated.
-migrate_legacy_config() {
-    local config_file="$1" config_local_file="$2"
-    local whitelist_file="$3" blacklist_file="$4" env_file="$5" env_local_file="$6"
-    local tmp_dir staged target src backup ok=true
-
-    MIGRATED_SOURCES=()
-    declare -gA MIGRATED_TARGETS=()
-
-    tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/ai-agent-sandbox-migrate.XXXXXX")
-    for staged in "$tmp_dir/config.yaml" "$tmp_dir/config.local.yaml"; do
-        target="$config_file"
-        [[ "$staged" == */config.local.yaml ]] && target="$config_local_file"
-        if [[ -f "$target" ]]; then
-            cp "$target" "$staged"
-        else
-            echo "# AI Agent Sandbox configuration, see config-example.yaml for all keys" > "$staged"
-        fi
-    done
-
-    migrate_legacy_file "$whitelist_file" whitelist list "$tmp_dir/config.yaml" "$config_file" "$tmp_dir" \
-        && migrate_legacy_file "$blacklist_file" blacklist list "$tmp_dir/config.yaml" "$config_file" "$tmp_dir" \
-        && migrate_legacy_file "$env_file" env map "$tmp_dir/config.yaml" "$config_file" "$tmp_dir" \
-        && migrate_legacy_file "$env_local_file" env map "$tmp_dir/config.local.yaml" "$config_local_file" "$tmp_dir" \
-        || ok=false
-
-    if [[ "$ok" = true ]]; then
-        for staged in "${!MIGRATED_TARGETS[@]}"; do
-            target="${MIGRATED_TARGETS[$staged]}"
-            mkdir -p "$(dirname "$target")"
-            # Overwrite in place to keep the permissions of an existing file
-            cat "$staged" > "$target"
-        done
-        for src in "${MIGRATED_SOURCES[@]}"; do
-            backup="$src.migrated"
-            [[ -e "$backup" ]] && backup="$src.migrated.$(date +%Y%m%d%H%M%S)"
-            mv "$src" "$backup"
-            echo -e "${GREEN}✓${NC} Renamed $src → $backup" >&2
-        done
-    else
-        echo -e "${RED}Migration aborted, no files were changed${NC}" >&2
-    fi
-    rm -rf "$tmp_dir"
-    [[ "$ok" = true ]]
-}
-
-# Explain what the migration does, shared by the prompt and --migrate-project-conf
-explain_legacy_migration() {
-    local config_file="$1" config_local_file="$2" has_yaml="$3"
-    shift 3
-
-    local file
-    echo -e "${RED}Deprecated configuration files found:${NC}" >&2
-    for file in "$@"; do
-        echo "  $file" >&2
-    done
-    cat >&2 << EOMIGRATE
-whitelist.txt, blacklist.txt, .env and .env.local are replaced by config.yaml;
-support for them will be dropped in a future release. The migration moves
-  whitelist.txt → 'whitelist:' in $config_file
-  blacklist.txt → 'blacklist:' in $config_file
-  .env          → 'env:'       in $config_file
-  .env.local    → 'env:'       in $config_local_file
-Existing entries are kept, the old files are renamed to *.migrated.
-EOMIGRATE
-    if [[ "$has_yaml" = true ]]; then
-        echo -e "${RED}Note: these files are currently IGNORED because a config.yaml/config.local.yaml exists.${NC}" >&2
-        echo -e "${RED}Migrating them makes their entries active again.${NC}" >&2
     fi
 }
 
@@ -3904,19 +3575,6 @@ run_in_sandbox() {
     return "$status"
 }
 
-# Strip inline comments and trim whitespace from a line
-# Usage: result=$(strip_inline_comment "$line")
-strip_inline_comment() {
-    local line="$1"
-    # Strip inline comments (anything after #)
-    line="${line%%#*}"
-    # Trim leading whitespace
-    line="${line#"${line%%[![:space:]]*}"}"
-    # Trim trailing whitespace
-    line="${line%"${line##*[![:space:]]}"}"
-    echo "$line"
-}
-
 # Expand $VAR / ${VAR} references and tildes in an environment value.
 # Variables resolve against values already set for the sandbox first, then the
 # host environment, and expand to empty when undefined. \$ produces a literal $.
@@ -4369,8 +4027,7 @@ warn_shadowed_binds() {
     done
 }
 
-# Process one whitelist entry (a line from a whitelist file or a config
-# `whitelist:` item): handles the ! override prefix and the :rw suffix
+# Process one whitelist entry (a config `whitelist:` item): handles the ! override prefix and the :rw suffix
 process_whitelist_entry() {
     local line="$1"
     local override bind_mode
@@ -4585,9 +4242,7 @@ protect_git_file() {
 user_config_protect_paths() {
     local file dir resolved
     local -A dirs=()
-    for file in "$DEFAULT_CONFIG_FILE" "$DEFAULT_CONFIG_LOCAL_FILE" \
-        "$DEFAULT_WHITELIST_FILE" "$DEFAULT_BLACKLIST_FILE" \
-        "$DEFAULT_ENV_FILE" "$DEFAULT_ENV_LOCAL_FILE"; do
+    for file in "$DEFAULT_CONFIG_FILE" "$DEFAULT_CONFIG_LOCAL_FILE"; do
         dir="$(dirname "$file")"
         if [[ "$dir" == / || "$dir" == "$HOME" || "$WORKING_DIR" == "$dir" \
             || "$WORKING_DIR" == "$dir/"* ]]; then
@@ -5258,15 +4913,10 @@ if [[ -n "${AI_AGENT_SANDBOX_SECCOMP:-}" ]]; then
     SECCOMP_SOURCE="AI_AGENT_SANDBOX_SECCOMP"
 fi
 
-# Parse command line arguments (kept for the restart after a config migration)
-ORIGINAL_ARGS=("$@")
+# Parse command line arguments
 AGENT_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --whitelist|--blacklist|--env-path)
-            echo -e "${RED}Error: $1 is no longer supported, put the entries into the whitelist, blacklist or env key of a config.yaml${NC}" >&2
-            exit 1
-            ;;
         --profile|-p)
             PROFILE="$2"
             PROFILE_SOURCE="--profile"
@@ -5282,10 +4932,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --allow-home-workdir)
             ALLOW_HOME_WORKDIR=true
-            shift
-            ;;
-        --migrate-project-conf)
-            MIGRATE_PROJECT_CONFIG=true
             shift
             ;;
         --no-docker)
@@ -5479,78 +5125,15 @@ if [[ "$LIST_PROFILES" = true ]]; then
     exit 0
 fi
 
-USER_LEGACY_FILES=()
-for legacy_file in "$DEFAULT_WHITELIST_FILE" "$DEFAULT_BLACKLIST_FILE" \
-    "$DEFAULT_ENV_FILE" "$DEFAULT_ENV_LOCAL_FILE"; do
-    if [[ -f "$legacy_file" ]]; then
-        USER_LEGACY_FILES+=("$legacy_file")
-    fi
-done
-PROJECT_LEGACY_FILES=()
-for legacy_file in "$PROJECT_WHITELIST_FILE" "$PROJECT_BLACKLIST_FILE" \
-    "$PROJECT_ENV_FILE" "$PROJECT_ENV_LOCAL_FILE"; do
-    if [[ -f "$legacy_file" ]]; then
-        PROJECT_LEGACY_FILES+=("$legacy_file")
-    fi
-done
-
-USER_HAS_YAML=false
-if [[ -f "$DEFAULT_CONFIG_FILE" || -f "$DEFAULT_CONFIG_LOCAL_FILE" ]]; then
-    USER_HAS_YAML=true
+mapfile -t REMOVED_CONFIG_FILES < <(find_removed_config_files)
+if [[ ${#REMOVED_CONFIG_FILES[@]} -gt 0 ]]; then
+    echo -e "${RED}Error: These configuration files are no longer supported:${NC}" >&2
+    for file in "${REMOVED_CONFIG_FILES[@]}"; do
+        echo -e "${RED}  $file${NC}" >&2
+    done
+    echo -e "${RED}Move their entries into the whitelist, blacklist and env keys of config.yaml in the same directory (.env.local into config.local.yaml), then delete or rename the files.${NC}" >&2
+    exit 1
 fi
-PROJECT_HAS_YAML=false
-if [[ -f "$PROJECT_CONFIG_FILE" || -f "$PROJECT_CONFIG_LOCAL_FILE" || -n "$MAIN_CHECKOUT_CONFIG_LOCAL_FILE" ]]; then
-    PROJECT_HAS_YAML=true
-fi
-
-if [[ "$MIGRATE_PROJECT_CONFIG" = true ]]; then
-    if [[ ${#PROJECT_LEGACY_FILES[@]} -eq 0 ]]; then
-        echo "No legacy configuration files found in $PROJECT_CONFIG_DIR, nothing to migrate" >&2
-        exit 0
-    fi
-    explain_legacy_migration "$PROJECT_CONFIG_FILE" "$PROJECT_CONFIG_LOCAL_FILE" \
-        "$PROJECT_HAS_YAML" "${PROJECT_LEGACY_FILES[@]}"
-    echo >&2
-    migrate_legacy_config "$PROJECT_CONFIG_FILE" "$PROJECT_CONFIG_LOCAL_FILE" \
-        "$PROJECT_WHITELIST_FILE" "$PROJECT_BLACKLIST_FILE" \
-        "$PROJECT_ENV_FILE" "$PROJECT_ENV_LOCAL_FILE" || exit 1
-    echo -e "\n${GREEN}Project configuration migrated.${NC} Review the result, delete the *.migrated files and commit." >&2
-    echo "Team members need a sandbox version that supports config.yaml before they pull this change." >&2
-    if [[ -n "${MIGRATED_TARGETS[*]}" && " ${MIGRATED_TARGETS[*]} " == *" $PROJECT_CONFIG_LOCAL_FILE "* ]] \
-        && git -C "$WORKING_DIR" rev-parse --is-inside-work-tree &>/dev/null \
-        && ! git -C "$WORKING_DIR" check-ignore -q "$PROJECT_CONFIG_LOCAL_FILE"; then
-        echo -e "${YELLOW}Warning: $PROJECT_CONFIG_LOCAL_FILE is not ignored by git; add it to .gitignore, it holds the former .env.local entries${NC}" >&2
-    fi
-    exit 0
-fi
-
-# Offer to migrate the user-level files when someone can answer. After a
-# successful migration the script restarts so the new config.yaml is loaded
-# with the usual precedence (config files are parsed before the command line).
-if [[ ${#USER_LEGACY_FILES[@]} -gt 0 && -t 0 && -t 2 ]]; then
-    explain_legacy_migration "$DEFAULT_CONFIG_FILE" "$DEFAULT_CONFIG_LOCAL_FILE" \
-        "$USER_HAS_YAML" "${USER_LEGACY_FILES[@]}"
-    migrate_answer=""
-    read -r -p "Migrate your user-level configuration now? [y/N] " migrate_answer || migrate_answer=""
-    case "$migrate_answer" in
-        y|Y|yes|Yes|YES)
-            if migrate_legacy_config "$DEFAULT_CONFIG_FILE" "$DEFAULT_CONFIG_LOCAL_FILE" \
-                "$DEFAULT_WHITELIST_FILE" "$DEFAULT_BLACKLIST_FILE" \
-                "$DEFAULT_ENV_FILE" "$DEFAULT_ENV_LOCAL_FILE"; then
-                echo -e "${GREEN}User configuration migrated, restarting with $DEFAULT_CONFIG_FILE${NC}\n" >&2
-                exec "$BASH" "$0" "${ORIGINAL_ARGS[@]}"
-            fi
-            ;;
-        *)
-            echo "Not migrating; you will be asked again on the next start." >&2
-            ;;
-    esac
-fi
-
-warn_legacy_files "user-level" "$DEFAULT_CONFIG_FILE" "$USER_HAS_YAML" \
-    "start the sandbox in a terminal to migrate them automatically" "${USER_LEGACY_FILES[@]}"
-warn_legacy_files "project-level" "$PROJECT_CONFIG_FILE" "$PROJECT_HAS_YAML" \
-    "run with --migrate-project-conf to migrate them" "${PROJECT_LEGACY_FILES[@]}"
 
 if [[ "$APPROVE_PROJECT_CONFIG" = true ]]; then
     check_project_approval approve
@@ -5690,10 +5273,10 @@ resolve_network_mode
 resolve_seccomp_level
 resolve_new_session
 
-# Create a default user-level config.yaml on first run: no user-level
-# configuration of either kind exists and the whitelist or blacklist was not
-# given explicitly. Only the sections that were not given explicitly are written.
-if [[ "$USER_HAS_YAML" = false && ${#USER_LEGACY_FILES[@]} -eq 0 ]] \
+# Create a default user-level config.yaml on first run: no user-level config
+# file exists and the whitelist or blacklist was not given explicitly. Only the
+# sections that were not given explicitly are written.
+if [[ ! -f "$DEFAULT_CONFIG_FILE" && ! -f "$DEFAULT_CONFIG_LOCAL_FILE" ]] \
     && [[ "$EXPLICIT_WHITELIST" = false || "$EXPLICIT_BLACKLIST" = false ]]; then
     echo -e "${YELLOW}Warning: No user-level configuration found, creating default $DEFAULT_CONFIG_FILE${NC}" >&2
     mkdir -p "$(dirname "$DEFAULT_CONFIG_FILE")"
@@ -5768,37 +5351,6 @@ EOBLACKLIST
     BLACKLIST_PATHS+=("${saved_blacklist_paths[@]}")
     CONFIG_FILES_LOADED=("$DEFAULT_CONFIG_FILE" "${CONFIG_FILES_LOADED[@]}")
     flush_config_log
-    USER_HAS_YAML=true
-fi
-
-# Legacy user-level files go first, legacy project-level files after them
-if [[ "$USER_HAS_YAML" = false ]]; then
-    if [[ -f "$DEFAULT_WHITELIST_FILE" ]]; then
-        WHITELIST_FILES+=("$DEFAULT_WHITELIST_FILE")
-    fi
-    if [[ -f "$DEFAULT_BLACKLIST_FILE" ]]; then
-        BLACKLIST_FILES+=("$DEFAULT_BLACKLIST_FILE")
-    fi
-    if [[ -f "$DEFAULT_ENV_FILE" ]]; then
-        ENV_FILES+=("$DEFAULT_ENV_FILE")
-    fi
-    if [[ -f "$DEFAULT_ENV_LOCAL_FILE" ]]; then
-        ENV_FILES+=("$DEFAULT_ENV_LOCAL_FILE")
-    fi
-fi
-if [[ "$PROJECT_HAS_YAML" = false ]]; then
-    if [[ -f "$PROJECT_WHITELIST_FILE" ]]; then
-        WHITELIST_FILES+=("$PROJECT_WHITELIST_FILE")
-    fi
-    if [[ -f "$PROJECT_BLACKLIST_FILE" ]]; then
-        BLACKLIST_FILES+=("$PROJECT_BLACKLIST_FILE")
-    fi
-    if [[ -f "$PROJECT_ENV_FILE" ]]; then
-        ENV_FILES+=("$PROJECT_ENV_FILE")
-    fi
-    if [[ -f "$PROJECT_ENV_LOCAL_FILE" ]]; then
-        ENV_FILES+=("$PROJECT_ENV_LOCAL_FILE")
-    fi
 fi
 
 # Build bubblewrap arguments
@@ -5836,34 +5388,14 @@ fi
 # of directories that already exist, and gpg requires /run/user/<uid> to be 0700
 mount_gpg_agent
 
-# Process all whitelist files and add to bubblewrap (after tmpfs so HOME paths work)
-if [[ ${#WHITELIST_FILES[@]} -eq 0 && ${#WHITELIST_ENTRIES[@]} -eq 0 \
+# Process the whitelist and add to bubblewrap (after tmpfs so HOME paths work)
+if [[ ${#WHITELIST_ENTRIES[@]} -eq 0 \
     && ${#WHITELIST_PATHS_RO[@]} -eq 0 && ${#WHITELIST_PATHS_RW[@]} -eq 0 ]]; then
     echo -e "${RED}Error: No whitelist entries found${NC}" >&2
     exit 1
 fi
 
-for WHITELIST_FILE in "${WHITELIST_FILES[@]}"; do
-    if [[ ! -f "$WHITELIST_FILE" ]]; then
-        echo -e "${YELLOW}Warning: Whitelist file not found: $WHITELIST_FILE (skipping)${NC}" >&2
-        continue
-    fi
-
-    log_info "${GREEN}Processing whitelist:${NC} $WHITELIST_FILE"
-
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        # Skip comments and empty lines
-        [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        [[ -z "${line// }" ]] && continue
-
-        line=$(strip_inline_comment "$line")
-        [[ -z "$line" ]] && continue
-
-        process_whitelist_entry "$line"
-    done < "$WHITELIST_FILE"
-done
-
-# Process whitelist entries from config files (same syntax as whitelist files)
+# Process whitelist entries from config files
 if [[ ${#WHITELIST_ENTRIES[@]} -gt 0 ]]; then
     log_info "${GREEN}Processing whitelist entries from config files:${NC}"
     for entry in "${WHITELIST_ENTRIES[@]}"; do
@@ -5904,30 +5436,6 @@ fi
 # nests on top)
 create_missing_project_config_dirs
 protect_sandbox_config BWRAP_ARGS
-
-# Process all blacklist files and hide patterns with tmpfs overlays
-if [[ ${#BLACKLIST_FILES[@]} -gt 0 ]]; then
-    log_info "\n${YELLOW}Processing blacklist patterns:${NC}"
-    for BLACKLIST_FILE in "${BLACKLIST_FILES[@]}"; do
-        if [[ ! -f "$BLACKLIST_FILE" ]]; then
-            log_info "${YELLOW}Warning: Blacklist file not found: $BLACKLIST_FILE (skipping)${NC}"
-            continue
-        fi
-
-        log_info "${YELLOW}Processing blacklist:${NC} $BLACKLIST_FILE"
-
-        while IFS= read -r pattern || [[ -n "$pattern" ]]; do
-            [[ "$pattern" =~ ^[[:space:]]*# ]] && continue
-            [[ -z "${pattern// }" ]] && continue
-
-            pattern=$(strip_inline_comment "$pattern")
-            [[ -z "$pattern" ]] && continue
-
-            # Process the pattern using the helper function
-            blacklist_pattern "$pattern"
-        done < "$BLACKLIST_FILE"
-    done
-fi
 
 # Process direct blacklist paths
 if [[ ${#BLACKLIST_PATHS[@]} -gt 0 ]]; then
@@ -6122,28 +5630,8 @@ elif [[ "$AGENT" = "opencode" ]] && [[ -n "$OPENCODE_MAJOR_VERSION" && "$OPENCOD
     sandbox_setenv OPENCODE_PERMISSION '{"*":"allow"}'
 fi
 
-# Process environment files and direct environment variables last so explicit
-# sandbox environment entries can override earlier defaults.
-if [[ ${#ENV_FILES[@]} -gt 0 ]]; then
-    log_info "\n${GREEN}Processing environment files:${NC}"
-    for ENV_FILE in "${ENV_FILES[@]}"; do
-        if [[ ! -f "$ENV_FILE" ]]; then
-            log_info "${YELLOW}Warning: Environment file not found: $ENV_FILE (skipping)${NC}"
-            continue
-        fi
-
-        log_info "${GREEN}Processing env:${NC} $ENV_FILE"
-
-        # The file name is only passed on for messages
-        # shellcheck disable=SC2094
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            trimmed_line=$(trim_whitespace "$line")
-            [[ -z "$trimmed_line" || "$trimmed_line" =~ ^# ]] && continue
-            set_sandbox_env "$line" "$ENV_FILE"
-        done < "$ENV_FILE"
-    done
-fi
-
+# Process direct environment variables last so explicit sandbox environment
+# entries can override earlier defaults.
 if [[ ${#ENV_VARS[@]} -gt 0 ]]; then
     log_info "\n${GREEN}Processing direct environment variables:${NC}"
     for i in "${!ENV_VARS[@]}"; do
@@ -6262,13 +5750,6 @@ log_info "Config Files (${#CONFIG_FILES_LOADED[@]}):"
 for cfile in "${CONFIG_FILES_LOADED[@]}"; do
     log_info "  ${YELLOW}$cfile${NC}"
 done
-LEGACY_FILES_IN_USE=("${WHITELIST_FILES[@]}" "${BLACKLIST_FILES[@]}" "${ENV_FILES[@]}")
-if [[ ${#LEGACY_FILES_IN_USE[@]} -gt 0 ]]; then
-    log_info "Deprecated Legacy Files (${#LEGACY_FILES_IN_USE[@]}):"
-    for lfile in "${LEGACY_FILES_IN_USE[@]}"; do
-        log_info "  ${YELLOW}$lfile${NC}"
-    done
-fi
 log_info "Direct Environment Variables: ${YELLOW}${#ENV_VARS[@]}${NC}"
 mapfile -t PASSED_HOST_ENV < <(passed_host_env_names)
 log_info "Passed Host Environment Variables (${#PASSED_HOST_ENV[@]}): ${YELLOW}${PASSED_HOST_ENV[*]}${NC}"

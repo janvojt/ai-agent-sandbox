@@ -1,37 +1,13 @@
 #!/usr/bin/env bats
-# Unit tests of the environment entry parsing: strip_inline_comment,
-# expand_env_value, parse_env_assignment and sandbox_setenv/set_sandbox_env
-# (what they add to SANDBOX_ENV and BWRAP_ARGS).
+# Unit tests of the environment entry parsing: expand_env_value,
+# parse_env_assignment and sandbox_setenv/set_sandbox_env (what they add to
+# SANDBOX_ENV and BWRAP_ARGS).
 
 setup() {
     load ../test_helper/common
     setup_test_env
     load_sandbox_script
     BWRAP_ARGS=()
-}
-
-# --- strip_inline_comment -----------------------------------------------------
-
-@test "strip_inline_comment removes a trailing comment and surrounding whitespace" {
-    run strip_inline_comment "  /opt/tools   # build tools"
-    assert_output /opt/tools
-}
-
-@test "strip_inline_comment cuts at the first # even without whitespace" {
-    run strip_inline_comment "a#b # c"
-    assert_output a
-}
-
-@test "strip_inline_comment turns a comment-only or blank line into an empty line" {
-    run strip_inline_comment "   # just a comment"
-    assert_output ""
-    run strip_inline_comment $' \t '
-    assert_output ""
-}
-
-@test "strip_inline_comment leaves a plain entry unchanged" {
-    run strip_inline_comment "src/**/*.json:rw"
-    assert_output "src/**/*.json:rw"
 }
 
 # --- expand_env_value ---------------------------------------------------------

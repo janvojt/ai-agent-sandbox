@@ -69,16 +69,11 @@ setup() {
     assert_output --partial '^[[2K'
 }
 
-@test "every project file and the legacy files in use need approval" {
+@test "every project file needs approval" {
     printf 'quiet: false\n' > "$PROJECT_DIR/config.local.yaml"
     run_sandbox --approve-project-config
     assert_success
     assert_output --partial "Approved 2 project files"
-    rm "$PROJECT_DIR/config.yaml" "$PROJECT_DIR/config.local.yaml"
-    printf '/opt\n' > "$PROJECT_DIR/whitelist.txt"
-    run_sandbox --dry-run
-    assert_failure 1
-    assert_output --partial "$PROJECT_DIR/whitelist.txt"
 }
 
 @test "no project files: nothing to approve" {

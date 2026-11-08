@@ -83,15 +83,35 @@ write_user_config() {
     done
 }
 
-@test "the removed *_files config keys are fatal" {
-    local key
-    for key in whitelist_files blacklist_files env_files; do
-        write_config "$USER_CONFIG" "$key: [/tmp/x]"
+@test "unknown keys and invalid syntax in a config file are fatal" {
+    local content
+    for content in 'blacklst: [/tmp/x]' 'blacklist_files: [/tmp/x]' 'whitelist: "/usr/bin' 'not yaml'; do
+        write_config "$USER_CONFIG" "$content"
         run_sandbox --dry-run
         assert_failure 1
-        assert_output --partial "$key"
+        assert_output --partial "$USER_CONFIG"
         assert_equal "${#BWRAP_RECORDED[@]}" 0
     done
+}
+
+@test "whitelist.txt, blacklist.txt, .env and .env.local are fatal at user and project level" {
+    local dir name
+    for dir in "$TEST_HOME/.config/ai-agent-sandbox" "$TEST_WORK/.ai-agent-sandbox"; do
+        mkdir -p "$dir"
+        for name in whitelist.txt blacklist.txt .env .env.local; do
+            printf 'x\n' > "$dir/$name"
+            run_sandbox --dry-run
+            assert_failure 1
+            assert_output --partial "no longer supported"
+            assert_output --partial "$dir/$name"
+            assert_equal "${#BWRAP_RECORDED[@]}" 0
+            rm "$dir/$name"
+        done
+    done
+    write_config "$USER_CONFIG" 'whitelist: [/usr/bin]'
+    printf 'x\n' > "$TEST_HOME/.config/ai-agent-sandbox/blacklist.txt.old"
+    run_sandbox --dry-run
+    assert_success
 }
 
 @test "an invalid boolean in a config file is fatal" {
@@ -266,12 +286,12 @@ last_index_of() {
 }
 
 @test "blacklisted files in the project configuration directory stay hidden" {
-    write_config "$PROJECT_DIR/config.yaml" $'blacklist:\n  - .ai-agent-sandbox/.env'
-    touch "$PROJECT_DIR/.env"
+    write_config "$PROJECT_DIR/config.yaml" $'blacklist:\n  - .ai-agent-sandbox/secret.txt'
+    touch "$PROJECT_DIR/secret.txt"
     run_sandbox --dry-run
     assert_success
     assert_args_contain BWRAP_RECORDED --ro-bind "$PROJECT_DIR" "$PROJECT_DIR"
-    assert_args_contain BWRAP_RECORDED --ro-bind /dev/null "$PROJECT_DIR/.env"
+    assert_args_contain BWRAP_RECORDED --ro-bind /dev/null "$PROJECT_DIR/secret.txt"
 }
 
 @test "--no-protect-project-config leaves the project configuration writable" {

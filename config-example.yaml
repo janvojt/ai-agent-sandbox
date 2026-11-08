@@ -10,10 +10,6 @@
 #             < AI_AGENT_SANDBOX_PROFILE environment variable < command-line flags
 # Scalars override earlier values; lists are merged.
 #
-# This file replaces the deprecated whitelist.txt, blacklist.txt, .env and
-# .env.local files: they are ignored next to a config.yaml/config.local.yaml
-# and support for them will be dropped in a future release.
-#
 # Only a flat subset of YAML is supported: "key: value" scalars, block lists
 # ("- item" lines), inline lists ("[a, b]", items may not contain commas) and,
 # for "env", one level of "KEY: value" entries. Comments start with "#".

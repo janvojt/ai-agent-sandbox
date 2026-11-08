@@ -365,7 +365,7 @@ All configuration lives in YAML config files, which are processed in order:
 1. **User-level files** (always included if they exist):
    - `~/.config/ai-agent-sandbox/config.yaml`
    - `~/.config/ai-agent-sandbox/config.local.yaml` (loaded after `config.yaml`, overrides its values, e.g. machine-specific settings)
-   - If neither exists (and there are no [legacy files](#legacy-configuration-files-deprecated)), `config.yaml` is auto-generated with a default whitelist and blacklist
+   - If neither exists, `config.yaml` is auto-generated with a default whitelist and blacklist
 
 2. **Project-level files** (automatically included if they exist):
    - `.ai-agent-sandbox/config.yaml` (in working directory, commit to version control)
@@ -376,25 +376,7 @@ All configuration lives in YAML config files, which are processed in order:
 
 The locations of the user-level files can be changed with `AI_AGENT_SANDBOX_CONFIG` and `AI_AGENT_SANDBOX_CONFIG_LOCAL`.
 
-### Legacy configuration files (deprecated)
-
-Before `config.yaml` existed, the configuration was split into `whitelist.txt`, `blacklist.txt`, `.env` and `.env.local` in `~/.config/ai-agent-sandbox/` and `.ai-agent-sandbox/`. These files are **deprecated** and support for them will be dropped in a future release:
-
-- At a level (user or project) that has a `config.yaml` or `config.local.yaml`, the legacy files of that level are **ignored** and a warning lists them.
-- At a level without a YAML config file, the legacy files are still used, with a warning that their support will be dropped.
-- The `--whitelist FILE`, `--blacklist FILE` and `--env-path FILE` options and the `whitelist_files`, `blacklist_files` and `env_files` config keys have been **removed**; using them is an error.
-- The environment variables `AI_AGENT_SANDBOX_WHITELIST`, `AI_AGENT_SANDBOX_BLACKLIST`, `AI_AGENT_SANDBOX_ENV` and `AI_AGENT_SANDBOX_ENV_LOCAL` still set the locations of the user-level legacy files.
-
-**Automatic migration.** The migration moves `whitelist.txt` into the `whitelist:` list, `blacklist.txt` into the `blacklist:` list and `.env` into the `env:` mapping of the `config.yaml` at the same level, and `.env.local` into the `env:` mapping of `config.local.yaml`. Entries already present in the YAML file are kept; nothing is written unless every file can be merged. The old files are renamed to `*.migrated`; delete them once you have checked the result.
-
-- **User-level files:** when the sandbox starts in a terminal and finds legacy files in `~/.config/ai-agent-sandbox/`, it explains the situation and asks whether to migrate them. After migrating it restarts with the new configuration. If you decline, or the start is not interactive, only the warning is printed and you are asked again next time.
-- **Project-level files** are never migrated automatically: they are usually tracked in git, and every team member needs a sandbox version that reads `config.yaml` before the old files disappear. Migrate them explicitly, then review and commit:
-  ```bash
-  ./ai-agent-sandbox.sh --migrate-project-conf
-  ```
-  If `.env.local` was migrated, make sure `.ai-agent-sandbox/config.local.yaml` is in `.gitignore` (the command warns if it is not).
-
-To migrate by hand, move the entries as described above; entry syntax is unchanged. Quote entries that start with `*` or `!` or contain `: `, e.g. `- "**/.env"`. A `.env` line `KEY=VALUE` becomes `KEY: VALUE`.
+The old `whitelist.txt`, `blacklist.txt`, `.env` and `.env.local` files are no longer supported: while any of them exists in `~/.config/ai-agent-sandbox/` or `.ai-agent-sandbox/`, the sandbox refuses to start. Move their entries into the `whitelist`, `blacklist` and `env` keys of `config.yaml` (`.env.local` into `config.local.yaml`); quote entries that start with `*` or `!` or contain `: `, e.g. `- "**/.env"`, and write a `KEY=VALUE` line as `KEY: VALUE`. Then delete or rename the old files.
 
 ### Configuration file (config.yaml)
 
@@ -445,7 +427,7 @@ See [`config-example.yaml`](config-example.yaml) for a commented example of ever
 - Block lists (`key:` followed by `- item` lines) and inline lists (`key: [a, b]`, items may not contain commas). A single scalar is accepted for a list key.
 - `env:` followed by indented `KEY: value` lines, or inline `env: {KEY: value}`.
 - Comments (`#` at the start of a line or after whitespace), `---` document markers, tabs and CRLF line endings are tolerated. `~` or `null` unsets a scalar.
-- Nested mappings (other than `env`), anchors, multi-line strings and unknown keys are reported as warnings and ignored.
+- Anything else is an error and the sandbox does not start: unknown keys (a typo such as `blacklst:` must not silently drop entries), nested mappings (other than `env`), anchors, multi-line strings, unterminated quotes, invalid `env` names. The message names the file and line.
 
 **Project config protection.** Because `.ai-agent-sandbox/` lives inside the read-write working directory, an agent could otherwise edit its own sandbox rules (switch to the host profile, whitelist `~/.ssh`, change `ANTHROPIC_BASE_URL`) to take effect on the next run. The same applies to other projects reachable through a read-write whitelist entry and to the user-level configuration. By default every `.ai-agent-sandbox/` inside a read-write mount (at any depth) and the user-level configuration directory (`~/.config/ai-agent-sandbox`, or the files and their symlink targets when `AI_AGENT_SANDBOX_CONFIG*` point elsewhere) are therefore mounted read-only, also when a whitelisted parent directory would otherwise make them writable. So the agent cannot create one either, an empty `.ai-agent-sandbox/` is created on the host in the working directory and in read-write whitelisted git repository roots that have none (git does not track empty directories). Deeper directories without one stay a gap: review a new `.ai-agent-sandbox/` that you did not create before running a sandbox there. Disable all of this with `--no-protect-project-config` or `protect_project_config: false` in the user-level config; the setting is deliberately ignored in project files. The resolved profile and its source are printed in the startup summary.
 
@@ -468,7 +450,7 @@ Not covered: code that lives in the working tree itself and runs when you use th
 - A start without a terminal (T3 Code, scripts) in a desktop session (`DISPLAY` or `WAYLAND_DISPLAY` set) shows the same text in a dialog (`zenity`, or `kdialog`) with **Approve** and **Deny**. The orchestrator waits meanwhile (T3 shows the thread as thinking); no answer within 2 minutes refuses the start. Starts of the same project that come in while a dialog is open wait for it and do not ask again. The agent cannot answer the dialog: it is not running yet, and the sandbox has no display or D-Bus. Approving in the chat of an orchestrator would not be safe, because agents can post messages to T3 threads through T3's tools.
 - Without a terminal or a dialog (no desktop session, `--no-desktop-prompts`, or no answer), the start is refused with the list of files, and a desktop notification (`notify-send`) says so. Review and approve the files with `ai-agent-sandbox.sh --approve-project-config` in the project directory (T3's integrated terminal runs on the host and works for this); it shows the same output and exits.
 - Approvals are stored per project and file name in `~/.local/state/ai-agent-sandbox/approved-config` (`AI_AGENT_SANDBOX_APPROVALS_DIR`), with a copy of every approved version: going back to a version approved before does not ask again. The git worktrees of a repository share the approvals of the main checkout, so T3 Code's per-thread worktrees do not ask once each. The directory is hidden inside the sandbox even when a whitelist entry covers it.
-- Every file that applies counts: `config.yaml`, `config.local.yaml` (also the main checkout's one in a worktree) and legacy files still in use. Deleting a file needs no approval.
+- Every file that applies counts: `config.yaml`, `config.local.yaml` (also the main checkout's one in a worktree). Deleting a file needs no approval.
 
 The setting is ignored in project files. `--no-require-project-approval` switches it off for one run. `desktop_prompts: false` in the user-level config (or `--no-desktop-prompts`) switches off the dialog and the notifications; it is ignored in project files too.
 

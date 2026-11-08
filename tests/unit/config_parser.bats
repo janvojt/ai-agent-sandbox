@@ -117,18 +117,18 @@ assert_no_config_warnings() {
     done
 }
 
-@test "parse_yaml_scalar warns about text after the closing quote" {
+@test "parse_yaml_scalar fails on text after the closing quote" {
     local value
-    parse_yaml_scalar '"a" trailing' value
-    assert_equal "$value" "a"
-    assert_config_warning "Ignoring unexpected text after quoted value: trailing"
+    run parse_yaml_scalar '"a" trailing' value f.yaml:3
+    assert_failure 1
+    assert_output --partial "f.yaml:3: unexpected text after quoted value: trailing"
 }
 
-@test "parse_yaml_scalar treats an unterminated quote literally with a warning" {
+@test "parse_yaml_scalar fails on an unterminated quote" {
     local value
-    parse_yaml_scalar '"open' value
-    assert_equal "$value" '"open'
-    assert_config_warning "Unterminated quoted value"
+    run parse_yaml_scalar '"open' value f.yaml:3
+    assert_failure 1
+    assert_output --partial "f.yaml:3: unterminated quoted value"
 }
 
 # --- parse_yaml_bool ----------------------------------------------------------
@@ -188,10 +188,10 @@ assert_no_config_warnings() {
     assert_output --partial "Invalid host_ports entry in /x/config.yaml: '70000'"
 }
 
-@test "apply_config_list_item warns for a key that does not take a list" {
-    apply_config_list_item profile work f.yaml
-    assert_equal "$PROFILE" ""
-    assert_config_warning "Key 'profile' in f.yaml does not accept a list"
+@test "apply_config_list_item fails for a key that does not take a list" {
+    run apply_config_list_item profile work f.yaml
+    assert_failure 1
+    assert_output --partial "Key 'profile' in f.yaml does not accept a list"
 }
 
 # --- apply_config_scalar ------------------------------------------------------
@@ -306,15 +306,16 @@ assert_no_config_warnings() {
     assert_equal "${WHITELIST_ENTRIES[*]}" "/etc/java[0-9]*"
 }
 
-@test "apply_config_scalar warns about an unknown key" {
-    apply_config_scalar colour blue f.yaml false
-    assert_config_warning "Unknown configuration key 'colour' in f.yaml"
+@test "apply_config_scalar fails on an unknown key" {
+    run apply_config_scalar colour blue f.yaml false
+    assert_failure 1
+    assert_output --partial "Unknown configuration key 'colour' in f.yaml"
 }
 
-@test "apply_config_scalar warns about env given as a scalar" {
-    apply_config_scalar env FOO f.yaml false
-    assert_equal "${#ENV_VARS[@]}" 0
-    assert_config_warning "Ignoring 'env' in f.yaml"
+@test "apply_config_scalar fails on env given as a scalar" {
+    run apply_config_scalar env FOO f.yaml false
+    assert_failure 1
+    assert_output --partial "'env' in f.yaml must be an indented KEY: VALUE mapping"
 }
 
 # --- apply_config_env_item ----------------------------------------------------
@@ -331,10 +332,10 @@ assert_no_config_warnings() {
     assert_equal "${ENV_VARS[1]}" "BAR='x'"
 }
 
-@test "apply_config_env_item skips an invalid variable name" {
-    apply_config_env_item 1BAD value f.yaml
-    assert_equal "${#ENV_VARS[@]}" 0
-    assert_config_warning "Skipping invalid environment variable name in f.yaml: 1BAD"
+@test "apply_config_env_item fails on an invalid variable name" {
+    run apply_config_env_item 1BAD value f.yaml
+    assert_failure 1
+    assert_output --partial "Invalid environment variable name in f.yaml: 1BAD"
 }
 
 # --- parse_yaml_flow_list / parse_yaml_flow_map -------------------------------
@@ -358,10 +359,10 @@ assert_no_config_warnings() {
     assert_equal "${ENV_VARS[1]}" 'BAR="two"'
 }
 
-@test "parse_yaml_flow_map warns about an invalid entry" {
-    parse_yaml_flow_map "{FOO: 1, nonsense}" f.yaml 7
-    assert_equal "${ENV_VARS[*]}" FOO=1
-    assert_config_warning "f.yaml:7: invalid env entry 'nonsense'"
+@test "parse_yaml_flow_map fails on an invalid entry" {
+    run parse_yaml_flow_map "{FOO: 1, nonsense}" f.yaml 7
+    assert_failure 1
+    assert_output --partial "f.yaml:7: invalid env entry 'nonsense'"
 }
 
 # --- parse_config_file --------------------------------------------------------
@@ -502,12 +503,14 @@ assert_no_config_warnings() {
     assert_equal "$PROFILE" ""
 }
 
-@test "parse_config_file warns about an unknown key and continues" {
-    local f="$BATS_TEST_TMPDIR/config.yaml"
-    write_config "$f" "colour: blue" "agent: opencode"
-    parse_config_file "$f"
-    assert_equal "$AGENT" opencode
-    assert_config_warning "Unknown configuration key 'colour' in $f"
+@test "parse_config_file fails on an unknown key" {
+    local f="$BATS_TEST_TMPDIR/config.yaml" key
+    for key in colour whitelist_files blacklist_files env_files; do
+        write_config "$f" "agent: opencode" "$key: x"
+        run parse_config_file "$f"
+        assert_failure 1
+        assert_output --partial "Unknown configuration key '$key' in $f"
+    done
 }
 
 @test "parse_config_file fails on docker: ture" {
@@ -518,61 +521,46 @@ assert_no_config_warnings() {
     assert_output --partial "Invalid boolean for 'docker' in $f: 'ture'"
 }
 
-@test "parse_config_file fails on the removed *_files keys" {
-    local f="$BATS_TEST_TMPDIR/config.yaml" key
-    for key in whitelist_files blacklist_files env_files; do
-        write_config "$f" "agent: opencode" "$key:" "  - x.txt"
+@test "parse_config_file fails on a list under a scalar key" {
+    local f="$BATS_TEST_TMPDIR/config.yaml"
+    write_config "$f" "agent:" "  - opencode"
+    run parse_config_file "$f"
+    assert_failure 1
+    assert_output --partial "$f:2: key 'agent' does not accept a list"
+}
+
+@test "parse_config_file fails on a list item outside of a list" {
+    local f="$BATS_TEST_TMPDIR/config.yaml"
+    write_config "$f" "- stray"
+    run parse_config_file "$f"
+    assert_failure 1
+    assert_output --partial "$f:1: list item outside of a list"
+}
+
+@test "parse_config_file fails on a nested mapping under a non-env key" {
+    local f="$BATS_TEST_TMPDIR/config.yaml"
+    write_config "$f" "whitelist:" "  nested: x"
+    run parse_config_file "$f"
+    assert_failure 1
+    assert_output --partial "$f:2: nested mapping under 'whitelist' is not supported"
+}
+
+@test "parse_config_file fails on unsupported YAML syntax" {
+    local f="$BATS_TEST_TMPDIR/config.yaml" line
+    for line in "agent: |" "profile: *anchor" "this is not yaml"; do
+        write_config "$f" "quiet: true" "$line"
         run parse_config_file "$f"
         assert_failure 1
-        assert_output --partial "$f:2: '$key' is no longer supported"
-        assert_output --partial "into the '${key%_files}' key"
+        assert_output --partial "$f:2: unsupported"
     done
 }
 
-@test "parse_config_file warns about a list under a scalar key" {
-    local f="$BATS_TEST_TMPDIR/config.yaml"
-    write_config "$f" "agent:" "  - opencode" "  - other" "quiet: true"
-    parse_config_file "$f"
-    assert_equal "$AGENT" claudecode
-    assert_equal "$QUIET" true
-    assert_config_warning "$f:2: key 'agent' does not accept a list"
-    assert_equal "${#CONFIG_LOG_MESSAGES[@]}" 1
-}
-
-@test "parse_config_file warns about a list item outside of a list" {
-    local f="$BATS_TEST_TMPDIR/config.yaml"
-    write_config "$f" "- stray"
-    parse_config_file "$f"
-    assert_config_warning "$f:1: list item outside of a list"
-}
-
-@test "parse_config_file warns about a nested mapping under a non-env key" {
-    local f="$BATS_TEST_TMPDIR/config.yaml"
-    write_config "$f" "whitelist:" "  nested: x" "  other: y" "agent: opencode"
-    parse_config_file "$f"
-    assert_equal "${#WHITELIST_ENTRIES[@]}" 0
-    assert_equal "$AGENT" opencode
-    assert_config_warning "$f:2: nested mapping under 'whitelist' is not supported"
-    assert_equal "${#CONFIG_LOG_MESSAGES[@]}" 1
-}
-
-@test "parse_config_file warns about unsupported YAML syntax" {
-    local f="$BATS_TEST_TMPDIR/config.yaml"
-    write_config "$f" "agent: |" "profile: *anchor" "this is not yaml"
-    parse_config_file "$f"
-    assert_equal "$AGENT" claudecode
-    assert_equal "$PROFILE" ""
-    assert_config_warning "$f:1: unsupported YAML syntax for 'agent'"
-    assert_config_warning "$f:2: unsupported YAML syntax for 'profile'"
-    assert_config_warning "$f:3: unsupported syntax (ignored): this is not yaml"
-}
-
-@test "parse_config_file treats an unexpectedly indented key as top-level" {
+@test "parse_config_file fails on an unexpectedly indented key" {
     local f="$BATS_TEST_TMPDIR/config.yaml"
     write_config "$f" "  agent: opencode"
-    parse_config_file "$f"
-    assert_equal "$AGENT" opencode
-    assert_config_warning "unexpected indentation, treating 'agent' as a top-level key"
+    run parse_config_file "$f"
+    assert_failure 1
+    assert_output --partial "$f:1: unexpected indentation of 'agent'"
 }
 
 # --- load_config_files --------------------------------------------------------
