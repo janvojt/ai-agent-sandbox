@@ -66,7 +66,10 @@ profile: work
 # docker_image: ghcr.io/wollomatic/socket-proxy:1
 # docker_port_range: 29000-29999  # host loopback ports for container ports published without
 #                                 # a host port (-p 5432, Testcontainers); none: Docker's random ports
-# venv: true            # --venv / --no-venv
+# venv: true            # --venv / --no-venv: the activated venv ($VIRTUAL_ENV)
+# venv: pipenv          # --venv=pipenv: the project's pipenv environment (works without
+#                       # an activated shell, e.g. in T3 Code, and in git worktrees)
+# venv: .venv           # --venv=PATH: a venv directory, relative to the working directory
 # gitconfig: false      # --gitconfig / --no-gitconfig
 # shared_skills: false  # --shared-skills / --no-shared-skills (host skills in every profile)
 # gpg_agent: true       # --gpg-agent / --no-gpg-agent

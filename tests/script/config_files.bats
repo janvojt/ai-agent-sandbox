@@ -342,3 +342,40 @@ last_index_of() {
     assert_success
     refute_args_contain BWRAP_RECORDED --ro-bind "$PROJECT_DIR" "$PROJECT_DIR"
 }
+
+@test "venv: pipenv in a project file mounts the pipenv environment and activates it" {
+    local venv="$TEST_HOME/.local/share/virtualenvs/work-abc"
+    mkdir -p "$venv/bin"
+    touch "$venv/pyvenv.cfg"
+    touch Pipfile
+    stub_command pipenv "echo '$venv'"
+    write_config "$PROJECT_DIR/config.yaml" 'venv: pipenv'
+    run_sandbox --dry-run
+    assert_success
+    assert_args_contain BWRAP_RECORDED --ro-bind "$venv" "$venv"
+    assert_args_contain BWRAP_RECORDED --setenv VIRTUAL_ENV "$venv"
+    assert_args_contain BWRAP_RECORDED --setenv PIPENV_ACTIVE 1
+    assert_output --partial "Virtual Environment: $venv (pipenv)"
+    run_sandbox --dry-run --no-venv
+    refute_args_contain BWRAP_RECORDED --ro-bind "$venv" "$venv"
+}
+
+@test "--venv=PATH mounts the path and puts its bin directory first on PATH" {
+    mkdir -p .venv/bin
+    touch .venv/pyvenv.cfg
+    run_sandbox --dry-run --venv=.venv
+    assert_success
+    assert_args_contain BWRAP_RECORDED --ro-bind "$TEST_WORK/.venv" "$TEST_WORK/.venv"
+    refute_args_contain BWRAP_RECORDED --setenv PIPENV_ACTIVE 1
+    local i path=""
+    for ((i = 0; i < ${#BWRAP_RECORDED[@]}; i++)); do
+        [[ "${BWRAP_RECORDED[i]}" == --setenv && "${BWRAP_RECORDED[i+1]}" == PATH ]] && path="${BWRAP_RECORDED[i+2]}"
+    done
+    [[ "$path" == "$TEST_WORK/.venv/bin:"* ]] || fail "PATH is $path"
+}
+
+@test "--venv with an invalid source exits 1" {
+    run_sandbox --dry-run --venv=pipnev
+    assert_failure
+    assert_output --partial "Invalid value for --venv"
+}

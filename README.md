@@ -92,6 +92,18 @@ source .venv/bin/activate
 
 `--venv` detects the active Python virtual environment from `VIRTUAL_ENV`, mounts the venv read-only, sets `VIRTUAL_ENV` inside the sandbox, and prepends `$VIRTUAL_ENV/bin` to `PATH`. If no active venv is detected, the option is ignored.
 
+Orchestrators such as T3 Code start the sandbox without an activated venv. For them, name the source in the project's `.ai-agent-sandbox/config.yaml` (or with `--venv=SOURCE`):
+
+```yaml
+venv: pipenv     # the environment pipenv created for this project's Pipfile
+# venv: .venv    # or a path, relative to the working directory
+```
+
+- `pipenv` runs `pipenv --venv` on the host for the `Pipfile` in the working directory (no search in parent directories, `.env` is not loaded) and also sets `PIPENV_ACTIVE=1` inside, as `pipenv shell` does. Variables `pipenv shell` would load from `.env` go into the `env:` key instead.
+- In a git worktree (T3 Code creates one per thread), a missing pipenv environment or relative path is looked up in the main checkout: venvs are git-ignored and pipenv names its environments after the project path, so a new worktree has none of its own.
+- The venv stays read-only: a venv the agent could change would run its code on the host the next time you use it. Install packages on the host (`pipenv install`).
+- The venv's `bin/python` links to the base interpreter. A warning names it when no mount makes it visible (e.g. `~/.pyenv`); whitelist that directory.
+
 ### Network isolation:
 
 By default the sandbox runs in its own network namespace. [pasta](https://passt.top/) attaches user-mode networking to it, so the agent reaches the internet transparently (no proxy settings, every tool works), while:
@@ -414,7 +426,7 @@ See [`config-example.yaml`](config-example.yaml) for a commented example of ever
 | `docker` | bool | `--enable-docker` / `--no-docker` |
 | `docker_image` | string | `--docker-image IMAGE` |
 | `docker_port_range` | string | `--docker-port-range A-B` (default `29000-29999`, `none` keeps Docker's random host ports) |
-| `venv` | bool | `--venv` / `--no-venv` |
+| `venv` | bool or string | `--venv[=SOURCE]` / `--no-venv` (`true` = `active`, `pipenv`, or a path such as `.venv`) |
 | `gitconfig` | bool | `--gitconfig` / `--no-gitconfig` |
 | `shared_skills` | bool | `--shared-skills` / `--no-shared-skills` (default: shared) |
 | `gpg_agent` | bool | `--gpg-agent` / `--no-gpg-agent` |

@@ -196,6 +196,14 @@ DOCKER_FILTER_PID=""
 DOCKER_ROOTLESS=false
 VENV_PATH=""
 VENV_BIN_DIR=""
+# Where the virtual environment comes from (--venv[=SOURCE], key venv): active
+# ($VIRTUAL_ENV of the launching shell), pipenv (asked on the host) or a path
+VENV_SOURCE="active"
+# How VENV_PATH was found, for the summary
+VENV_ORIGIN=""
+# Main checkout of a verified git worktree with a .git common dir (set by
+# resolve_git_worktree), used to find git-ignored files the worktree lacks
+GIT_MAIN_CHECKOUT_DIR=""
 CLAUDE_HOST_BIN="$HOME/.local/bin/claude"
 CLAUDE_NATIVE_DIR="$HOME/.local/share/claude"
 CLAUDE_SANDBOX_BIN_DIR="$HOME/.local/share/ai-agent-sandbox/claude-bin"
@@ -235,7 +243,11 @@ OPTIONS:
     --blacklist-path PATH   Directly blacklist a path (relative to working dir, can be specified multiple times)
     --enable-docker, -d     Enable Docker access via filtered socket proxy
     --no-docker             Disable Docker access (overrides config files)
-    --venv                  Include active Python virtual environment in sandbox PATH
+    --venv[=SOURCE]         Mount a Python virtual environment read-only and put its bin
+                            directory first on PATH. SOURCE: active (default, the
+                            activated venv from \$VIRTUAL_ENV), pipenv (the project's
+                            pipenv environment, looked up on the host) or a path
+                            (relative to the working directory, e.g. .venv)
     --no-venv               Do not include the virtual environment (overrides config files)
     --gitconfig             Mount ~/.gitconfig read-only into the sandbox (default)
     --no-gitconfig          Do not mount ~/.gitconfig into the sandbox
@@ -358,6 +370,7 @@ EXAMPLES:
     $0 --whitelist-path-rw /shared/data
     $0 --blacklist-path .env --blacklist-path secrets/
     $0 --venv
+    $0 --venv=pipenv
     $0 --gpg-agent
     $0 --network host
     $0 --seccomp nested
@@ -615,12 +628,16 @@ apply_config_scalar() {
                 SECCOMP_SOURCE="$file"
             fi
             ;;
-        docker|venv|gpg_agent|gitconfig|shared_skills|quiet|protect_project_config|protect_git_config|require_project_approval)
+        venv)
+            [[ "$is_null" = true ]] && return 0
+            apply_venv_setting "$value" \
+                || config_error "Invalid value for 'venv' in $file: '$value' (expected true, false, active, pipenv or a path starting with ., / or ~)"
+            ;;
+        docker|gpg_agent|gitconfig|shared_skills|quiet|protect_project_config|protect_git_config|require_project_approval)
             [[ "$is_null" = true ]] && return 0
             bool=$(parse_yaml_bool "$value" "$key" "$file") || exit 1
             case "$key" in
                 docker) ENABLE_DOCKER="$bool" ;;
-                venv) ENABLE_VENV="$bool" ;;
                 gpg_agent) ENABLE_GPG_AGENT="$bool" ;;
                 gitconfig) MOUNT_GITCONFIG="$bool" ;;
                 shared_skills) SHARE_SKILLS="$bool" ;;
@@ -1215,6 +1232,7 @@ resolve_git_worktree() {
     [[ "$(basename "$common_dir")" == .git ]] || return 0
     main_checkout=$(dirname "$common_dir")
     [[ "$main_checkout" != "$WORKING_DIR" ]] || return 0
+    GIT_MAIN_CHECKOUT_DIR="$main_checkout"
     if [[ ! -f "$PROJECT_CONFIG_LOCAL_FILE" && -f "$main_checkout/.ai-agent-sandbox/config.local.yaml" ]]; then
         MAIN_CHECKOUT_CONFIG_LOCAL_FILE="$main_checkout/.ai-agent-sandbox/config.local.yaml"
     fi
@@ -1700,21 +1718,129 @@ mount_docker_compose_plugins() {
     fi
 }
 
+# Usage: apply_venv_setting <value>
+# Sets ENABLE_VENV and VENV_SOURCE from a --venv=/venv: value. Booleans keep
+# their meaning (true = the active venv). A path must look like one (start with
+# ., / or ~, or contain a /), so that a misspelt keyword is an error instead of
+# a missing directory. Returns 1 for anything else.
+apply_venv_setting() {
+    local value="$1"
+    case "${value,,}" in
+        true|yes|on|active)
+            ENABLE_VENV=true
+            VENV_SOURCE="active"
+            return 0
+            ;;
+        false|no|off)
+            ENABLE_VENV=false
+            return 0
+            ;;
+        pipenv)
+            ENABLE_VENV=true
+            VENV_SOURCE="pipenv"
+            return 0
+            ;;
+    esac
+    if [[ "$value" == [./~]* || "$value" == \$HOME* || "$value" == */* ]]; then
+        ENABLE_VENV=true
+        VENV_SOURCE="$value"
+        return 0
+    fi
+    return 1
+}
+
+# Usage: pipenv_venv_in <dir>
+# Prints the virtualenv pipenv uses for the Pipfile in <dir>, or fails. Runs on
+# the host: the Pipfile is given explicitly (no search in parent directories),
+# .env is not loaded, an activated venv of the launching shell is ignored and
+# pipenv prints nothing but the path.
+pipenv_venv_in() {
+    local dir="$1" output line path=""
+    [[ -f "$dir/Pipfile" ]] || return 1
+    local -a cmd=(env -u PIPENV_ACTIVE -u VIRTUAL_ENV
+        PIPENV_PIPFILE="$dir/Pipfile" PIPENV_DONT_LOAD_ENV=1 PIPENV_IGNORE_VIRTUALENVS=1
+        PIPENV_VERBOSITY=-1 PIPENV_NOSPIN=1 PIPENV_YES=0 PIPENV_MAX_DEPTH=1
+        pipenv --venv)
+    if command -v timeout >/dev/null 2>&1; then
+        cmd=(timeout 30 "${cmd[@]}")
+    fi
+    output=$(cd "$dir" && "${cmd[@]}" 2>/dev/null </dev/null) || return 1
+    # The path is the last non-empty line
+    while IFS= read -r line; do
+        line=$(trim_whitespace "$line")
+        [[ -n "$line" ]] && path="$line"
+    done <<< "$output"
+    [[ "$path" == /* && -d "$path" ]] || return 1
+    printf '%s\n' "$path"
+}
+
+# Usage: resolve_venv_path
+# Sets VENV_PATH and VENV_ORIGIN for VENV_SOURCE, or logs why not and fails.
+# In a git worktree a pipenv environment or a relative path missing in the
+# worktree is looked up in the main checkout: venvs are git-ignored and pipenv
+# names its environments after the project path, so a new worktree has none.
+resolve_venv_path() {
+    local candidate
+    case "$VENV_SOURCE" in
+        active)
+            if [[ -z "${VIRTUAL_ENV:-}" ]]; then
+                log_info "${YELLOW}Warning: --venv specified, but no active virtual environment was detected (continuing without venv; use --venv=pipenv or --venv=PATH when no shell activates it, e.g. in T3 Code)${NC}"
+                return 1
+            fi
+            VENV_PATH="${VIRTUAL_ENV/#\~/$HOME}"
+            VENV_PATH="${VENV_PATH//\$HOME/$HOME}"
+            [[ "$VENV_PATH" == /* ]] || VENV_PATH="$WORKING_DIR/$VENV_PATH"
+            VENV_ORIGIN="active virtual environment"
+            ;;
+        pipenv)
+            if ! command -v pipenv >/dev/null 2>&1; then
+                log_info "${YELLOW}Warning: venv: pipenv specified, but pipenv is not installed on the host (continuing without venv)${NC}"
+                return 1
+            fi
+            if [[ "$NO_PROJECT_WORKDIR" != true ]] && VENV_PATH=$(pipenv_venv_in "$WORKING_DIR"); then
+                VENV_ORIGIN="pipenv"
+            elif [[ -n "$GIT_MAIN_CHECKOUT_DIR" ]] && VENV_PATH=$(pipenv_venv_in "$GIT_MAIN_CHECKOUT_DIR"); then
+                VENV_ORIGIN="pipenv, main checkout $GIT_MAIN_CHECKOUT_DIR"
+            else
+                VENV_PATH=""
+                if [[ ! -f "$WORKING_DIR/Pipfile" && ( -z "$GIT_MAIN_CHECKOUT_DIR" || ! -f "$GIT_MAIN_CHECKOUT_DIR/Pipfile" ) ]]; then
+                    log_info "${YELLOW}Warning: venv: pipenv specified, but there is no Pipfile in $WORKING_DIR (continuing without venv)${NC}"
+                else
+                    log_info "${YELLOW}Warning: pipenv has no virtual environment for $WORKING_DIR${GIT_MAIN_CHECKOUT_DIR:+ or $GIT_MAIN_CHECKOUT_DIR}; run 'pipenv install' on the host (continuing without venv)${NC}"
+                fi
+                return 1
+            fi
+            ;;
+        *)
+            candidate="${VENV_SOURCE/#\~/$HOME}"
+            candidate="${candidate//\$HOME/$HOME}"
+            if [[ "$candidate" == /* ]]; then
+                VENV_PATH="$candidate"
+                VENV_ORIGIN="configured path"
+            elif [[ "$NO_PROJECT_WORKDIR" != true && -d "$WORKING_DIR/$candidate" ]]; then
+                VENV_PATH="$WORKING_DIR/$candidate"
+                VENV_ORIGIN="configured path"
+            elif [[ -n "$GIT_MAIN_CHECKOUT_DIR" && -d "$GIT_MAIN_CHECKOUT_DIR/$candidate" ]]; then
+                VENV_PATH="$GIT_MAIN_CHECKOUT_DIR/$candidate"
+                VENV_ORIGIN="configured path, main checkout"
+            else
+                VENV_PATH="$WORKING_DIR/$candidate"
+                VENV_ORIGIN="configured path"
+            fi
+            VENV_PATH=$(realpath -m -s -- "$VENV_PATH")
+            ;;
+    esac
+}
+
 detect_venv() {
     if [[ "$ENABLE_VENV" != true ]]; then
         return 0
     fi
 
-    if [[ -z "${VIRTUAL_ENV:-}" ]]; then
-        log_info "${YELLOW}Warning: --venv specified, but no active virtual environment was detected (continuing without venv)${NC}"
+    if ! resolve_venv_path; then
+        VENV_PATH=""
         ENABLE_VENV=false
         return 0
-    fi
-
-    VENV_PATH="${VIRTUAL_ENV/#\~/$HOME}"
-    VENV_PATH="${VENV_PATH//\$HOME/$HOME}"
-    if [[ "$VENV_PATH" != /* ]]; then
-        VENV_PATH="$WORKING_DIR/$VENV_PATH"
     fi
 
     while [[ "$VENV_PATH" == */ && "$VENV_PATH" != "/" ]]; do
@@ -1722,7 +1848,7 @@ detect_venv() {
     done
 
     if [[ ! -d "$VENV_PATH" ]]; then
-        log_info "${YELLOW}Warning: active virtual environment does not exist: $VENV_PATH (continuing without venv)${NC}"
+        log_info "${YELLOW}Warning: virtual environment does not exist: $VENV_PATH (continuing without venv)${NC}"
         VENV_PATH=""
         ENABLE_VENV=false
         return 0
@@ -1730,11 +1856,31 @@ detect_venv() {
 
     VENV_BIN_DIR="$VENV_PATH/bin"
     if [[ ! -d "$VENV_BIN_DIR" ]]; then
-        log_info "${YELLOW}Warning: active virtual environment has no bin directory: $VENV_BIN_DIR (continuing without venv)${NC}"
+        log_info "${YELLOW}Warning: virtual environment has no bin directory: $VENV_BIN_DIR (continuing without venv)${NC}"
+        VENV_PATH=""
+        VENV_BIN_DIR=""
+        ENABLE_VENV=false
+        return 0
+    fi
+
+    # The path may come from a project file: only mount what is a venv
+    if [[ ! -f "$VENV_PATH/pyvenv.cfg" && ! -e "$VENV_BIN_DIR/python" ]]; then
+        log_info "${YELLOW}Warning: $VENV_PATH is not a Python virtual environment (no pyvenv.cfg or bin/python; continuing without venv)${NC}"
         VENV_PATH=""
         VENV_BIN_DIR=""
         ENABLE_VENV=false
     fi
+}
+
+# The venv's bin/python is a symlink to the base interpreter (/usr/bin/python3.x,
+# or ~/.pyenv, ~/.local/share/uv, ...); warn when no mount makes it visible.
+warn_hidden_venv_interpreter() {
+    local python="$VENV_BIN_DIR/python" target
+    [[ -L "$python" ]] || return 0
+    target=$(realpath -e -- "$python" 2>/dev/null) || return 0
+    path_is_within "$target" "$VENV_PATH" && return 0
+    is_path_bound "$target" && return 0
+    log_info "${YELLOW}Warning: the virtual environment's interpreter $target is not visible in the sandbox; whitelist $(dirname "$target")${NC}"
 }
 
 collect_allowed_mount_paths() {
@@ -4906,6 +5052,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --venv)
             ENABLE_VENV=true
+            VENV_SOURCE="active"
+            shift
+            ;;
+        --venv=*)
+            if ! apply_venv_setting "${1#--venv=}"; then
+                echo -e "${RED}Error: Invalid value for --venv: '${1#--venv=}' (expected active, pipenv or a path starting with ., / or ~)${NC}" >&2
+                exit 1
+            fi
             shift
             ;;
         --no-gitconfig)
@@ -5468,6 +5622,22 @@ if [[ ${#WHITELIST_OVERRIDE_ARGS[@]} -gt 0 ]]; then
     protect_sandbox_config WHITELIST_OVERRIDE_ARGS
 fi
 
+# Before the profile store and the approvals are hidden: the path may come from
+# a project file, and a mount covering them must not uncover them again
+if [[ "$ENABLE_VENV" = true ]]; then
+    log_info "\n${GREEN}Virtual environment:${NC} $VENV_PATH"
+    BWRAP_ARGS+=(--ro-bind "$VENV_PATH" "$VENV_PATH")
+    sandbox_setenv VIRTUAL_ENV "$VENV_PATH"
+    BWRAP_ARGS+=(--unsetenv PYTHONHOME)
+    if [[ "$VENV_SOURCE" = pipenv ]]; then
+        # What pipenv shell sets: pipenv inside then uses this environment
+        # instead of looking for one named after the (worktree) path
+        sandbox_setenv PIPENV_ACTIVE 1
+    fi
+    log_info "${GREEN}✓${NC} Mounted virtual environment: $VENV_PATH (read-only, $VENV_ORIGIN)"
+    warn_hidden_venv_interpreter
+fi
+
 # Never expose other profiles' credentials, even when a whitelist entry covers
 # the profile store (e.g. ~/.local/share); the active profile is bound separately
 if [[ -d "$PROFILES_DIR" ]] && is_path_bound "$PROFILES_DIR"; then
@@ -5478,14 +5648,6 @@ fi
 if [[ -d "$APPROVALS_DIR" ]] && is_path_bound "$APPROVALS_DIR"; then
     BWRAP_ARGS+=(--tmpfs "$APPROVALS_DIR")
     log_info "${YELLOW}✓${NC} Hidden project config approvals $APPROVALS_DIR (covered by another mount)"
-fi
-
-if [[ "$ENABLE_VENV" = true ]]; then
-    log_info "\n${GREEN}Virtual environment:${NC} $VENV_PATH"
-    BWRAP_ARGS+=(--ro-bind "$VENV_PATH" "$VENV_PATH")
-    sandbox_setenv VIRTUAL_ENV "$VENV_PATH"
-    BWRAP_ARGS+=(--unsetenv PYTHONHOME)
-    log_info "${GREEN}✓${NC} Mounted virtual environment: $VENV_PATH (read-only)"
 fi
 
 mount_docker_compose_plugins
@@ -5749,7 +5911,7 @@ if [[ ${#HIDDEN_WORKTREE_CHECKOUTS[@]} -gt 0 ]]; then
     log_info "Other Git Worktrees (kept registered, not mounted): ${YELLOW}${HIDDEN_WORKTREE_CHECKOUTS[*]}${NC}"
 fi
 if [[ "$ENABLE_VENV" = true ]]; then
-    log_info "Virtual Environment: ${YELLOW}$VENV_PATH${NC}"
+    log_info "Virtual Environment: ${YELLOW}$VENV_PATH ($VENV_ORIGIN)${NC}"
 else
     log_info "Virtual Environment: ${YELLOW}disabled${NC}"
 fi
