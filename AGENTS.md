@@ -189,10 +189,11 @@ This is a bash-based sandboxing solution for running AI coding agents in isolate
 
 **Claude Code Configuration Binding (lines 264-285)**:
 - Native installs bind `~/.local/share/claude` read-write so downloaded versions persist
-- Native installs mount `~/.local/bin` as an **overlayfs**: the host directory is the read-only lower layer and `~/.local/share/ai-agent-sandbox/claude-bin` is the writable upper layer (with `~/.local/share/ai-agent-sandbox/claude-work` as the overlay workdir). The in-sandbox updater's atomic launcher swap at `~/.local/bin/claude` lands in the upper layer and persists across runs, while other executables in `~/.local/bin` stay visible and the host directory is never modified
-- `prepare_claude_native_install` re-syncs at every launch: the upper-layer launcher is kept only while strictly newer than the host's (an in-sandbox update the host hasn't caught up to); broken symlinks, stale whiteouts, and entries at or behind the host launcher are removed so the host launcher shows through the lower layer
-- If bwrap lacks `--overlay` support, falls back to binding `claude-bin` over `~/.local/bin` (updates still persist, but other entries in `~/.local/bin` are hidden)
-- Concurrent sandbox runs share the overlay upper/work dirs, which the kernel may refuse for simultaneous mounts
+- Native installs mount `~/.local/bin` as an **overlayfs**: the host directory is the read-only lower layer, the upper layer and workdir are **per run** (`prepare_local_bin_run_dir`: `mktemp -d` in `LOCAL_BIN_RUNS_DIR` = `~/.local/share/ai-agent-sandbox/local-bin-runs`, 0700, with `pid`, `upper/`, `work/`; same filesystem as the store, the upper layer on `/tmp` would need user xattrs on tmpfs). Writes to `~/.local/bin` are lost at exit like the rest of the tmpfs home. They used to persist in a shared upper layer, which put anything an agent installed there (a `git` wrapper, say) on the `PATH` of every later sandbox of every project and profile, shadowed newer host binaries, and kept entry scripts whose code in `~/.local/lib`/`~/.local/share` was gone
+- Only the updater's launcher swap survives: `cleanup_local_bin_run_dir` (from `cleanup_sandbox`) calls `save_updated_claude_launcher`, which copies `upper/claude` to `CLAUDE_SANDBOX_BIN_DIR/claude` (`~/.local/share/ai-agent-sandbox/claude-bin`, atomic rename) when `claude_launcher_target` accepts it (symlink to an executable in `~/.local/share/claude/versions/`, relative links resolved against `~/.local/bin`) and it is strictly newer (`claude_version_newer`, `sort -V`) than both the host's and the stored launcher. The next run seeds its upper layer with it. After `kill -9` the update is not saved (Claude downloads it again); `remove_stale_local_bin_run_dirs` removes run directories whose pid is gone. `remove_overlay_dir` chmods first because the kernel's `work/work` is mode 000
+- `prepare_claude_native_install` re-syncs at every launch: the stored launcher is kept only while strictly newer than the host's; anything else is removed so the host launcher shows through.
+- If bwrap lacks `--overlay` support, the run's upper directory (seeded with the stored launcher or a link to the host's version) is bound over `~/.local/bin`, hiding its other entries
+- `local-bin-runs` (created before the check) and `claude-bin` get a `--tmpfs` when a whitelist mount exposes them, next to the profile store and the approvals: a writable run directory would let one sandbox write into another's `~/.local/bin`, a writable store would pick the host's next launcher
 - Non-native `~/.local/bin/claude` installations remain read-only (the symlink/bind is skipped when `~/.local/bin` is already visible via a whitelist mount)
 - `mount_claude_config` binds `$PROFILE_HOME/.claude/` and `$PROFILE_HOME/.claude.json` read-write at `~/.claude` / `~/.claude.json` (host paths for the `default` profile, profile store otherwise; created on first use, `.claude.json` seeded with `{}`)
 - Preserves Claude-specific environment variables; unsets `CLAUDE_CONFIG_DIR`
@@ -356,7 +357,7 @@ Network setup is the `case "$NETWORK_MODE"` block after the `--chdir` argument p
 ### Adding Claude Configuration Mounts
 
 Claude Code needs specific paths (`mount_claude_config`):
-- Launcher: `~/.local/bin/claude` (native installs: overlayfs with writable upper layer so updater launcher swaps persist; non-native: read-only) - shared by all profiles
+- Launcher: `~/.local/bin/claude` (native installs: overlayfs with a per-run upper layer, only a newer launcher is kept after the run; non-native: read-only) - shared by all profiles
 - Versions: `~/.local/share/claude` (native installs, read-write) - shared by all profiles
 - Config directory: `~/.claude/` (read-write, from `$PROFILE_HOME`)
 - Skills: `~/.claude/skills` (non-default profiles: overlayfs of the host's skills and the profile's own, see Shared skills)
@@ -388,7 +389,7 @@ When modifying the script:
 9. Test with environment variable expansion in whitelist (`$HOME/.local`, `~/.local`)
 10. Test with relative paths in whitelist (`data/`, `src/**/*.txt`)
 11. Test with ant-style patterns in both absolute and relative whitelist paths
-12. Verify cleanup on clean exit and interrupt (Ctrl+C) - check for temp file leaks
+12. Verify cleanup on clean exit and interrupt (Ctrl+C) - check for temp file leaks (also no `run.*` left in `~/.local/share/ai-agent-sandbox/local-bin-runs`). With a native Claude install: a file written to `~/.local/bin` inside is gone in the next run, `claude update` inside is kept (`claude-bin/claude`) and still used after a restart
 13. Test with missing additional files (should skip with warning, not fail)
 14. Test Claude Code can still access its config: check `~/.claude/` and `~/.claude.json`
 15. Verify configuration summary shows all whitelist/blacklist files being used (user, project, and explicit)

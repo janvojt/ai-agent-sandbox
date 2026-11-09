@@ -228,7 +228,7 @@ A profile pinned in a project file is a requirement, not just a default: when `A
 
 Claude Code runs with `--dangerously-skip-permissions` by default: the sandbox is the safety net, so the agent does not have to ask. If you pass a permission flag yourself (`--permission-mode <mode>`, `--dangerously-skip-permissions` or `--allow-dangerously-skip-permissions`), the default is not added and your choice applies. Orchestrators such as T3 Code rely on this to keep their supervised modes supervised.
 
-Native Claude Code updates are persistent across sandbox runs. The sandbox mounts Claude's version store read-write and uses a dedicated persistent launcher directory, rather than exposing every executable in `~/.local/bin` to writes.
+Native Claude Code updates persist across sandbox runs. The sandbox mounts Claude's version store (`~/.local/share/claude`) read-write. `~/.local/bin` is an overlay: your host's `~/.local/bin` underneath, plus a writable layer that exists for one run only. Anything else written to `~/.local/bin` inside the sandbox is lost at exit, like the rest of the sandbox home, so tools an agent installs there never reach later sandboxes of other projects. When Claude updates itself, the new launcher is kept in `~/.local/share/ai-agent-sandbox/claude-bin` until the host's own launcher is as new. Install tools you want to keep on the host.
 
 ```bash
 ./ai-agent-sandbox.sh -- update

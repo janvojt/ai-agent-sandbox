@@ -206,8 +206,16 @@ VENV_ORIGIN=""
 GIT_MAIN_CHECKOUT_DIR=""
 CLAUDE_HOST_BIN="$HOME/.local/bin/claude"
 CLAUDE_NATIVE_DIR="$HOME/.local/share/claude"
+# Launcher written by a Claude update inside the sandbox (a symlink into
+# CLAUDE_NATIVE_DIR/versions), kept until the host's own launcher is as new
 CLAUDE_SANDBOX_BIN_DIR="$HOME/.local/share/ai-agent-sandbox/claude-bin"
-CLAUDE_SANDBOX_WORK_DIR="$HOME/.local/share/ai-agent-sandbox/claude-work"
+# Parent of each run's own writable layer for ~/.local/bin
+# (run.XXXXXX/{upper,work}), deleted when the run ends. Not on /tmp: an overlay
+# in an unprivileged sandbox keeps its metadata in user xattrs, which tmpfs
+# only supports on newer kernels.
+LOCAL_BIN_RUNS_DIR="$HOME/.local/share/ai-agent-sandbox/local-bin-runs"
+# This run's directory in LOCAL_BIN_RUNS_DIR, for the cleanup at exit
+LOCAL_BIN_RUN_DIR=""
 CLAUDE_NATIVE_INSTALL=false
 DOCKER_COMPOSE_PLUGIN_DIRS=(
     "$HOME/.docker/cli-plugins"
@@ -3560,6 +3568,7 @@ cleanup_gpg_agent() {
 }
 
 cleanup_sandbox() {
+    cleanup_local_bin_run_dir
     cleanup_socket_proxy
     cleanup_gpg_agent
     cleanup_network
@@ -4603,45 +4612,125 @@ mount_opencode_config() {
     BWRAP_ARGS+=(--unsetenv OPENCODE_CONFIG_DIR --unsetenv OPENCODE_DB)
 }
 
+# Print the target of a Claude launcher symlink when it is an executable in
+# Claude's version store; fail otherwise (no symlink, broken, elsewhere). A
+# relative link is resolved against <dir> when given (where the link is seen
+# inside the sandbox), otherwise against its own directory.
+# Usage: claude_launcher_target <link> [dir]
+claude_launcher_target() {
+    local target
+    [[ -L "$1" ]] || return 1
+    target=$(readlink "$1" 2>/dev/null) || return 1
+    if [[ -n "${2:-}" && "$target" != /* ]]; then
+        target="$2/$target"
+    else
+        target="$1"
+    fi
+    target=$(readlink -f "$target" 2>/dev/null) || return 1
+    [[ "$target" == "$CLAUDE_NATIVE_DIR/versions/"* && -x "$target" ]] || return 1
+    echo "$target"
+}
+
+# Usage: claude_version_newer <version> <other>; true when <version> is set and
+# sorts strictly after <other> (an empty <other> is older than any version)
+claude_version_newer() {
+    [[ -n "$1" && "$1" != "$2" ]] || return 1
+    [[ -n "$2" ]] || return 0
+    [[ "$(printf '%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
+}
+
+# Remove a directory tree that may contain the mode 000 "work" directory the
+# kernel creates in an overlay workdir.
+remove_overlay_dir() {
+    chmod -R u+rwx "$1" 2>/dev/null || true
+    rm -rf "$1" 2>/dev/null || true
+}
+
 prepare_claude_native_install() {
     local managed_launcher="$CLAUDE_SANDBOX_BIN_DIR/claude"
-    local host_target="" managed_target=""
+    local host_target managed_target
 
-    # ~/.local/bin is mounted as an overlay: the host directory is the
-    # read-only lower layer and the managed dir is the writable upper layer,
-    # so the updater can atomically replace ~/.local/bin/claude inside the
-    # sandbox (the write lands in the upper layer and persists) without the
-    # sandbox getting write access to the rest of ~/.local/bin.
-    if [[ -L "$CLAUDE_HOST_BIN" ]]; then
-        host_target=$(readlink -f "$CLAUDE_HOST_BIN" 2>/dev/null || true)
-        if [[ "$host_target" != "$CLAUDE_NATIVE_DIR/versions/"* || ! -x "$host_target" ]]; then
-            host_target=""
-        fi
-    fi
-    if [[ -L "$managed_launcher" ]]; then
-        managed_target=$(readlink -f "$managed_launcher" 2>/dev/null || true)
-        if [[ "$managed_target" != "$CLAUDE_NATIVE_DIR/versions/"* || ! -x "$managed_target" ]]; then
-            managed_target=""
-        fi
-    fi
+    # The updater atomically replaces ~/.local/bin/claude, so ~/.local/bin is
+    # mounted as an overlay with a writable upper layer that exists for one run
+    # only (prepare_local_bin_run_dir). The only thing kept across runs is a
+    # newer launcher (save_updated_claude_launcher), in CLAUDE_SANDBOX_BIN_DIR.
+    host_target=$(claude_launcher_target "$CLAUDE_HOST_BIN") || host_target=""
+    managed_target=$(claude_launcher_target "$managed_launcher") || managed_target=""
 
-    # Keep the upper-layer launcher only while it is strictly newer than the
-    # host's (an in-sandbox update the host hasn't caught up to). Otherwise
-    # remove it — including broken symlinks and stale whiteouts — so the host
-    # launcher shows through the lower layer.
-    if [[ -e "$managed_launcher" || -L "$managed_launcher" ]]; then
-        local host_ver="${host_target##*/}" managed_ver="${managed_target##*/}"
-        if [[ -z "$managed_target" ]] || { [[ -n "$host_target" ]] && \
-            [[ "$(printf '%s\n' "$managed_ver" "$host_ver" | sort -V | tail -n1)" == "$host_ver" ]]; }; then
-            rm -f "$managed_launcher"
-            managed_target=""
-        fi
+    # Keep the stored launcher only while it is strictly newer than the host's
+    # (an in-sandbox update the host hasn't caught up to). Otherwise remove it,
+    # including broken symlinks, so the host launcher shows through.
+    if [[ -e "$managed_launcher" || -L "$managed_launcher" ]] && \
+        ! claude_version_newer "${managed_target##*/}" "${host_target##*/}"; then
+        rm -rf "$managed_launcher"
+        managed_target=""
     fi
 
     if [[ -n "$host_target" || -n "$managed_target" ]]; then
-        mkdir -p "$CLAUDE_SANDBOX_BIN_DIR" "$CLAUDE_SANDBOX_WORK_DIR"
+        mkdir -p "$CLAUDE_SANDBOX_BIN_DIR"
         CLAUDE_NATIVE_INSTALL=true
     fi
+}
+
+# Create this run's upper and work directory of the ~/.local/bin overlay
+# (LOCAL_BIN_RUN_DIR) with the run's pid in it, after removing those of runs
+# that are gone. The upper layer starts with the stored launcher, or with a link
+# to the host's version when there is no overlay support (the upper directory
+# then replaces ~/.local/bin, which must still contain claude).
+# Usage: prepare_local_bin_run_dir <true|false: overlay supported>
+prepare_local_bin_run_dir() {
+    local host_target
+    remove_stale_local_bin_run_dirs
+    mkdir -p "$LOCAL_BIN_RUNS_DIR" && chmod 0700 "$LOCAL_BIN_RUNS_DIR" || return 1
+    LOCAL_BIN_RUN_DIR=$(mktemp -d "$LOCAL_BIN_RUNS_DIR/run.XXXXXX") || return 1
+    echo "$$" > "$LOCAL_BIN_RUN_DIR/pid"
+    mkdir "$LOCAL_BIN_RUN_DIR/upper" "$LOCAL_BIN_RUN_DIR/work" || return 1
+    if [[ -L "$CLAUDE_SANDBOX_BIN_DIR/claude" ]]; then
+        cp -P "$CLAUDE_SANDBOX_BIN_DIR/claude" "$LOCAL_BIN_RUN_DIR/upper/claude" || return 1
+    elif [[ "$1" = false ]] && host_target=$(claude_launcher_target "$CLAUDE_HOST_BIN"); then
+        ln -s "$host_target" "$LOCAL_BIN_RUN_DIR/upper/claude" || return 1
+    fi
+}
+
+# Run directories whose script is gone (killed without its EXIT trap). Only
+# directories with a pid file count: one without is being created right now.
+remove_stale_local_bin_run_dirs() {
+    local dir pid
+    for dir in "$LOCAL_BIN_RUNS_DIR"/run.*; do
+        [[ -d "$dir" && ! -L "$dir" && -O "$dir" && -f "$dir/pid" ]] || continue
+        pid=""
+        read -r pid < "$dir/pid" 2>/dev/null || true
+        [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
+        if ! kill -0 "$pid" 2>/dev/null; then
+            remove_overlay_dir "$dir"
+        fi
+    done
+    return 0
+}
+
+# Keep the launcher an in-sandbox update wrote, when it is newer than both the
+# host's and the stored one. Nothing else written to ~/.local/bin is kept.
+# Usage: save_updated_claude_launcher <launcher in the run's upper layer>
+save_updated_claude_launcher() {
+    local candidate host_target stored_target tmp
+    candidate=$(claude_launcher_target "$1" "$HOME/.local/bin") || return 0
+    host_target=$(claude_launcher_target "$CLAUDE_HOST_BIN") || host_target=""
+    stored_target=$(claude_launcher_target "$CLAUDE_SANDBOX_BIN_DIR/claude") || stored_target=""
+    claude_version_newer "${candidate##*/}" "${host_target##*/}" || return 0
+    claude_version_newer "${candidate##*/}" "${stored_target##*/}" || return 0
+    mkdir -p "$CLAUDE_SANDBOX_BIN_DIR" || return 0
+    tmp="$CLAUDE_SANDBOX_BIN_DIR/.claude.$$"
+    if ! ln -sfn "$candidate" "$tmp" || ! mv -fT "$tmp" "$CLAUDE_SANDBOX_BIN_DIR/claude"; then
+        rm -f "$tmp"
+    fi
+    return 0
+}
+
+cleanup_local_bin_run_dir() {
+    [[ -n "$LOCAL_BIN_RUN_DIR" && -d "$LOCAL_BIN_RUN_DIR" ]] || return 0
+    save_updated_claude_launcher "$LOCAL_BIN_RUN_DIR/upper/claude"
+    remove_overlay_dir "$LOCAL_BIN_RUN_DIR"
+    LOCAL_BIN_RUN_DIR=""
 }
 
 # OpenCode 1 and 2 have different command lines (see build_opencode_launch_args),
@@ -5649,32 +5738,48 @@ if [[ -d "$APPROVALS_DIR" ]] && is_path_bound "$APPROVALS_DIR"; then
     BWRAP_ARGS+=(--tmpfs "$APPROVALS_DIR")
     log_info "${YELLOW}✓${NC} Hidden project config approvals $APPROVALS_DIR (covered by another mount)"
 fi
+# Nor the ~/.local/bin layers of this and concurrent runs, or the stored
+# launcher, which the host's next sandbox would run. The runs directory is
+# created now so that a run directory made later cannot appear under a mount.
+if [[ "$CLAUDE_NATIVE_INSTALL" = true ]]; then
+    mkdir -p "$LOCAL_BIN_RUNS_DIR" && chmod 0700 "$LOCAL_BIN_RUNS_DIR"
+fi
+for local_bin_state_dir in "$LOCAL_BIN_RUNS_DIR" "$CLAUDE_SANDBOX_BIN_DIR"; do
+    if [[ -d "$local_bin_state_dir" ]] && is_path_bound "$local_bin_state_dir"; then
+        BWRAP_ARGS+=(--tmpfs "$local_bin_state_dir")
+        log_info "${YELLOW}✓${NC} Hidden $local_bin_state_dir (covered by another mount)"
+    fi
+done
 
 mount_docker_compose_plugins
 
 log_info "\n${YELLOW}Agent-specific configuration bindings:"
 if [[ "$AGENT" = "claudecode" ]]; then
     if [[ "$CLAUDE_NATIVE_INSTALL" = true ]]; then
-        # Persist both parts of a native Claude installation. The updater writes
-        # binaries under ~/.local/share and atomically replaces its launcher at
-        # ~/.local/bin/claude. That path is mounted as an overlay (host dir as
-        # read-only lower layer, managed dir as writable upper layer) so the
-        # launcher swap persists across runs while the rest of ~/.local/bin
-        # stays visible and effectively read-only on the host. Note: concurrent
-        # sandboxes share the upper/work dirs, which overlayfs may refuse.
+        # The updater writes versions under ~/.local/share/claude (bound
+        # read-write) and atomically replaces its launcher at
+        # ~/.local/bin/claude. ~/.local/bin is an overlay of the host directory
+        # (read-only lower layer) and an upper layer that exists for this run
+        # only: writes there are lost at exit like the rest of the tmpfs home,
+        # except a newer launcher, which cleanup_local_bin_run_dir keeps.
         BWRAP_ARGS+=(--bind "$CLAUDE_NATIVE_DIR" "$CLAUDE_NATIVE_DIR")
         if [[ -d "$HOME/.local/bin" ]] && bwrap_supports_overlay; then
-            BWRAP_ARGS+=(--overlay-src "$HOME/.local/bin")
-            BWRAP_ARGS+=(--overlay "$CLAUDE_SANDBOX_BIN_DIR" "$CLAUDE_SANDBOX_WORK_DIR" "$HOME/.local/bin")
-            log_info "${GREEN}✓${NC} Mounted native Claude versions (read-write) and ~/.local/bin overlay (updates persist)"
-        else
-            # No overlay support: shadow ~/.local/bin with the managed dir so
-            # updates still persist, at the cost of hiding its other entries.
-            if [[ ! -e "$CLAUDE_SANDBOX_BIN_DIR/claude" ]] && [[ -x "$(readlink -f "$CLAUDE_HOST_BIN" 2>/dev/null)" ]]; then
-                ln -s "$(readlink -f "$CLAUDE_HOST_BIN")" "$CLAUDE_SANDBOX_BIN_DIR/claude"
+            if ! prepare_local_bin_run_dir true; then
+                echo -e "${RED}Error: could not create the ~/.local/bin overlay directory in $LOCAL_BIN_RUNS_DIR${NC}" >&2
+                exit 1
             fi
-            BWRAP_ARGS+=(--bind "$CLAUDE_SANDBOX_BIN_DIR" "$HOME/.local/bin")
-            log_info "${GREEN}✓${NC} Mounted native Claude versions and launcher (read-write, no overlay support)"
+            BWRAP_ARGS+=(--overlay-src "$HOME/.local/bin")
+            BWRAP_ARGS+=(--overlay "$LOCAL_BIN_RUN_DIR/upper" "$LOCAL_BIN_RUN_DIR/work" "$HOME/.local/bin")
+            log_info "${GREEN}✓${NC} Mounted native Claude versions (read-write) and ~/.local/bin overlay (writes are lost at exit, Claude updates are kept)"
+        else
+            # No overlay support: the run's upper directory replaces
+            # ~/.local/bin, hiding its other entries.
+            if ! prepare_local_bin_run_dir false; then
+                echo -e "${RED}Error: could not create the ~/.local/bin directory in $LOCAL_BIN_RUNS_DIR${NC}" >&2
+                exit 1
+            fi
+            BWRAP_ARGS+=(--bind "$LOCAL_BIN_RUN_DIR/upper" "$HOME/.local/bin")
+            log_info "${GREEN}✓${NC} Mounted native Claude versions and launcher (no overlay support: other ~/.local/bin entries hidden, writes are lost at exit)"
         fi
     # Bind non-native claude binary
     elif [[ -e "$HOME/.local/bin/claude" ]]; then
