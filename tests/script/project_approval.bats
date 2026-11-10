@@ -140,3 +140,100 @@ setup() {
     assert_output --partial "Project Config Approval: required (1 project file approved, 1 just now)"
     assert_file_exists "$BWRAP_ARGS_FILE"
 }
+
+# Usage: stub_dialog <name> <exit-status>
+# A dialog program that records its arguments and the text file it was given
+stub_dialog() {
+    stub_command "$1" "printf '%s\n' \"\$@\" >> '$BATS_TEST_TMPDIR/$1.args'
+for ((i = 1; i <= \$#; i++)); do
+    if [[ \"\${!i}\" == --filename || \"\${!i}\" == --textbox ]]; then
+        j=\$((i + 1)); cat \"\${!j}\" >> '$BATS_TEST_TMPDIR/$1.text'
+    fi
+done
+exit $2"
+}
+
+@test "without a terminal, a desktop dialog asks and Approve starts the sandbox" {
+    stub_dialog zenity 0
+    RUN_SANDBOX_ENV_OPTIONS=(DISPLAY=:99)
+    run_sandbox --dry-run
+    assert_success
+    assert_output --partial "Project Config Approval: required (1 project file approved, 1 just now)"
+    assert_file_exists "$BWRAP_ARGS_FILE"
+    run cat "$BATS_TEST_TMPDIR/zenity.text"
+    assert_output --partial "Not approved yet: $PROJECT_DIR/config.yaml"
+    assert_output --partial "  - /opt"
+    assert_output --partial "--approve-project-config"
+    run cat "$BATS_TEST_TMPDIR/zenity.args"
+    assert_line --text-info
+    assert_line Approve
+
+    # Approved now: no second dialog
+    rm "$BATS_TEST_TMPDIR/zenity.args"
+    run_sandbox --dry-run
+    assert_success
+    assert_file_not_exists "$BATS_TEST_TMPDIR/zenity.args"
+}
+
+@test "Deny in the desktop dialog refuses the start without a notification" {
+    stub_dialog zenity 1
+    stub_command notify-send "touch '$BATS_TEST_TMPDIR/notified'"
+    RUN_SANDBOX_ENV_OPTIONS=(DISPLAY=:99 DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent)
+    run_sandbox --dry-run
+    assert_failure 1
+    assert_output --partial "denied in the desktop dialog"
+    assert_file_not_exists "$BWRAP_ARGS_FILE"
+    assert_file_not_exists "$BATS_TEST_TMPDIR/notified"
+    run_sandbox --dry-run
+    assert_failure 1
+}
+
+@test "a dialog without an answer refuses the start and notifies" {
+    stub_dialog zenity 5
+    stub_command notify-send "printf '%s\n' \"\$@\" > '$BATS_TEST_TMPDIR/notify.args'"
+    RUN_SANDBOX_ENV_OPTIONS=(DISPLAY=:99 DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent)
+    run_sandbox --dry-run
+    assert_failure 1
+    assert_output --partial "No answer in the desktop approval dialog"
+    run cat "$BATS_TEST_TMPDIR/notify.args"
+    assert_line "Sandbox refused to start: project configuration not approved"
+    assert_output --partial "$PROJECT_DIR/config.yaml"
+}
+
+@test "--no-desktop-prompts and desktop_prompts: false refuse without a dialog or notification" {
+    stub_dialog zenity 0
+    stub_command notify-send "touch '$BATS_TEST_TMPDIR/notified'"
+    RUN_SANDBOX_ENV_OPTIONS=(DISPLAY=:99 DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent)
+    run_sandbox --dry-run --no-desktop-prompts
+    assert_failure 1
+    assert_file_not_exists "$BATS_TEST_TMPDIR/zenity.args"
+    assert_file_not_exists "$BATS_TEST_TMPDIR/notified"
+    printf 'desktop_prompts: false\n' >> "$USER_CONFIG"
+    run_sandbox --dry-run
+    assert_failure 1
+    assert_file_not_exists "$BATS_TEST_TMPDIR/zenity.args"
+    run_sandbox --dry-run --desktop-prompts
+    assert_success
+    assert_file_exists "$BATS_TEST_TMPDIR/zenity.args"
+}
+
+@test "desktop_prompts in a project file is ignored" {
+    stub_dialog zenity 0
+    printf 'desktop_prompts: false\n' >> "$PROJECT_DIR/config.yaml"
+    RUN_SANDBOX_ENV_OPTIONS=(DISPLAY=:99)
+    run_sandbox --dry-run
+    assert_success
+    assert_output --partial "Ignoring 'desktop_prompts'"
+    assert_file_exists "$BATS_TEST_TMPDIR/zenity.args"
+}
+
+@test "a refused start is logged for orchestrators that discard stderr" {
+    run_sandbox --dry-run
+    assert_failure 1
+    local log="$TEST_HOME/.local/state/ai-agent-sandbox/refusals.log"
+    assert_file_exists "$log"
+    run cat "$log"
+    assert_output --partial " $TEST_WORK"
+    assert_output --partial "  project configuration not approved:"
+    assert_output --partial "    $PROJECT_DIR/config.yaml"
+}

@@ -56,6 +56,13 @@ APPROVE_PROJECT_CONFIG=false
 APPROVALS_DIR="${AI_AGENT_SANDBOX_APPROVALS_DIR:-$HOME/.local/state/ai-agent-sandbox/approved-config}"
 # Summary text of the approval check
 PROJECT_APPROVAL_STATUS=""
+# Without a terminal: ask for approvals in a desktop dialog and report refused
+# starts with a desktop notification (orchestrators discard stderr)
+DESKTOP_PROMPTS=true
+# Seconds a desktop approval dialog waits for an answer
+DESKTOP_DIALOG_TIMEOUT=120
+# Refused starts are appended here (see refuse_start)
+REFUSAL_LOG_FILE="${AI_AGENT_SANDBOX_REFUSAL_LOG:-$HOME/.local/state/ai-agent-sandbox/refusals.log}"
 # Hooks and configuration of git repositories in read-write mounts are mounted
 # read-only (see protect_git_dir): git runs them on the host later
 PROTECT_GIT_CONFIG=true
@@ -271,11 +278,15 @@ OPTIONS:
                             them on the host); --protect-git-config switches it back on
     --require-project-approval
                             Refuse project config files (.ai-agent-sandbox/) whose
-                            content was not approved on the host; asks in a terminal.
+                            content was not approved on the host; asks in a terminal
+                            or, without one, in a desktop dialog.
                             Off by default, --no-require-project-approval overrides
                             the config file
     --approve-project-config
                             Show this project's config files, approve them and exit
+    --no-desktop-prompts    Without a terminal, do not ask for approvals in a desktop
+                            dialog (zenity or kdialog) and send no desktop notification
+                            when a start is refused; --desktop-prompts switches it back on
     --docker-image IMAGE    Socket proxy image (default: ghcr.io/wollomatic/socket-proxy:1)
     --docker-port-range A-B Host loopback ports for container ports published without a
                             host port (-p 5432, Testcontainers), reachable inside the
@@ -330,7 +341,7 @@ CONFIGURATION FILE FORMAT:
                 docker_port_range, venv,
                 gitconfig, shared_skills, gpg_agent, quiet,
                 protect_project_config, protect_git_config,
-                require_project_approval (user-level only),
+                require_project_approval, desktop_prompts (user-level only),
                 whitelist, blacklist, host_ports, allow_hosts, agent_args (lists),
                 env (KEY: VALUE mapping)
     whitelist: Absolute or relative paths/patterns that the agent can read
@@ -641,7 +652,7 @@ apply_config_scalar() {
             apply_venv_setting "$value" \
                 || config_error "Invalid value for 'venv' in $file: '$value' (expected true, false, active, pipenv or a path starting with ., / or ~)"
             ;;
-        docker|gpg_agent|gitconfig|shared_skills|quiet|protect_project_config|protect_git_config|require_project_approval)
+        docker|gpg_agent|gitconfig|shared_skills|quiet|protect_project_config|protect_git_config|require_project_approval|desktop_prompts)
             [[ "$is_null" = true ]] && return 0
             bool=$(parse_yaml_bool "$value" "$key" "$file") || exit 1
             case "$key" in
@@ -650,15 +661,17 @@ apply_config_scalar() {
                 gitconfig) MOUNT_GITCONFIG="$bool" ;;
                 shared_skills) SHARE_SKILLS="$bool" ;;
                 quiet) QUIET="$bool" ;;
-                protect_project_config|protect_git_config|require_project_approval)
+                protect_project_config|protect_git_config|require_project_approval|desktop_prompts)
                     # The project itself must not be able to switch off the
-                    # protection of its own configuration
+                    # protection of its own configuration (or how it is asked for)
                     if is_project_config_file "$file"; then
                         config_warn "Ignoring '$key' in $file (only allowed in user-level config files or on the command line)"
                     elif [[ "$key" = protect_project_config ]]; then
                         PROTECT_PROJECT_CONFIG="$bool"
                     elif [[ "$key" = protect_git_config ]]; then
                         PROTECT_GIT_CONFIG="$bool"
+                    elif [[ "$key" = desktop_prompts ]]; then
+                        DESKTOP_PROMPTS="$bool"
                     else
                         REQUIRE_PROJECT_APPROVAL="$bool"
                     fi
@@ -880,6 +893,136 @@ load_config_files() {
     done
 }
 
+# --- Refused starts and desktop prompts ----------------------------------------
+#
+# Orchestrators such as T3 Code discard the agent's stderr, so a start refused
+# without a terminal only shows up as a provider that exited (or a thread that
+# keeps "thinking"). Refusals are therefore also appended to REFUSAL_LOG_FILE
+# and, with DESKTOP_PROMPTS, sent as a desktop notification; project config
+# approvals are asked in a dialog. The script runs on the host, so the desktop
+# session of the orchestrator is reachable; the sandboxed agent has no display
+# and no D-Bus, so it can neither answer the dialog nor fake one.
+
+# True when a graphical session is reachable
+desktop_session_available() {
+    [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]
+}
+
+# True when a D-Bus session bus (needed by notify-send) is reachable
+session_bus_available() {
+    [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" || ( -n "${XDG_RUNTIME_DIR:-}" && -S "$XDG_RUNTIME_DIR/bus" ) ]]
+}
+
+# Print the dialog program for desktop prompts (zenity or kdialog); fails when
+# desktop prompts are off or no graphical session or program is available
+desktop_dialog_tool() {
+    [[ "$DESKTOP_PROMPTS" = true ]] && desktop_session_available || return 1
+    local tool
+    for tool in zenity kdialog; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            echo "$tool"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Usage: run_with_timeout <seconds> <command...>
+run_with_timeout() {
+    local seconds="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$seconds" "$@"
+    else
+        "$@"
+    fi
+}
+
+# Usage: desktop_approval_dialog <tool> <title> <text-file>
+# Show the text and ask Approve/Deny. Returns 0 when approved, 1 when denied,
+# 2 without an answer (timeout, or the dialog could not be shown). The text is
+# shown as plain text (never as markup); the question itself is fixed text.
+desktop_approval_dialog() {
+    local tool="$1" title="$2" file="$3" status=0
+    case "$tool" in
+        zenity)
+            # zenity: 1 = Deny or window closed, 5 = its own timeout
+            run_with_timeout $((DESKTOP_DIALOG_TIMEOUT + 5)) zenity --text-info --title "$title" \
+                --filename "$file" --ok-label Approve --cancel-label Deny \
+                --width 900 --height 650 --timeout "$DESKTOP_DIALOG_TIMEOUT" \
+                </dev/null >/dev/null 2>&1 || status=$?
+            ;;
+        kdialog)
+            # --textbox only shows the text, the decision is a second dialog
+            run_with_timeout "$DESKTOP_DIALOG_TIMEOUT" kdialog --title "$title" --textbox "$file" 900 650 \
+                </dev/null >/dev/null 2>&1 || status=$?
+            if [[ $status -eq 0 ]]; then
+                run_with_timeout "$DESKTOP_DIALOG_TIMEOUT" kdialog --title "$title" \
+                    --yes-label Approve --no-label Deny \
+                    --warningyesno "Approve and use this project configuration?" \
+                    </dev/null >/dev/null 2>&1 || status=$?
+            fi
+            ;;
+        *)
+            status=2
+            ;;
+    esac
+    case "$status" in
+        0) return 0 ;;
+        1) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+# Usage: notify_desktop <summary> <body>
+# Best effort: nothing happens without desktop prompts, notify-send or a bus
+notify_desktop() {
+    [[ "$DESKTOP_PROMPTS" = true ]] || return 0
+    session_bus_available && command -v notify-send >/dev/null 2>&1 || return 0
+    local body="$2"
+    # Notification servers may render the body as markup (the replacements
+    # are quoted: with patsub_replacement an unquoted & is the matched text)
+    body="${body//&/"&amp;"}"
+    body="${body//</"&lt;"}"
+    body="${body//>/"&gt;"}"
+    run_with_timeout 5 notify-send --app-name=ai-agent-sandbox --urgency=critical \
+        --icon=dialog-warning -- "$1" "$body" </dev/null >/dev/null 2>&1 || true
+}
+
+# Usage: log_refusal <message lines...>
+# Append a refused start to REFUSAL_LOG_FILE (kept to its last 1000 lines)
+log_refusal() {
+    local dir="${REFUSAL_LOG_FILE%/*}" lines
+    {
+        mkdir -p "$dir" &&
+            {
+                printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$WORKING_DIR"
+                printf '  %s\n' "$@"
+            } >> "$REFUSAL_LOG_FILE"
+    } 2>/dev/null || return 0
+    lines="$(wc -l < "$REFUSAL_LOG_FILE" 2>/dev/null)" || return 0
+    if [[ "$lines" -gt 2000 ]]; then
+        { tail -n 1000 "$REFUSAL_LOG_FILE" > "$REFUSAL_LOG_FILE.tmp" &&
+            mv -f -- "$REFUSAL_LOG_FILE.tmp" "$REFUSAL_LOG_FILE"; } 2>/dev/null || true
+    fi
+}
+
+# Usage: refuse_start <notification summary> <error> [detail lines...]
+# Print the error (red) and the details on stderr, log them and, when nobody
+# sees stderr, send a desktop notification. Exits 1.
+refuse_start() {
+    local summary="$1"
+    shift
+    echo -e "${RED}Error: $1${NC}" >&2
+    [[ $# -gt 1 ]] && printf '%s\n' "${@:2}" >&2
+    log_refusal "$@"
+    if ! [[ -t 2 ]]; then
+        notify_desktop "$summary" "$(printf '%s\n' "$@")
+(logged in $REFUSAL_LOG_FILE)"
+    fi
+    exit 1
+}
+
 # --- Project configuration approval -------------------------------------------
 #
 # Project files are controlled by the repository: a clone, a pull, or a commit
@@ -972,49 +1115,113 @@ show_project_file_change() {
     echo >&2
 }
 
+# Usage: project_files_pending <files...>
+# Print the files whose content is not approved
+project_files_pending() {
+    local file
+    for file in "$@"; do
+        project_file_approved "$file" || echo "$file"
+    done
+}
+
+# Usage: ask_project_approval_dialog <tool> <files...>
+# Show the pending files (or their diffs) in a desktop dialog; returns like
+# desktop_approval_dialog
+ask_project_approval_dialog() {
+    local tool="$1" text file status=0
+    shift
+    text="$(mktemp "${TMPDIR:-/tmp}/ai-agent-sandbox-approval.XXXXXX")" || return 2
+    {
+        echo "An AI agent sandbox is about to start in $WORKING_DIR"
+        echo "with project configuration that you have not approved yet."
+        echo
+        echo "Project files can whitelist host paths and set environment variables, and they"
+        echo "change with every pull or commit. Approve only what you expect to see."
+        echo
+        for file in "$@"; do
+            (YELLOW="" NC="" show_project_file_change "$file") 2>&1
+        done
+        echo "Deny refuses this start. You can also review the files in a terminal with:"
+        echo "  cd $WORKING_DIR && $0 --approve-project-config"
+    } > "$text"
+    desktop_approval_dialog "$tool" "Approve sandbox project configuration?" "$text" || status=$?
+    rm -f -- "$text"
+    return "$status"
+}
+
 # Usage: check_project_approval <mode>
 # mode "start": approved files pass; unapproved ones are shown and asked about
-# in a terminal, otherwise the start is refused (exit 1). mode "approve"
+# in a terminal, or in a desktop dialog without one (desktop_dialog_tool),
+# otherwise the start is refused (exit 1). mode "approve"
 # (--approve-project-config): unapproved files are shown and approved, after a
 # question in a terminal. Sets PROJECT_APPROVAL_STATUS.
 check_project_approval() {
-    local mode="$1" file answer
+    local mode="$1" file answer tool lock_fd="" asked=false dialog_status=0
     local -a files=() pending=()
     mapfile -t files < <(project_config_files_in_use)
     if [[ ${#files[@]} -gt 0 ]] && ! command -v sha256sum >/dev/null 2>&1; then
         echo -e "${RED}Error: sha256sum is needed to check project config approvals${NC}" >&2
         exit 1
     fi
-    for file in "${files[@]}"; do
-        project_file_approved "$file" || pending+=("$file")
-    done
+    mapfile -t pending < <(project_files_pending "${files[@]}")
+    if [[ "$mode" = start && ${#pending[@]} -gt 0 ]] && ! [[ -t 0 && -t 2 ]] && tool="$(desktop_dialog_tool)"; then
+        # Orchestrators start several threads of a project at once: one dialog
+        # at a time, and a start that waited sees the approval given meanwhile
+        if command -v flock >/dev/null 2>&1 && (umask 077 && mkdir -p "$APPROVALS_DIR") 2>/dev/null &&
+            { exec {lock_fd}>>"$APPROVALS_DIR/.dialog.lock"; } 2>/dev/null; then
+            flock -w $((DESKTOP_DIALOG_TIMEOUT * 2)) "$lock_fd" || true
+            mapfile -t pending < <(project_files_pending "${files[@]}")
+        fi
+        if [[ ${#pending[@]} -gt 0 ]]; then
+            ask_project_approval_dialog "$tool" "${pending[@]}" || dialog_status=$?
+            case "$dialog_status" in
+                0)
+                    asked=true
+                    ;;
+                1)
+                    echo -e "${RED}Error: project configuration not approved (denied in the desktop dialog)${NC}" >&2
+                    log_refusal "project configuration not approved (denied in the desktop dialog)" "${pending[@]}"
+                    exit 1
+                    ;;
+            esac
+        fi
+    fi
     if [[ ${#pending[@]} -eq 0 ]]; then
+        [[ -n "$lock_fd" ]] && exec {lock_fd}>&-
         PROJECT_APPROVAL_STATUS="required (${#files[@]} project file$([[ ${#files[@]} -eq 1 ]] || echo s) approved)"
         [[ "$mode" = approve ]] && echo "Project configuration is approved, nothing to do" >&2
         return 0
     fi
-    if [[ "$mode" = start ]] && ! [[ -t 0 && -t 2 ]]; then
-        echo -e "${RED}Error: project configuration not approved:${NC}" >&2
-        printf '  %s\n' "${pending[@]}" >&2
-        echo "Project files can whitelist host paths and set environment variables, and they" >&2
-        echo "change with every pull or commit. Review and approve them on the host with:" >&2
-        echo "  cd $WORKING_DIR && $0 --approve-project-config" >&2
-        exit 1
+    if [[ "$mode" = start && "$asked" = false ]] && ! [[ -t 0 && -t 2 ]]; then
+        local -a details=()
+        for file in "${pending[@]}"; do
+            details+=("  $file")
+        done
+        [[ "$dialog_status" -eq 2 ]] && details+=("No answer in the desktop approval dialog.")
+        details+=(
+            "Project files can whitelist host paths and set environment variables, and they"
+            "change with every pull or commit. Review and approve them on the host with:"
+            "  cd $WORKING_DIR && $0 --approve-project-config"
+        )
+        refuse_start "Sandbox refused to start: project configuration not approved" \
+            "project configuration not approved:" "${details[@]}"
     fi
-    echo -e "${YELLOW}Project configuration needs your approval${NC} (it can whitelist host paths and set environment variables):\n" >&2
-    for file in "${pending[@]}"; do
-        show_project_file_change "$file"
-    done
-    if [[ -t 0 && -t 2 ]]; then
-        answer=""
-        read -r -p "Approve and use this configuration? [y/N] " answer || answer=""
-        case "$answer" in
-            y|Y|yes|Yes|YES) ;;
-            *)
-                echo "Not approved." >&2
-                exit 1
-                ;;
-        esac
+    if [[ "$asked" = false ]]; then
+        echo -e "${YELLOW}Project configuration needs your approval${NC} (it can whitelist host paths and set environment variables):\n" >&2
+        for file in "${pending[@]}"; do
+            show_project_file_change "$file"
+        done
+        if [[ -t 0 && -t 2 ]]; then
+            answer=""
+            read -r -p "Approve and use this configuration? [y/N] " answer || answer=""
+            case "$answer" in
+                y|Y|yes|Yes|YES) ;;
+                *)
+                    echo "Not approved." >&2
+                    exit 1
+                    ;;
+            esac
+        fi
     fi
     for file in "${pending[@]}"; do
         if ! approve_project_file "$file"; then
@@ -1022,6 +1229,7 @@ check_project_approval() {
             exit 1
         fi
     done
+    [[ -n "$lock_fd" ]] && exec {lock_fd}>&-
     echo -e "${GREEN}Approved${NC} ${#pending[@]} project file$([[ ${#pending[@]} -eq 1 ]] || echo s) (recorded in $APPROVALS_DIR)" >&2
     PROJECT_APPROVAL_STATUS="required (${#files[@]} project file$([[ ${#files[@]} -eq 1 ]] || echo s) approved, ${#pending[@]} just now)"
 }
@@ -5008,10 +5216,10 @@ check_project_profile() {
         return 0
     fi
     [[ "$PROJECT_PROFILE" != "$requested" ]] || return 0
-    echo -e "${RED}Error: profile mismatch: $PROJECT_PROFILE_SOURCE requires profile '$PROJECT_PROFILE', but $origin${NC}" >&2
-    echo "In an orchestrator such as T3 Code, start the thread with the provider instance of profile '$PROJECT_PROFILE'." >&2
-    echo "To run under '$requested' anyway, pass --profile $requested." >&2
-    exit 1
+    refuse_start "Sandbox refused to start: profile mismatch" \
+        "profile mismatch: $PROJECT_PROFILE_SOURCE requires profile '$PROJECT_PROFILE', but $origin" \
+        "In an orchestrator such as T3 Code, start the thread with the provider instance of profile '$PROJECT_PROFILE'." \
+        "To run under '$requested' anyway, pass --profile $requested."
 }
 
 # --- Main ----------------------------------------------------------------------
@@ -5109,6 +5317,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-require-project-approval)
             REQUIRE_PROJECT_APPROVAL=false
+            shift
+            ;;
+        --desktop-prompts)
+            DESKTOP_PROMPTS=true
+            shift
+            ;;
+        --no-desktop-prompts)
+            DESKTOP_PROMPTS=false
             shift
             ;;
         --approve-project-config)

@@ -211,9 +211,19 @@ agent_args:
 # --no-require-project-approval): a project's .ai-agent-sandbox/ files only apply
 # once their exact content has been approved on the host. A start in a terminal
 # shows a new or changed file (as a diff) and asks; without a terminal (T3 Code)
-# it is refused until you run `ai-agent-sandbox.sh --approve-project-config` in
-# the project. Off by default.
+# it asks in a desktop dialog (see desktop_prompts), otherwise it is refused
+# until you run `ai-agent-sandbox.sh --approve-project-config` in the project.
+# Off by default.
 # require_project_approval: false
+
+# Only honoured in the user-level file (or via --desktop-prompts /
+# --no-desktop-prompts): when the sandbox is started without a terminal (T3
+# Code, which discards stderr) in a desktop session, ask for project config
+# approvals in a zenity or kdialog dialog (no answer within 2 minutes refuses
+# the start) and send a desktop notification (notify-send) when a start is
+# refused. Refused starts are always logged in
+# ~/.local/state/ai-agent-sandbox/refusals.log (AI_AGENT_SANDBOX_REFUSAL_LOG).
+# desktop_prompts: true
 
 # Only honoured in the user-level file (or via --no-protect-git-config /
 # --protect-git-config): mount the hooks and configuration (config,

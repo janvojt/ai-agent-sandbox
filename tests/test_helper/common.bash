@@ -31,6 +31,8 @@ setup_test_env() {
     export PATH="$STUB_DIR:$PATH"
     unset "${!AI_AGENT_SANDBOX_@}" "${!CLAUDE@}" "${!OPENCODE@}" \
         GNUPGHOME DOCKER_HOST
+    # No desktop dialogs or notifications from tests run in a desktop session
+    unset DISPLAY WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR
 }
 
 # Source the script from the test working directory. Its defaults are
