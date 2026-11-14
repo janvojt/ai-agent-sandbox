@@ -146,6 +146,30 @@ stub_opencode() {
     assert_failure 1
 }
 
+@test "a sessionless Claude probe in the home directory runs without a working directory mount" {
+    cd "$TEST_HOME"
+    run_sandbox -d -- --output-format stream-json --input-format stream-json --no-session-persistence
+    assert_success
+    assert_output --partial "(not mounted: sessionless Claude without a project)"
+    assert_output --partial "Docker disabled"
+    refute_args_contain BWRAP_RECORDED --bind "$TEST_HOME" "$TEST_HOME"
+    assert_args_contain BWRAP_RECORDED --chdir "$TEST_HOME"
+    assert_not_exist "$TEST_HOME/.ai-agent-sandbox"
+}
+
+@test "the sessionless exception covers neither parents of the home directory nor OpenCode" {
+    stub_opencode 'echo 2.0.1'
+    cd "$TEST_HOME/.."
+    run_sandbox -- --no-session-persistence
+    assert_failure 1
+    assert_output --partial "contains your home directory"
+    cd "$TEST_HOME"
+    run_sandbox --agent opencode -- --no-session-persistence
+    assert_failure 1
+    run_sandbox -- --print -- --no-session-persistence
+    assert_failure 1
+}
+
 @test "--allow-home-workdir starts the sandbox in the home directory" {
     cd "$TEST_HOME"
     run_sandbox --dry-run --allow-home-workdir

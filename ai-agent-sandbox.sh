@@ -44,9 +44,14 @@ ALLOW_HOME_WORKDIR=false
 VERSION_QUERY=false
 # Agent command line starts with `acp` (OpenCode as an Agent Client Protocol agent)
 ACP_COMMAND=false
-# Working directory is not mounted: OpenCode's ACP agent started in the home
-# directory (T3 Code's health probe), where there is no project to give it
+# Claude called with --no-session-persistence (an SDK session that leaves no
+# transcript, such as T3 Code's provider probe)
+CLAUDE_SESSIONLESS=false
+# Working directory is not mounted: an orchestrator's health probe (OpenCode's
+# ACP agent, a sessionless Claude) started in the home directory, where there is
+# no project to give it; NO_PROJECT_WORKDIR_REASON names it in the summary
 NO_PROJECT_WORKDIR=false
+NO_PROJECT_WORKDIR_REASON=""
 MIGRATE_PROJECT_CONFIG=false
 PROTECT_PROJECT_CONFIG=true
 # Project config files must have been approved on the host (opt-in, see
@@ -5462,6 +5467,10 @@ fi
 if [[ ${#AGENT_ARGS[@]} -gt 0 && "${AGENT_ARGS[0]}" == "acp" ]]; then
     ACP_COMMAND=true
 fi
+for arg in "${AGENT_ARGS[@]}"; do
+    [[ "$arg" == "--" ]] && break
+    [[ "$arg" == "--no-session-persistence" ]] && CLAUDE_SESSIONLESS=true
+done
 AGENT_ARGS=("${CONFIG_AGENT_ARGS[@]}" "${AGENT_ARGS[@]}")
 flush_config_log
 
@@ -5619,9 +5628,17 @@ fi
 # per thread in the thread's directory, but runs its health probe (initialize,
 # authentication, models) in its own working directory, usually the home
 # directory; there is no project there, so the agent only gets its private home.
+# The same holds for Claude with --no-session-persistence: T3 Code's Claude
+# provider probes account and models with such an SDK session in its own working
+# directory, and a sessionless run leaves nothing a real thread would resume.
 REAL_WORKING_DIR=$(realpath -m "$WORKING_DIR")
 REAL_HOME=$(realpath -m "$HOME")
-if [[ "$ALLOW_HOME_WORKDIR" = false && "$AGENT" = "opencode" && "$ACP_COMMAND" = true \
+if [[ "$AGENT" = "opencode" && "$ACP_COMMAND" = true ]]; then
+    NO_PROJECT_WORKDIR_REASON="ACP agent without a project"
+elif [[ "$AGENT" = "claudecode" && "$CLAUDE_SESSIONLESS" = true ]]; then
+    NO_PROJECT_WORKDIR_REASON="sessionless Claude without a project"
+fi
+if [[ "$ALLOW_HOME_WORKDIR" = false && -n "$NO_PROJECT_WORKDIR_REASON" \
     && "$REAL_HOME" == "$REAL_WORKING_DIR" ]]; then
     NO_PROJECT_WORKDIR=true
     if [[ "$ENABLE_DOCKER" = true ]]; then
@@ -6170,7 +6187,7 @@ else
     log_info "Profile: ${YELLOW}$PROFILE${NC} (from $PROFILE_SOURCE) -> $PROFILE_HOME"
 fi
 if [[ "$NO_PROJECT_WORKDIR" = true ]]; then
-    log_info "Working Directory: ${YELLOW}$WORKING_DIR${NC} (not mounted: ACP agent without a project)"
+    log_info "Working Directory: ${YELLOW}$WORKING_DIR${NC} (not mounted: $NO_PROJECT_WORKDIR_REASON)"
 else
     log_info "Working Directory: ${YELLOW}$WORKING_DIR${NC}"
 fi
