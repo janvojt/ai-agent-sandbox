@@ -104,6 +104,18 @@ HOST_ENV_ALLOWED=(
 )
 HOST_ENV_ALLOWED_PREFIXES=(LC_ ANTHROPIC_ CLAUDE_ OPENCODE_ T3CODE_ VERTEX_REGION_ DISABLE_PROMPT_CACHING)
 declare -A SANDBOX_ENV=()
+# The sandbox environment changes in order, as words: "set NAME VALUE" and
+# "unset NAME" (sandbox_setenv, sandbox_unsetenv). Applied by apply_sandbox_env
+# in the subshell that executes bwrap, never passed as bwrap arguments
+SANDBOX_ENV_OPS=()
+# Names bash manages itself (read-only, dynamic or reset by every command):
+# exporting them from bash cannot set the value, so they cannot be passed
+SANDBOX_ENV_BASH_RESERVED=(
+    _ BASH_ALIASES BASH_ARGC BASH_ARGV BASH_ARGV0 BASH_CMDS BASH_COMMAND BASH_LINENO
+    BASH_REMATCH BASH_SOURCE BASH_SUBSHELL BASH_VERSINFO BASH_XTRACEFD BASHOPTS BASHPID
+    COMP_WORDBREAKS DIRSTACK EPOCHREALTIME EPOCHSECONDS EUID FUNCNAME GROUPS HISTCMD
+    LINENO PIPESTATUS PPID RANDOM SECONDS SHELLOPTS SRANDOM UID
+)
 BLACKLISTED_DIRS=()
 BLACKLIST_SEARCH_ROOTS=()
 WHITELIST_OVERRIDE_ARGS=()
@@ -1582,7 +1594,7 @@ mount_gpg_agent() {
     BWRAP_ARGS+=(--ro-bind "$GPG_HOST_EXTRA_SOCKET" "$runtime_dir/gnupg/S.gpg-agent")
     # Public-key-only keyring prepared by validate_gpg_agent
     BWRAP_ARGS+=(--bind "$GPG_SANDBOX_HOME" "$HOME/.gnupg")
-    BWRAP_ARGS+=(--unsetenv GNUPGHOME)
+    sandbox_unsetenv GNUPGHOME
 
     log_info "${GREEN}✓${NC} Forwarded gpg-agent: $GPG_HOST_EXTRA_SOCKET -> $runtime_dir/gnupg/S.gpg-agent"
     log_info "${GREEN}✓${NC} Mounted public-key-only keyring at ~/.gnupg"
@@ -3061,7 +3073,9 @@ setup_isolated_network() {
 # and display addresses. Only HOST_ENV_ALLOWED and HOST_ENV_ALLOWED_PREFIXES
 # survive; the variables are removed in the subshell that executes bwrap, so
 # values never end up on a command line (bwrap --setenv arguments are readable
-# in /proc/<pid>/cmdline).
+# in /proc/<pid>/cmdline and inside as /proc/1/cmdline). The sandbox's own
+# variables (env: entries, --env, HOME, PATH, ...) are exported in the same
+# subshell afterwards for the same reason (apply_sandbox_env).
 
 host_env_allowed() {
     local name="$1" item
@@ -3106,6 +3120,33 @@ filter_host_environment() {
     mapfile -t hidden < <(hidden_host_env_names)
     for name in "${hidden[@]}"; do
         unset "$name" 2>/dev/null || true
+    done
+}
+
+# Usage: apply_sandbox_env "${SANDBOX_ENV_OPS[@]}"
+# Applies the recorded changes in order. Run in the subshell that executes
+# bwrap, after filter_host_environment, so the values reach bwrap (and the
+# command, bwrap passes its environment on) without being arguments. Uses only
+# the positional parameters: a variable of its own could be overwritten by a
+# name being exported (pure bash, PATH may be gone or replaced). The script's
+# variables are no longer needed once the command line is in "$@".
+apply_sandbox_env() {
+    while (( $# > 0 )); do
+        case "$1" in
+            set)
+                # A script array of that name would not be exported
+                unset -v "$2"
+                export "$2=$3"
+                shift 3
+                ;;
+            unset)
+                unset "$2"
+                shift 2
+                ;;
+            *)
+                return 1
+                ;;
+        esac
     done
 }
 
@@ -3519,8 +3560,10 @@ run_in_sandbox() {
         fi
         bwrap_extra+=(--seccomp "$SECCOMP_FD")
     fi
-    # The subshell drops the hidden host variables and becomes bwrap (exec),
-    # so $! is bwrap's pid. Without job control bash starts background jobs
+    # The subshell drops the hidden host variables, exports the sandbox's own
+    # and becomes bwrap (exec), so $! is bwrap's pid. The command line goes to
+    # the positional parameters first: an exported name may equal one of the
+    # variables it is built from. Without job control bash starts background jobs
     # with SIGINT and SIGQUIT ignored, and an ignored disposition is inherited
     # through bwrap by everything inside: Ctrl+C would not stop a build in the
     # dry-run shell, and the JVM does not even install its handler then. The
@@ -3528,7 +3571,9 @@ run_in_sandbox() {
     {
         trap - INT QUIT
         filter_host_environment
-        exec "$BWRAP_BIN" "${BWRAP_ARGS[@]}" "${bwrap_extra[@]}" -- "$@"
+        set -- "$BWRAP_BIN" "${BWRAP_ARGS[@]}" "${bwrap_extra[@]}" -- "$@"
+        apply_sandbox_env "${SANDBOX_ENV_OPS[@]}" || exit 1
+        exec "$@"
     } <&0 &
     SANDBOX_PID=$!
     if [[ -n "$SECCOMP_FD" ]]; then
@@ -3664,12 +3709,25 @@ parse_env_assignment() {
 }
 
 # Set an environment variable inside the sandbox and remember its value so
-# later env entries can reference it (e.g. PATH="~/bin:$PATH").
+# later env entries can reference it (e.g. PATH="~/bin:$PATH"). Not a bwrap
+# --setenv: arguments are world-readable (see apply_sandbox_env). Returns 1
+# for a name bash manages itself.
 sandbox_setenv() {
     local key="$1"
-    local value="$2"
-    BWRAP_ARGS+=(--setenv "$key" "$value")
+    local value="$2" name
+    for name in "${SANDBOX_ENV_BASH_RESERVED[@]}"; do
+        [[ "$key" == "$name" ]] && return 1
+    done
+    SANDBOX_ENV_OPS+=(set "$key" "$value")
     SANDBOX_ENV[$key]="$value"
+}
+
+# Remove a variable from the sandbox environment, in order with sandbox_setenv
+sandbox_unsetenv() {
+    local key
+    for key in "$@"; do
+        SANDBOX_ENV_OPS+=(unset "$key")
+    done
 }
 
 set_sandbox_env() {
@@ -3684,7 +3742,10 @@ set_sandbox_env() {
         return 0
     fi
 
-    sandbox_setenv "$key" "$value"
+    if ! sandbox_setenv "$key" "$value"; then
+        log_info "${YELLOW}⚠${NC} Skipping environment variable $key from $source_label: bash manages it, it cannot be set"
+        return 0
+    fi
     log_info "${GREEN}✓${NC} Environment variable: $key"
 }
 
@@ -4424,7 +4485,7 @@ mount_claude_config() {
     fi
 
     # A CLAUDE_CONFIG_DIR inherited from the host would bypass the profile mount
-    BWRAP_ARGS+=(--unsetenv CLAUDE_CONFIG_DIR)
+    sandbox_unsetenv CLAUDE_CONFIG_DIR
 }
 
 # Mount a skills directory that OpenCode reads besides its own (~/.claude/skills,
@@ -4475,9 +4536,8 @@ mount_opencode_config() {
 
     # XDG_* and OpenCode path overrides inherited from the host would bypass
     # the profile mounts
-    BWRAP_ARGS+=(--unsetenv XDG_CONFIG_HOME --unsetenv XDG_CACHE_HOME)
-    BWRAP_ARGS+=(--unsetenv XDG_STATE_HOME --unsetenv XDG_DATA_HOME)
-    BWRAP_ARGS+=(--unsetenv OPENCODE_CONFIG_DIR --unsetenv OPENCODE_DB)
+    sandbox_unsetenv XDG_CONFIG_HOME XDG_CACHE_HOME XDG_STATE_HOME XDG_DATA_HOME
+    sandbox_unsetenv OPENCODE_CONFIG_DIR OPENCODE_DB
 }
 
 # Print the target of a Claude launcher symlink when it is an executable in
@@ -5458,7 +5518,7 @@ if [[ "$ENABLE_VENV" = true ]]; then
     log_info "\n${GREEN}Virtual environment:${NC} $VENV_PATH"
     BWRAP_ARGS+=(--ro-bind "$VENV_PATH" "$VENV_PATH")
     sandbox_setenv VIRTUAL_ENV "$VENV_PATH"
-    BWRAP_ARGS+=(--unsetenv PYTHONHOME)
+    sandbox_unsetenv PYTHONHOME
     if [[ "$VENV_SOURCE" = pipenv ]]; then
         # What pipenv shell sets: pipenv inside then uses this environment
         # instead of looking for one named after the (worktree) path
@@ -5602,8 +5662,7 @@ if [[ "$ENABLE_VENV" = true ]]; then
     SANDBOX_PATH="$VENV_BIN_DIR:$SANDBOX_PATH"
 fi
 sandbox_setenv PATH "$SANDBOX_PATH"
-BWRAP_ARGS+=(--unsetenv SSH_AUTH_SOCK)
-BWRAP_ARGS+=(--unsetenv SSH_AGENT_PID)
+sandbox_unsetenv SSH_AUTH_SOCK SSH_AGENT_PID
 
 if [[ "$ENABLE_DOCKER" = true ]]; then
     prepare_docker_private_dir

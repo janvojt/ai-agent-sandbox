@@ -169,7 +169,7 @@ write_user_config() {
     assert_args_contain BWRAP_RECORDED --ro-bind /usr/share /usr/share
     assert_args_contain BWRAP_RECORDED --bind "$TEST_WORK/data" "$TEST_WORK/data"
     assert_args_contain BWRAP_RECORDED --tmpfs "$TEST_WORK/secrets"
-    assert_args_contain BWRAP_RECORDED --setenv FOO bar
+    assert_recorded_env FOO bar
     assert_equal "${SANDBOX_COMMAND[*]}" "$STUB_DIR/claude --dangerously-skip-permissions --model x"
 }
 
@@ -373,8 +373,8 @@ last_index_of() {
     run_sandbox --dry-run
     assert_success
     assert_args_contain BWRAP_RECORDED --ro-bind "$venv" "$venv"
-    assert_args_contain BWRAP_RECORDED --setenv VIRTUAL_ENV "$venv"
-    assert_args_contain BWRAP_RECORDED --setenv PIPENV_ACTIVE 1
+    assert_recorded_env VIRTUAL_ENV "$venv"
+    assert_recorded_env PIPENV_ACTIVE 1
     assert_output --partial "Virtual Environment: $venv (pipenv)"
     run_sandbox --dry-run --no-venv
     refute_args_contain BWRAP_RECORDED --ro-bind "$venv" "$venv"
@@ -386,11 +386,8 @@ last_index_of() {
     run_sandbox --dry-run --venv=.venv
     assert_success
     assert_args_contain BWRAP_RECORDED --ro-bind "$TEST_WORK/.venv" "$TEST_WORK/.venv"
-    refute_args_contain BWRAP_RECORDED --setenv PIPENV_ACTIVE 1
-    local i path=""
-    for ((i = 0; i < ${#BWRAP_RECORDED[@]}; i++)); do
-        [[ "${BWRAP_RECORDED[i]}" == --setenv && "${BWRAP_RECORDED[i+1]}" == PATH ]] && path="${BWRAP_RECORDED[i+2]}"
-    done
+    refute_recorded_env PIPENV_ACTIVE
+    local path="${BWRAP_ENV_RECORDED[PATH]}"
     [[ "$path" == "$TEST_WORK/.venv/bin:"* ]] || fail "PATH is $path"
 }
 

@@ -490,7 +490,8 @@ env:
 ```
 
 **Important:**
-- Values are exposed inside the sandbox via `bubblewrap --setenv`.
+- Values are passed to bubblewrap in its environment, not as `--setenv` arguments, so they do not show up in `ps` or `/proc/<pid>/cmdline`, on the host or inside the sandbox.
+- Names bash manages itself (`RANDOM`, `SECONDS`, `UID`, `_`, …) cannot be set and are skipped with a warning.
 - Later entries override earlier entries when the same key appears multiple times.
 - Variable names must match shell environment naming rules, such as `API_TOKEN` or `_PRIVATE`.
 - Logs show variable names only, not values.

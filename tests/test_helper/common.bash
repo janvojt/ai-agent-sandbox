@@ -49,6 +49,34 @@ load_sandbox_script() {
     declare -gA SANDBOX_ENV=()
 }
 
+# Usage: assert_recorded_env <name> <value>
+# Fail unless bwrap (the stub) got <name>=<value> in its environment.
+assert_recorded_env() {
+    if [[ ! -v "BWRAP_ENV_RECORDED[$1]" ]]; then
+        fail "bwrap's environment has no $1"
+    fi
+    assert_equal "${BWRAP_ENV_RECORDED[$1]}" "$2"
+}
+
+# Usage: refute_recorded_env <name>
+refute_recorded_env() {
+    if [[ -v "BWRAP_ENV_RECORDED[$1]" ]]; then
+        fail "bwrap's environment has $1=${BWRAP_ENV_RECORDED[$1]}"
+    fi
+}
+
+# Usage: refute_args_mention <array-name> <text>
+# Fail when any word of the named array contains <text>.
+refute_args_mention() {
+    local -n _words="$1"
+    local word
+    for word in "${_words[@]}"; do
+        if [[ "$word" == *"$2"* ]]; then
+            fail "argument '$word' contains '$2'"
+        fi
+    done
+}
+
 # Usage: stub_command <name> [script-body]
 # Create an executable <name> in STUB_DIR (first on PATH). The body defaults
 # to `exit 0`.
@@ -77,18 +105,27 @@ exit ${STUB_BWRAP_STATUS:-0}"
 # pasta and real namespaces); export AI_AGENT_SANDBOX_NETWORK to change it.
 # RUN_SANDBOX_ENV_OPTIONS (array) is passed to the env that starts the script.
 # Sets bats' status/output (stdout and stderr combined, colors stripped), loads
-# the recorded bwrap arguments into BWRAP_RECORDED and the command bwrap was
-# asked to run (everything after the first --) into SANDBOX_COMMAND.
+# the recorded bwrap arguments into BWRAP_RECORDED, the command bwrap was
+# asked to run (everything after the first --) into SANDBOX_COMMAND and bwrap's
+# environment into the associative array BWRAP_ENV_RECORDED (one line per
+# variable, so values containing newlines are not supported).
 run_sandbox() {
     [[ -x "$STUB_DIR/bwrap" ]] || stub_bwrap
     [[ -x "$STUB_DIR/claude" ]] || stub_command claude 'echo "2.1.0 (Claude Code)"'
-    rm -f "$BWRAP_ARGS_FILE"
+    rm -f "$BWRAP_ARGS_FILE" "$BWRAP_ENV_FILE"
     run env "${RUN_SANDBOX_ENV_OPTIONS[@]}" AI_AGENT_SANDBOX_NETWORK="${AI_AGENT_SANDBOX_NETWORK:-host}" \
         bash "$SANDBOX_SCRIPT" "$@" </dev/null
     output="$(printf '%s' "$output" | sed 's/\x1b\[[0-9;]*m//g')"
     mapfile -t lines <<< "$output"
     BWRAP_RECORDED=()
     SANDBOX_COMMAND=()
+    declare -gA BWRAP_ENV_RECORDED=()
+    if [[ -f "$BWRAP_ENV_FILE" ]]; then
+        local env_line
+        while IFS= read -r env_line; do
+            [[ "$env_line" == *=* ]] && BWRAP_ENV_RECORDED["${env_line%%=*}"]="${env_line#*=}"
+        done < "$BWRAP_ENV_FILE"
+    fi
     if [[ -f "$BWRAP_ARGS_FILE" ]]; then
         mapfile -t BWRAP_RECORDED < "$BWRAP_ARGS_FILE"
         local i

@@ -1,13 +1,14 @@
 #!/usr/bin/env bats
 # Unit tests of the environment entry parsing: expand_env_value,
-# parse_env_assignment and sandbox_setenv/set_sandbox_env (what they add to
-# SANDBOX_ENV and BWRAP_ARGS).
+# parse_env_assignment, sandbox_setenv/sandbox_unsetenv/set_sandbox_env (what
+# they add to SANDBOX_ENV and SANDBOX_ENV_OPS) and apply_sandbox_env.
 
 setup() {
     load ../test_helper/common
     setup_test_env
     load_sandbox_script
     BWRAP_ARGS=()
+    SANDBOX_ENV_OPS=()
 }
 
 # --- expand_env_value ---------------------------------------------------------
@@ -159,24 +160,43 @@ setup() {
 
 # --- sandbox_setenv / set_sandbox_env ----------------------------------------
 
-@test "sandbox_setenv adds --setenv to BWRAP_ARGS and records the value" {
+@test "sandbox_setenv records the value without adding bwrap arguments" {
     sandbox_setenv FOO "bar baz"
-    assert_equal "${#BWRAP_ARGS[@]}" 3
-    assert_args_contain BWRAP_ARGS --setenv FOO "bar baz"
+    assert_equal "${#BWRAP_ARGS[@]}" 0
+    assert_equal "${#SANDBOX_ENV_OPS[@]}" 3
+    assert_args_contain SANDBOX_ENV_OPS set FOO "bar baz"
     assert_equal "${SANDBOX_ENV[FOO]}" "bar baz"
 }
 
-@test "sandbox_setenv overwrites a recorded value and appends another --setenv" {
+@test "sandbox_setenv overwrites a recorded value and appends another change" {
     sandbox_setenv FOO one
     sandbox_setenv FOO two
     assert_equal "${SANDBOX_ENV[FOO]}" two
-    assert_equal "${BWRAP_ARGS[*]}" "--setenv FOO one --setenv FOO two"
+    assert_equal "${SANDBOX_ENV_OPS[*]}" "set FOO one set FOO two"
+}
+
+@test "sandbox_setenv refuses names bash manages itself" {
+    run sandbox_setenv RANDOM 4
+    assert_failure
+    run sandbox_setenv UID 0
+    assert_failure
+    run set_sandbox_env 'SECONDS=5' "the test"
+    assert_success
+    assert_output --partial "Skipping environment variable SECONDS from the test"
+    assert_equal "${#SANDBOX_ENV_OPS[@]}" 0
+}
+
+@test "sandbox_unsetenv records removals in order with the assignments" {
+    sandbox_setenv A 1
+    sandbox_unsetenv A B
+    assert_equal "${SANDBOX_ENV_OPS[*]}" "set A 1 unset A unset B"
+    assert_equal "${#BWRAP_ARGS[@]}" 0
 }
 
 @test "set_sandbox_env parses the assignment and sets it in the sandbox" {
     set_sandbox_env 'GREETING="hello world"' "test" 2>/dev/null
-    assert_equal "${BWRAP_ARGS[*]}" "--setenv GREETING hello world"
-    assert_args_contain BWRAP_ARGS --setenv GREETING "hello world"
+    assert_equal "${#BWRAP_ARGS[@]}" 0
+    assert_args_contain SANDBOX_ENV_OPS set GREETING "hello world"
     assert_equal "${SANDBOX_ENV[GREETING]}" "hello world"
 }
 
@@ -192,12 +212,12 @@ setup() {
     set_sandbox_env 'PATH_TEST_BASE=/sandbox/bin' "first" 2>/dev/null
     set_sandbox_env 'PATH_TEST="~/bin:$PATH_TEST_BASE"' "second" 2>/dev/null
     assert_equal "${SANDBOX_ENV[PATH_TEST]}" "$TEST_HOME/bin:/sandbox/bin"
-    assert_args_contain BWRAP_ARGS --setenv PATH_TEST "$TEST_HOME/bin:/sandbox/bin"
+    assert_args_contain SANDBOX_ENV_OPS set PATH_TEST "$TEST_HOME/bin:/sandbox/bin"
 }
 
 @test "set_sandbox_env skips invalid entries without failing" {
     set_sandbox_env "not an assignment" "the test" 2>/dev/null
-    assert_equal "${#BWRAP_ARGS[@]}" 0
+    assert_equal "${#SANDBOX_ENV_OPS[@]}" 0
     assert_equal "${#SANDBOX_ENV[@]}" 0
     run set_sandbox_env "1BAD=x" "the test"
     assert_success

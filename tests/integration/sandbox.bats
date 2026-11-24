@@ -315,7 +315,8 @@ done'
     export GITHUB_TOKEN=leaked-token ANTHROPIC_API_KEY=provider-key LC_ALL=C
     run_real_sandbox 'echo "hidden=$(env | grep -c ^GITHUB_TOKEN=)"
 echo "key=$ANTHROPIC_API_KEY lc=$LC_ALL gh=${GH:-unset}"
-echo "cmdline=$(tr "\0" " " < /proc/1/cmdline | grep -c provider-key)"' --env 'GH=$GITHUB_TOKEN'
+echo "cmdline=$(tr "\0" " " < /proc/1/cmdline | grep -c -e provider-key -e leaked-token -e cli-secret)"' \
+        --env 'GH=$GITHUB_TOKEN' --env 'CLI_SECRET=cli-secret'
     assert_success
     assert_line hidden=0
     assert_line "key=provider-key lc=C gh=leaked-token"

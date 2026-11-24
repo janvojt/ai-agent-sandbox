@@ -80,5 +80,38 @@ setup() {
     export GITHUB_TOKEN=from-host
     run_sandbox --dry-run --env 'GH=$GITHUB_TOKEN'
     assert_success
-    assert_args_contain BWRAP_RECORDED --setenv GH from-host
+    assert_recorded_env GH from-host
+}
+
+@test "env: and --env values reach bwrap's environment, not its arguments" {
+    mkdir -p "$TEST_WORK/.ai-agent-sandbox"
+    printf 'env:\n  CI_PASSWORD: project-secret\n' > "$TEST_WORK/.ai-agent-sandbox/config.local.yaml"
+    run_sandbox --dry-run --env 'CLI_TOKEN=cli-secret'
+    assert_success
+    assert_recorded_env CI_PASSWORD project-secret
+    assert_recorded_env CLI_TOKEN cli-secret
+    refute_args_mention BWRAP_RECORDED project-secret
+    refute_args_mention BWRAP_RECORDED cli-secret
+    refute_args_contain BWRAP_RECORDED --setenv
+    # the script's own values travel the same way
+    assert_recorded_env HOME "$TEST_HOME"
+    assert_recorded_env PWD "$TEST_WORK"
+    [[ "${BWRAP_ENV_RECORDED[PATH]}" == "$TEST_HOME/.local/bin:"* ]] || fail "PATH is ${BWRAP_ENV_RECORDED[PATH]}"
+}
+
+@test "sandbox removals keep their order with env: entries" {
+    export CLAUDE_CONFIG_DIR=/host/claude SSH_AUTH_SOCK=/host/ssh
+    run_sandbox --dry-run --env 'SSH_AUTH_SOCK=/sandbox/ssh'
+    assert_success
+    refute_recorded_env CLAUDE_CONFIG_DIR
+    # env entries come after the script's own removals and win, as before
+    assert_recorded_env SSH_AUTH_SOCK /sandbox/ssh
+}
+
+@test "an env: entry named like a script variable does not break the bwrap command" {
+    run_sandbox --dry-run --env 'BWRAP_ARGS=x' --env 'BWRAP_BIN=y' --env 'IFS=:'
+    assert_success
+    assert_recorded_env BWRAP_ARGS x
+    assert_recorded_env BWRAP_BIN y
+    assert_args_contain BWRAP_RECORDED --tmpfs /tmp
 }

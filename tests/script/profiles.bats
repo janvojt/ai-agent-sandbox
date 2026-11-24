@@ -20,7 +20,7 @@ setup() {
     assert_output 700
     assert_args_contain BWRAP_RECORDED --bind "$PROFILES/test/home/.claude" "$TEST_HOME/.claude"
     assert_args_contain BWRAP_RECORDED --bind "$PROFILES/test/home/.claude.json" "$TEST_HOME/.claude.json"
-    assert_args_contain BWRAP_RECORDED --unsetenv CLAUDE_CONFIG_DIR
+    refute_recorded_env CLAUDE_CONFIG_DIR
 }
 
 @test "the default profile binds the host configuration" {

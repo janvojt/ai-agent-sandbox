@@ -56,7 +56,7 @@ stub_opencode() {
     run_sandbox --agent opencode -- run hi
     assert_success
     assert_equal "${SANDBOX_COMMAND[*]}" "$OPENCODE_BIN --agent build run hi"
-    assert_args_contain BWRAP_RECORDED --setenv OPENCODE_PERMISSION '{"*":"allow"}'
+    assert_recorded_env OPENCODE_PERMISSION '{"*":"allow"}'
 }
 
 @test "a bare --version is answered by the host binary without a sandbox" {

@@ -209,7 +209,8 @@ beta"
     mkdir -p "$HOME/.claude/skills"
     mount_claude_config 2>/dev/null
     assert_equal "${BWRAP_ARGS[*]}" \
-        "--bind $HOME/.claude $HOME/.claude --bind $HOME/.claude.json $HOME/.claude.json --unsetenv CLAUDE_CONFIG_DIR"
+        "--bind $HOME/.claude $HOME/.claude --bind $HOME/.claude.json $HOME/.claude.json"
+    assert_equal "${SANDBOX_ENV_OPS[*]}" "unset CLAUDE_CONFIG_DIR"
     run cat "$HOME/.claude.json"
     assert_output '{}'
 }
@@ -220,7 +221,8 @@ beta"
     echo host > "$HOME/.claude.json"
     mount_claude_config 2>/dev/null
     assert_equal "${BWRAP_ARGS[*]}" \
-        "--bind $PROFILE_HOME/.claude $HOME/.claude --overlay-src $HOME/.claude/skills --overlay $PROFILE_HOME/.claude/skills $PROFILES_DIR/work/overlay-work/claude-skills $HOME/.claude/skills --bind $PROFILE_HOME/.claude.json $HOME/.claude.json --unsetenv CLAUDE_CONFIG_DIR"
+        "--bind $PROFILE_HOME/.claude $HOME/.claude --overlay-src $HOME/.claude/skills --overlay $PROFILE_HOME/.claude/skills $PROFILES_DIR/work/overlay-work/claude-skills $HOME/.claude/skills --bind $PROFILE_HOME/.claude.json $HOME/.claude.json"
+    assert_equal "${SANDBOX_ENV_OPS[*]}" "unset CLAUDE_CONFIG_DIR"
     run cat "$PROFILE_HOME/.claude.json"
     assert_output '{}'
     run cat "$HOME/.claude.json"
@@ -308,7 +310,7 @@ beta"
     refute_args_contain BWRAP_ARGS --overlay-src
     local var
     for var in XDG_CONFIG_HOME XDG_CACHE_HOME XDG_STATE_HOME XDG_DATA_HOME OPENCODE_CONFIG_DIR OPENCODE_DB; do
-        assert_args_contain BWRAP_ARGS --unsetenv "$var"
+        assert_args_contain SANDBOX_ENV_OPS unset "$var"
     done
 }
 
@@ -331,7 +333,7 @@ beta"
         --overlay "$PROFILE_HOME/.claude/skills" "$PROFILES_DIR/work/overlay-work/claude-skills" "$HOME/.claude/skills"
     assert_args_contain BWRAP_ARGS --overlay-src "$HOME/.agents/skills" \
         --overlay "$PROFILE_HOME/.agents/skills" "$PROFILES_DIR/work/overlay-work/agents-skills" "$HOME/.agents/skills"
-    assert_args_contain BWRAP_ARGS --unsetenv OPENCODE_CONFIG_DIR --unsetenv OPENCODE_DB
+    assert_args_contain SANDBOX_ENV_OPS unset OPENCODE_CONFIG_DIR unset OPENCODE_DB
 }
 
 @test "mount_opencode_config: the skills overlay nests on top of the config bind" {
