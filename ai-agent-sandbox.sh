@@ -1509,7 +1509,7 @@ validate_gpg_agent() {
 
     # Launch the host agent if it is not running yet so its sockets exist
     if [[ ! -S "$GPG_HOST_EXTRA_SOCKET" ]]; then
-        gpgconf --launch gpg-agent 2>/dev/null || true
+        gpgconf --launch gpg-agent >/dev/null 2>&1 || true
     fi
     if [[ ! -S "$GPG_HOST_EXTRA_SOCKET" ]]; then
         echo -e "${RED}Error: gpg-agent extra socket not found: $GPG_HOST_EXTRA_SOCKET${NC}" >&2
@@ -2714,7 +2714,7 @@ start_socket_proxy() {
         # Not a child of the sandbox: the agent cannot stop it. It exits on its
         # own when this script is gone.
         python3 -I "$filter_program" "$PROXY_SOCKET_PATH" "$upstream_socket" "$WORKING_DIR" "$(docker_published_port_range)" \
-            </dev/null 2>>"$DOCKER_PRIVATE_DIR/filter.log" &
+            </dev/null >/dev/null 2>>"$DOCKER_PRIVATE_DIR/filter.log" &
         DOCKER_FILTER_PID=$!
         timeout=20
         while [[ ! -S "$PROXY_SOCKET_PATH" ]] && [[ $timeout -gt 0 ]] && kill -0 "$DOCKER_FILTER_PID" 2>/dev/null; do
@@ -2757,8 +2757,10 @@ cleanup_socket_proxy() {
         local container_name="$PROXY_CONTAINER_NAME"
         PROXY_CONTAINER_NAME=""
         log_info "${YELLOW}Cleaning up socket proxy: $container_name${NC}"
-        docker stop "$container_name" 2>/dev/null || true
-        docker rm -f "$container_name" 2>/dev/null || true
+        # Both print the container name on stdout, which belongs to the
+        # sandboxed command alone (orchestrators parse it)
+        docker stop "$container_name" >/dev/null 2>&1 || true
+        docker rm -f "$container_name" >/dev/null 2>&1 || true
     fi
     if [[ -n "${PROXY_SOCKET_PATH:-}" ]] && [[ -e "$PROXY_SOCKET_PATH" ]]; then
         rm -f "$PROXY_SOCKET_PATH" 2>/dev/null || true
@@ -2892,7 +2894,7 @@ create_user_namespace() {
         parent=$(readlink "/proc/self/fd/$parent_fd")
         map=(--map-user="$(id -u)" --map-group="$(id -g)")
     fi
-    "${cmd[@]}" "$UNSHARE_BIN" --user "${map[@]}" -- sleep 60 &
+    "${cmd[@]}" "$UNSHARE_BIN" --user "${map[@]}" -- sleep 60 >/dev/null &
     holder=$!
     # The holder starts in our namespace, moves to the parent (nsenter) and
     # ends up in the new one, where unshare writes both maps before it execs
@@ -2997,7 +2999,7 @@ setup_isolated_network() {
     # pasta closes every inherited fd before it opens the namespace paths, so the
     # user namespace fd has to be addressed through this shell's /proc entry
     pasta_args+=(--userns "/proc/$BASHPID/fd/$SANDBOX_USERNS_FD" --netns "/proc/$SANDBOX_CHILD_PID/ns/net")
-    if ! "$PASTA_BIN" "${pasta_args[@]}"; then
+    if ! "$PASTA_BIN" "${pasta_args[@]}" >&2; then
         echo -e "${RED}Error: pasta could not set up the sandbox network${NC}" >&2
         return 1
     fi
